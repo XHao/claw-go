@@ -1,0 +1,558 @@
+// Package client - interactive readline CLI that connects to the claw daemon.
+package client
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/chzyer/readline"
+	"github.com/XHao/claw-go/config"
+	"github.com/XHao/claw-go/ipc"
+	"github.com/XHao/claw-go/knowledge"
+	"github.com/XHao/claw-go/memory"
+	"github.com/XHao/claw-go/provider"
+	"github.com/XHao/claw-go/tool"
+)
+
+// Runner can execute a shell command with local stdin/stdout/stderr.
+type Runner interface {
+	Run(ctx context.Context, command string) error
+}
+
+// Run connects to the daemon over socketPath and starts an interactive session.
+func Run(
+	ctx context.Context,
+	socketPath, prompt, historyFile string,
+	shellEnabled bool,
+	shellTimeoutSeconds int,
+	allowedCommands []string,
+	toolsEnabled bool,
+	bashTimeoutSeconds int,
+	theme config.ThemeConfig,
+	llmProvider provider.Provider,
+	memoryDir string,
+	experiencesDir string,
+) error {
+	// Apply colour theme before any terminal output.
+	ApplyTheme(theme)
+
+	// Build the local tool runner (used for LLM-requested tool calls).
+	var localRunner *tool.LocalRunner
+	if toolsEnabled {
+		localRunner = &tool.LocalRunner{
+			BashTimeoutSeconds: bashTimeoutSeconds,
+		}
+	}
+	// Build knowledge components (distiller + experience store).
+	var distiller *knowledge.Distiller
+	var expStore *knowledge.ExperienceStore
+	if llmProvider != nil && memoryDir != "" && experiencesDir != "" {
+		memMgr := memory.NewManager(memoryDir)
+		expStore = knowledge.NewExperienceStore(experiencesDir)
+		distiller = knowledge.NewDistiller(llmProvider, memMgr, expStore)
+	}
+
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("无法连接到守护进程 %q：%w\n提示：请先运行  claw serve  启动守护进程", socketPath, err)
+	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	scanner := bufio.NewScanner(conn)
+
+	// ── Phase 1: read session list (or busy error) ────────────────────────────
+	if !scanner.Scan() {
+		return fmt.Errorf("connection closed before session list")
+	}
+	var first ipc.Msg
+	if err := json.Unmarshal(scanner.Bytes(), &first); err != nil {
+		return fmt.Errorf("invalid response from daemon")
+	}
+	if first.Error != "" {
+		return fmt.Errorf("守护进程拒绝连接：%s", first.Error)
+	}
+
+	// ── Phase 2: session selection (simple stdin/stdout, before readline) ─────
+	sessionName, recentHist, err := selectSession(enc, scanner, first.Sessions)
+	if err != nil {
+		if err == io.EOF {
+			return nil // Ctrl-D during selection — clean exit
+		}
+		return err
+	}
+
+	// Show recent conversation turns so the user has context right away.
+	DrawWelcomeBanner()
+	DrawHistory(recentHist)
+
+	// ── Phase 3: set up readline + optional shell executor ───────────────────
+	rlCfg := &readline.Config{
+		Prompt:          prompt,
+		HistoryFile:     historyFile,
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+		AutoComplete:    newCompleter(shellEnabled),
+	}
+	rl, err := readline.NewEx(rlCfg)
+	if err != nil {
+		return fmt.Errorf("readline 初始化失败：%w", err)
+	}
+	defer rl.Close()
+
+	var runner Runner
+	if shellEnabled {
+		runner = tool.NewShellExecutor("", shellTimeoutSeconds, allowedCommands)
+	}
+	_ = localRunner // used in printNextReply below
+
+	fmt.Printf("「%s」对话  （输入 /help 查看命令）\n", S.Bold(sessionName))
+
+	// ── Phase 4: chat loop (synchronous: send → wait for reply → repeat) ─────
+	// Using a synchronous model avoids all readline/goroutine concurrency issues:
+	// after each user message we block until the daemon responds exactly once.
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		line, err := rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt {
+				continue
+			}
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		switch {
+		case line == "exit" || line == "quit":
+			return nil
+		case line == "/help":
+			printHelp()
+			continue
+		case line == "/reset":
+			if err := enc.Encode(ipc.Msg{Cmd: "reset"}); err != nil {
+				return fmt.Errorf("write: %w", err)
+			}
+			sp := NewSpinner("正在清空对话…")
+			err := printNextReply(ctx, scanner, enc, localRunner, sp)
+			sp.Stop()
+			if err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, "/learn"):
+			topic := strings.TrimSpace(strings.TrimPrefix(line, "/learn"))
+			topic = strings.Trim(topic, `"'`)
+			if topic == "" {
+				fmt.Fprintln(os.Stderr, S.Warn("Usage: /learn \"<topic>\"  e.g. /learn \"Linux 开发\""))
+				continue
+			}
+			if distiller == nil {
+				fmt.Fprintln(os.Stderr, S.Err("[错误]")+" 知识提炼需要配置 LLM")
+				continue
+			}
+			runLearn(ctx, distiller, topic)
+			continue
+		case strings.HasPrefix(line, "/exp"):
+			arg := strings.TrimSpace(strings.TrimPrefix(line, "/exp"))
+			if expStore == nil {
+				fmt.Fprintln(os.Stderr, S.Err("[错误]")+" 经验库不可用（无经验目录）")
+				continue
+			}
+			runExp(ctx, arg, expStore, enc, scanner)
+			continue
+		case strings.HasPrefix(line, "!"):
+			if runner == nil {
+				fmt.Fprintln(os.Stderr, S.Err("[错误]")+" Shell 权限已禁用")
+			} else if err := runner.Run(ctx, strings.TrimPrefix(line, "!")); err != nil {
+				fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[错误]"), err)
+			}
+		default:
+			if err := enc.Encode(ipc.Msg{Text: line}); err != nil {
+				return fmt.Errorf("write: %w", err)
+			}
+			// Show spinner while waiting; stop it before rendering the reply.
+			sp := NewSpinner("思考中…")
+			err := printNextReply(ctx, scanner, enc, localRunner, sp)
+			sp.Stop()
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// printNextReply reads messages from the daemon until a final reply, info, or
+// error is received. sp is the active spinner; it is stopped before any output
+// so the line is clean. If the daemon sends tool_calls, they are executed
+// locally, results sent back, and the spinner resumes waiting.
+func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, localRunner *tool.LocalRunner, sp *Spinner) error {
+	for {
+		// Respect context cancellation (e.g. Ctrl-C).
+		if ctx.Err() != nil {
+			sp.Stop()
+			fmt.Fprintln(os.Stderr, S.Warn("[已取消]"))
+			return nil
+		}
+
+		if !scanner.Scan() {
+			sp.Stop()
+			if err := scanner.Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "\n%s 守护进程连接中断：%v\n", S.Err("[错误]"), err)
+				fmt.Fprintln(os.Stderr, S.Warn("提示：请运行  claw serve  重启守护进程"))
+				return fmt.Errorf("daemon disconnected: %w", err)
+			}
+			fmt.Fprintln(os.Stderr, "\n"+S.Warn("[提示] 守护进程已关闭连接。"))
+			return io.EOF
+		}
+
+		var msg ipc.Msg
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			// Malformed frame — don't hang, just warn and keep waiting.
+			sp.Stop()
+			fmt.Fprintf(os.Stderr, "%s 收到格式错误的消息，已跳过。\n", S.Warn("[警告]"))
+			return nil
+		}
+
+		// ── Tool calls: execute locally and send results back ─────────────────
+		if len(msg.ToolCalls) > 0 {
+			sp.Stop()
+			if localRunner == nil {
+				// Tools disabled on the client — send empty results so daemon continues.
+				_ = enc.Encode(ipc.Msg{
+					Cmd:         "tool_results",
+					ToolResults: []ipc.ToolResult{},
+				})
+				newSp := NewSpinner("思考中…")
+				err := printNextReply(ctx, scanner, enc, localRunner, newSp)
+				newSp.Stop()
+				return err
+			}
+			fmt.Printf("%s 调用 %d 个工具\n", S.Dim("[工具]"), len(msg.ToolCalls))
+			results := make([]ipc.ToolResult, len(msg.ToolCalls))
+			for i, tc := range msg.ToolCalls {
+				argsJSON := ""
+				if tc.Args != nil {
+					argsJSON = string(tc.Args)
+				}
+				toolSp := NewSpinner(fmt.Sprintf("  ↳ %s", S.ToolName(tc.Name)))
+				output, isErr := localRunner.Run(ctx, tc.Name, argsJSON)
+				toolSp.Stop()
+				statusIcon := S.Success("✓")
+				if isErr {
+					statusIcon = S.Err("✗")
+				}
+				fmt.Printf("  %s %s\n", statusIcon, S.ToolName(tc.Name))
+				results[i] = ipc.ToolResult{
+					CallID:  tc.ID,
+					Name:    tc.Name,
+					Output:  output,
+					IsError: isErr,
+				}
+			}
+			if err := enc.Encode(ipc.Msg{Cmd: "tool_results", ToolResults: results}); err != nil {
+				return fmt.Errorf("发送工具结果失败：%w", err)
+			}
+			// Restart spinner while daemon processes results with LLM.
+			newSp := NewSpinner("处理结果中…")
+			err := printNextReply(ctx, scanner, enc, localRunner, newSp)
+			newSp.Stop()
+			return err
+		}
+
+		// ── Terminal messages — always stop spinner first ──────────────────────
+		sp.Stop()
+		switch {
+		case msg.Reply != "":
+			renderMarkdown(msg.Reply)
+			return nil
+		case msg.Info != "":
+			fmt.Printf("%s %s\n", S.Dim("[提示]"), msg.Info)
+			return nil
+		case msg.Error != "":
+			// Friendly boxed error — non-blocking.
+			w := 44
+			// top: ╭─(2) + " 错误 "(visW=6) + dashes(w-7) + ╮(1) = w+2 = bottom width
+			fmt.Fprintf(os.Stderr, "\n%s\n", S.Err("╭─ 错误 "+strings.Repeat("─", w-7)+"╮"))
+			for _, ln := range strings.Split(msg.Error, "\n") {
+				fmt.Fprintf(os.Stderr, "%s %s\n", S.Err("│"), ln)
+			}
+			fmt.Fprintf(os.Stderr, "%s\n", S.Err("╰"+strings.Repeat("─", w)+"╯"))
+			return nil
+		default:
+			// Empty or unrecognised frame — do NOT loop forever; return cleanly.
+			// This guards against models returning null/empty content.
+			return nil
+		}
+	}
+}
+
+// selectSession presents the conversation list and returns the chosen name.
+// Protocol: server sends sessions list → client sends cmd → server sends
+// info (success) or error + new sessions list (retry).
+func selectSession(enc *json.Encoder, scanner *bufio.Scanner, sessions []ipc.SessionInfo) (string, []ipc.HistoryEntry, error) {
+	for {
+		// Draw the boxed session chooser; it also prints the input prompt.
+		fmt.Println()
+		DrawSessionList(sessions)
+
+		// Read user input (no server round-trip for invalid local input).
+		var input string
+		_, scanErr := fmt.Scanln(&input)
+		if scanErr != nil {
+			// Ctrl-D / EOF — exit cleanly.
+			fmt.Println()
+			return "", nil, io.EOF
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			// Server hasn't moved; no list refresh needed.
+			continue
+		}
+
+		// ── New conversation ──────────────────────────────────────────────────
+		if input == "n" || len(sessions) == 0 {
+			var name string
+			if input != "n" {
+				name = input
+			} else {
+				fmt.Print(S.Bold("对话名称") + "：")
+				_, scanErr := fmt.Scanln(&name)
+				if scanErr != nil {
+					fmt.Println()
+					return "", nil, io.EOF
+				}
+				name = strings.TrimSpace(name)
+				if name == "" {
+					fmt.Fprintln(os.Stderr, S.Warn("名称不能为空。"))
+					continue // no server round-trip, no list refresh
+				}
+			}
+			if err := enc.Encode(ipc.Msg{Cmd: "new", Session: name}); err != nil {
+				return "", nil, fmt.Errorf("write: %w", err)
+			}
+			resp, err := readMsg(scanner)
+			if err != nil {
+				return "", nil, err
+			}
+			if resp.Error != "" {
+				fmt.Fprintf(os.Stderr, "%s %s\n", S.Err("错误："), resp.Error)
+				// Server re-sent the updated list; consume it for the next display.
+				sessions, err = readSessionList(scanner)
+				if err != nil {
+					return "", nil, err
+				}
+				continue
+			}
+			return name, nil, nil
+		}
+
+		// ── Select existing by number ─────────────────────────────────────────
+		n, err := strconv.Atoi(input)
+		if err != nil || n < 1 || n > len(sessions) {
+			fmt.Fprintf(os.Stderr, S.Warn("无效选择。")+"请输入 1～%d 之间的数字，或输入 'n'。\n", len(sessions))
+			continue // no server round-trip, no list refresh
+		}
+		chosen := sessions[n-1].Name
+		if err := enc.Encode(ipc.Msg{Cmd: "select", Session: chosen}); err != nil {
+			return "", nil, fmt.Errorf("write: %w", err)
+		}
+		resp, err := readMsg(scanner)
+		if err != nil {
+			return "", nil, err
+		}
+		if resp.Error != "" {
+			fmt.Fprintf(os.Stderr, "%s %s\n", S.Err("错误："), resp.Error)
+			// Server re-sent the updated list; consume it for the next display.
+			sessions, err = readSessionList(scanner)
+			if err != nil {
+				return "", nil, err
+			}
+			continue
+		}
+		return chosen, resp.History, nil
+	}
+}
+
+// readSessionList reads one message from the server and returns its Sessions
+// field. Used to consume the refreshed session list the server sends after an
+// error in the selection phase.
+func readSessionList(scanner *bufio.Scanner) ([]ipc.SessionInfo, error) {
+	msg, err := readMsg(scanner)
+	if err != nil {
+		return nil, err
+	}
+	if msg.Error != "" {
+		return nil, fmt.Errorf("守护进程错误：%s", msg.Error)
+	}
+	return msg.Sessions, nil
+}
+
+func readMsg(scanner *bufio.Scanner) (ipc.Msg, error) {
+	if !scanner.Scan() {
+		return ipc.Msg{}, fmt.Errorf("连接已断开")
+	}
+	var msg ipc.Msg
+	if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+		return ipc.Msg{}, fmt.Errorf("无效响应：%w", err)
+	}
+	return msg, nil
+}
+
+// runLearn runs the knowledge distillation pipeline for topic and prints
+// live progress to stdout.
+func runLearn(ctx context.Context, d *knowledge.Distiller, topic string) {
+	fmt.Printf("%s 开始提炼主题 %s 的经验知识…\n", S.Bold("→"), S.Bold(topic))
+	sp := NewSpinner("读取记忆…")
+	progress := func(msg string) {
+		sp.UpdateLabel(msg)
+	}
+	content, err := d.Distill(ctx, topic, progress)
+	sp.Stop()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+		return
+	}
+	lines := strings.Count(content, "\n")
+	fmt.Printf("%s 经验库已更新！共 %d 行。使用 /exp show %q 查看。\n",
+		S.Success("✓"), lines, topic)
+}
+
+// runExp handles /exp subcommands: ls, show, rm, use.
+func runExp(ctx context.Context, arg string, store *knowledge.ExperienceStore,
+	enc *json.Encoder, scanner *bufio.Scanner) {
+	parts := strings.SplitN(arg, " ", 2)
+	subcmd := strings.ToLower(strings.TrimSpace(parts[0]))
+	param := ""
+	if len(parts) > 1 {
+		param = strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+	}
+
+	switch subcmd {
+	case "", "ls":
+		list, err := store.List()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+			return
+		}
+		if len(list) == 0 {
+			fmt.Println(S.Dim("暂无经验库。使用 /learn \"<主题>\" 开始提炼。"))
+			return
+		}
+		w := 50
+		pipe := S.Border("│")
+		fmt.Println(S.Border("╭─") + S.Bold(" Experience Library ") + S.Border(strings.Repeat("─", w-22)+"─╮"))
+		for i, m := range list {
+			size := fmt.Sprintf("%d KB", (m.Size+512)/1024)
+			updated := m.UpdatedAt.Format("01-02 15:04")
+			fmt.Printf("%s  %s  %s %s  %s\n",
+				pipe,
+				padRight(S.Bold(fmt.Sprintf("%2d", i+1)), 2),
+				padRight(S.Bold(m.Topic), 28),
+				padRight(S.Dim(size), 6),
+				S.Dim(updated))
+		}
+		fmt.Println(S.Border("╰" + strings.Repeat("─", w) + "╯"))
+		fmt.Println(S.Dim("提示: /exp show <主题>  /exp use <主题>  /exp rm <主题>"))
+
+	case "show":
+		if param == "" {
+			fmt.Fprintln(os.Stderr, S.Warn("Usage: /exp show <topic>"))
+			return
+		}
+		content, err := store.Load(param)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+			return
+		}
+		if content == "" {
+			fmt.Fprintf(os.Stderr, S.Warn("找不到主题 %q 的经验库\n"), param)
+			return
+		}
+		renderMarkdown(content)
+
+	case "rm":
+		if param == "" {
+			fmt.Fprintln(os.Stderr, S.Warn("Usage: /exp rm <topic>"))
+			return
+		}
+		if err := store.Delete(param); err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+			return
+		}
+		fmt.Printf("%s 已删除主题 %q 的经验库\n", S.Success("✓"), param)
+
+	case "use":
+		if param == "" {
+			fmt.Fprintln(os.Stderr, S.Warn("Usage: /exp use <topic>"))
+			return
+		}
+		content, err := store.Load(param)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+			return
+		}
+		if content == "" {
+			fmt.Fprintf(os.Stderr, S.Warn("找不到主题 %q 的经验库，请先运行 /learn %q\n"), param, param)
+			return
+		}
+		// Send inject_ctx command to daemon so it injects into the active session.
+		if err := enc.Encode(ipc.Msg{Cmd: "inject_ctx", Text: content}); err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+			return
+		}
+		// Wait for ack.
+		resp, err := readMsg(scanner)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[error]"), err)
+			return
+		}
+		if resp.Error != "" {
+			fmt.Fprintf(os.Stderr, "%s %s\n", S.Err("[error]"), resp.Error)
+			return
+		}
+		fmt.Printf("%s 经验库 %q 已挂载到当前会话上下文\n", S.Success("✓"), param)
+
+	default:
+		fmt.Fprintf(os.Stderr, S.Warn("未知子命令 %q。可用: ls, show, rm, use\n"), subcmd)
+	}
+}
+
+func printHelp() {
+	w := 58
+	// top: ╭─(2) + " 帮助 "(visW=6) + dashes(w-8) + ─╮(2) = w+2 = bottom width
+	fmt.Println(S.Border("╭─") + S.Bold(" 帮助 ") + S.Border(strings.Repeat("─", w-8)+"─╮"))
+	pipe := S.Border("│")
+	// Extra non-slash entries shown at the bottom.
+	extras := [][2]string{
+		{"!<命令>", "直接运行本地 Shell 命令（需开启 shell_enabled）"},
+		{"<消息>", "发送消息给 AI 助手"},
+	}
+	for _, e := range commands {
+		argHint := ""
+		if len(e.args) > 0 {
+			argHint = " " + strings.Join(e.args, "|")
+		}
+		fmt.Printf("%s  %s %s\n", pipe, padRight(S.Bold(e.cmd+argHint), 24), S.Dim(e.desc))
+	}
+	for _, item := range extras {
+		fmt.Printf("%s  %s %s\n", pipe, padRight(S.Bold(item[0]), 24), S.Dim(item[1]))
+	}
+	fmt.Println(S.Border("╰" + strings.Repeat("─", w) + "╯"))
+}

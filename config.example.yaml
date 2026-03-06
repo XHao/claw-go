@@ -1,0 +1,100 @@
+# Example claw-go configuration
+#
+# ── Data directory ────────────────────────────────────────────────────────────
+# All persistent data lives under a single root directory:
+#
+#   ~/.claw/              (default; override with $OPENCLAW_STATE_DIR)
+#   ├── config.yaml       this file (if placed there)
+#   ├── sessions/         one JSON file per conversation — survives restarts
+#   ├── logs/claw-go.log daemon log
+#   └── history           readline input history
+#
+# The daemon creates the sessions/ and logs/ directories automatically on first
+# start if they do not already exist.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Unix Domain Socket used by the daemon and CLI client.
+# Default (in priority order):
+#   $XDG_RUNTIME_DIR/claw-go.sock   (Linux tmpfs, auto-cleaned on logout)
+#   ~/.claw/claw-go.sock            (macOS and fallback)
+# socket_path: "~/.claw/claw-go.sock"
+
+# 每会话保留的最大对话轮数（一问一答为一轮）
+max_history_turns: 20
+
+# ── LLM provider ─────────────────────────────────────────────────────────────
+provider:
+  type: openai
+  base_url: "https://api.openai.com/v1"
+  # api_key: "sk-..."        # or set OPENAI_API_KEY env var
+  model: "gpt-4o-mini"
+  system_prompt: |
+    You are a helpful assistant running on {os} ({arch}).
+    The user's login is {user} and their home directory is {home}.
+    The current working directory is {cwd}.
+    They are using the shell {shell}.
+    Today is {date}.
+    Be concise and prefer code examples over long explanations.
+    When working with files or paths, use the current directory context above.
+  max_tokens: 4096
+  timeout_seconds: 120
+
+# ── CLI client ────────────────────────────────────────────────────────────────
+cli:
+  prompt: "You ❯ "
+  # history_file defaults to ~/.claw/history when empty.
+  # Set an explicit path to override, or leave empty to use the default.
+  # history_file: ""
+  shell_enabled: true          # allow !<cmd> to run local shell commands
+  shell_timeout_seconds: 300   # 0 = no timeout
+  # allowed_commands:          # restrict shell access; omit = all allowed
+  #   - git
+  #   - python3
+  #   - ls
+
+# ── Theme / colour palette ───────────────────────────────────────────────────
+# Controls all terminal colours.  Presets: default | dark | minimal | none.
+# Individual colour slots accept raw ANSI SGR codes, e.g. "1;36" = bold cyan.
+# Set NO_COLOR=1 in the environment to disable all styling unconditionally.
+theme:
+  preset: "default"      # default | dark | minimal | none
+  # colors:              # override any individual slot (ANSI SGR parameter)
+  #   assistant: "1;36" # bold cyan   — assistant reply label
+  #   user:      "1;32" # bold green  — user prompt (future)
+  #   dim:       "90"   # dark gray   — secondary info, spinners
+  #   success:   "32"   # green       — tool success ✓
+  #   warn:      "33"   # yellow      — warnings, [busy]
+  #   error:     "31"   # red         — error messages
+  #   bold:      "1"    # bold        — labels, emphasis
+  #   border:    "36"   # cyan        — box-drawing characters
+  #   timestamp: "90"   # dark gray   — time display
+  #   tool_name: "35"   # magenta     — tool name in progress list
+
+# When enabled, the LLM can request tool executions (bash, file I/O) that run
+# locally on the client machine.  The daemon orchestrates the loop; the CLI
+# client executes the tools and returns results.
+tools:
+  enabled: false               # set to true to enable tool calling
+  max_iterations: 10           # max tool-call rounds per user message
+  bash_timeout_seconds: 30     # per-bash-call timeout
+  # allowed:                   # restrict which tools the LLM may use; omit = all
+  #   - bash
+  #   - read_file
+  #   - write_file
+  #   - list_files
+
+# ── 调试日志 ───────────────────────────────────────────────────────────────────────────
+# 启用后，每次 LLM 调用都会将完整的请求/响应记录到一份人类可读的 debug 文件中。
+# 格式示例：
+#   ═════ LLM 调用 #1  2026-03-06 15:01:35 ═════
+#   ── 可用工具 (6 个) distill_knowledge / list_experiences / ...
+#   ── 消息历史 (3 条)
+#   [1] SYSTEM   You are a helpful assistant...
+#   [2] USER     帮我总结 C++ 开发经验
+#   ── 响应  stop_reason=tool_calls  elapsed=1900ms
+#       ▶ TOOL CALL: distill_knowledge
+#         { "topic": "C++开发" }
+#   ═══════════════════════════════════════════
+log:
+  debug_llm: false            # true = 开启并记录完整 LLM 请求/响应到 debug_file
+  # debug_file: ~/.claw/logs/llm_debug.log  # 默认路径，无需修改
