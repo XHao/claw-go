@@ -163,13 +163,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		"model", cfg.Provider.Model,
 	)
 
-	var llm provider.Provider = provider.NewOpenAI(
-		cfg.Provider.BaseURL,
-		cfg.Provider.APIKey,
-		cfg.Provider.Model,
-		cfg.Provider.MaxTokens,
-		cfg.Provider.TimeoutSeconds,
-	)
+	llm := buildLLM(cfg)
 	if cfg.Log.DebugLLM {
 		llm = provider.WrapDebug(llm, cfg.Log.DebugFile)
 		log.Info("已启用 LLM 调试日志", "file", cfg.Log.DebugFile)
@@ -227,13 +221,7 @@ func runConnect(cfg *config.Config, socketPath string) {
 	defer stop()
 
 	cli := cfg.CLI
-	var llm provider.Provider = provider.NewOpenAI(
-		cfg.Provider.BaseURL,
-		cfg.Provider.APIKey,
-		cfg.Provider.Model,
-		cfg.Provider.MaxTokens,
-		cfg.Provider.TimeoutSeconds,
-	)
+	llm := buildLLM(cfg)
 	if cfg.Log.DebugLLM {
 		llm = provider.WrapDebug(llm, cfg.Log.DebugFile)
 	}
@@ -255,6 +243,39 @@ func runConnect(cfg *config.Config, socketPath string) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// buildLLM constructs the Provider from config.
+// When provider_router.task is set, a RouterProvider is returned.
+// Otherwise the legacy single-model provider is used (backward compatible).
+func buildLLM(cfg *config.Config) provider.Provider {
+	rc := cfg.ProviderRouter
+	if rc.IsEnabled() {
+		newOAI := func(pc *config.ProviderConfig) provider.Provider {
+			if pc == nil {
+				return nil
+			}
+			return provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds)
+		}
+		rp, err := provider.NewRouterProvider(
+			newOAI(rc.Task),
+			newOAI(rc.Routing),
+			newOAI(rc.Summary),
+			newOAI(rc.Thinking),
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: build router provider: %v\n", err)
+			os.Exit(1)
+		}
+		return rp
+	}
+	return provider.NewOpenAI(
+		cfg.Provider.BaseURL,
+		cfg.Provider.APIKey,
+		cfg.Provider.Model,
+		cfg.Provider.MaxTokens,
+		cfg.Provider.TimeoutSeconds,
+	)
 }
 
 func setupLogger(level, logFile string) *slog.Logger {

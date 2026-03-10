@@ -125,6 +125,23 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		return
 	}
 
+	// /think <message> — ask the deep-reasoning Tier-3 model for this turn only.
+	// Strip the prefix and attach ModelHintThinking to ctx so RouterProvider
+	// selects the Tier-3 model for every LLM call in this dispatch.
+	if strings.HasPrefix(text, "/think ") || text == "/think" {
+		text = strings.TrimSpace(strings.TrimPrefix(text, "/think"))
+		ctx = provider.WithModelHint(ctx, provider.ModelHintThinking)
+		if text == "" {
+			if ch != nil {
+				_ = ch.Send(ctx, channel.OutboundMessage{
+					ChatID: msg.ChatID,
+					Text:   "用法：/think <你的问题>",
+				})
+			}
+			return
+		}
+	}
+
 	sess := a.sessions.Get(msg.SessionKey)
 	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
 	// Capture turn index right after the user message is appended.

@@ -63,11 +63,14 @@ func (d *Distiller) Distill(ctx context.Context, topic string, progress Progress
 	}
 
 	// 3. Map phase — process in batches.
+	// Use ModelHintSummary so RouterProvider selects the cheap long-context
+	// model (e.g. Gemini Flash) for these repeated extraction calls.
+	mapCtx := provider.WithModelHint(ctx, provider.ModelHintSummary)
 	chunks := chunkTurns(relevant, mapBatchSize)
 	var mapResults []string
 	for i, chunk := range chunks {
 		progress(fmt.Sprintf("Map %d/%d — 提炼知识片段…", i+1, len(chunks)))
-		result, err := d.mapBatch(ctx, topic, chunk)
+		result, err := d.mapBatch(mapCtx, topic, chunk)
 		if err != nil {
 			return "", fmt.Errorf("distill: map batch %d: %w", i, err)
 		}

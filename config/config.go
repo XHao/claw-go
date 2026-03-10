@@ -19,10 +19,14 @@ type Config struct {
 	SocketPath      string         `yaml:"socket_path"`
 	MaxHistoryTurns int            `yaml:"max_history_turns"`
 	Provider        ProviderConfig `yaml:"provider"`
-	CLI             CLIConfig      `yaml:"cli"`
-	Tools           ToolsConfig    `yaml:"tools"`
-	Theme           ThemeConfig    `yaml:"theme"`
-	Log             LogConfig      `yaml:"log"`
+	// ProviderRouter enables the multi-tier model routing architecture.
+	// When set, RouterProvider is used instead of the single Provider above.
+	// Tiers that are omitted fall back to task automatically.
+	ProviderRouter RouterConfig `yaml:"provider_router"`
+	CLI            CLIConfig    `yaml:"cli"`
+	Tools          ToolsConfig  `yaml:"tools"`
+	Theme          ThemeConfig  `yaml:"theme"`
+	Log            LogConfig    `yaml:"log"`
 }
 
 // LogConfig controls daemon logging behaviour.
@@ -69,6 +73,28 @@ type ToolsConfig struct {
 	Allowed []string `yaml:"allowed"`
 	// BashTimeoutSeconds is the per-command timeout for bash tool calls.
 	BashTimeoutSeconds int `yaml:"bash_timeout_seconds"`
+}
+
+// RouterConfig describes the optional multi-tier model routing block.
+// Populate provider_router in config.yaml to enable it.
+type RouterConfig struct {
+	// Routing is the Tier-1 ultra-cheap intent classifier (e.g. Gemini Flash-lite).
+	// Optional — falls back to Task when omitted.
+	Routing *ProviderConfig `yaml:"routing"`
+	// Task is the Tier-2 default model used for normal conversation and code gen.
+	// Required when provider_router is set.
+	Task *ProviderConfig `yaml:"task"`
+	// Summary is the Tier-2 summarisation model used for distillation batches.
+	// Optional — falls back to Task when omitted.
+	Summary *ProviderConfig `yaml:"summary"`
+	// Thinking is the Tier-3 deep-reasoning model (e.g. Claude Sonnet).
+	// Optional — falls back to Task when omitted.
+	Thinking *ProviderConfig `yaml:"thinking"`
+}
+
+// IsEnabled reports whether the multi-model router is configured.
+func (r RouterConfig) IsEnabled() bool {
+	return r.Task != nil
 }
 
 // ProviderConfig describes the LLM backend.
@@ -229,17 +255,38 @@ func applyEnvOverrides(cfg *Config) {
 }
 
 func validate(cfg *Config) error {
-	if cfg.Provider.Type == "" {
-		cfg.Provider.Type = "openai"
-	}
-	if cfg.Provider.Type != "openai" {
-		return fmt.Errorf("unsupported provider type %q", cfg.Provider.Type)
+	// Validate single-model provider (only required when router is not configured).
+	if !cfg.ProviderRouter.IsEnabled() {
+		if cfg.Provider.Type == "" {
+			cfg.Provider.Type = "openai"
+		}
+		if cfg.Provider.Type != "openai" {
+			return fmt.Errorf("unsupported provider type %q", cfg.Provider.Type)
+		}
 	}
 	return nil
 }
 
 // ValidateServe performs additional validation required for daemon (serve) mode.
 func ValidateServe(cfg *Config) error {
+	// When the multi-tier router is enabled, validate each configured tier.
+	if cfg.ProviderRouter.IsEnabled() {
+		if err := validateProviderConfig("provider_router.task", cfg.ProviderRouter.Task); err != nil {
+			return err
+		}
+		for name, pc := range map[string]*ProviderConfig{
+			"provider_router.routing":  cfg.ProviderRouter.Routing,
+			"provider_router.summary":  cfg.ProviderRouter.Summary,
+			"provider_router.thinking": cfg.ProviderRouter.Thinking,
+		} {
+			if pc != nil {
+				if err := validateProviderConfig(name, pc); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	if cfg.Provider.APIKey == "" {
 		return fmt.Errorf("API key is not set — add provider.api_key to config or set OPENAI_API_KEY")
 	}
@@ -252,6 +299,17 @@ func ValidateServe(cfg *Config) error {
 				"claw-go does not support OAuth flows — set OPENAI_API_KEY to a real API key",
 			cfg.Provider.APIKey,
 		)
+	}
+	return nil
+}
+
+// validateProviderConfig checks that a ProviderConfig has the minimum required fields.
+func validateProviderConfig(name string, pc *ProviderConfig) error {
+	if pc.APIKey == "" {
+		return fmt.Errorf("%s: api_key is not set", name)
+	}
+	if strings.HasSuffix(pc.APIKey, "-oauth") {
+		return fmt.Errorf("%s: api_key %q looks like an OAuth placeholder; set a real API key", name, pc.APIKey)
 	}
 	return nil
 }

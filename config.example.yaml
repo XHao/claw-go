@@ -98,3 +98,39 @@ tools:
 log:
   debug_llm: false            # true = 开启并记录完整 LLM 请求/响应到 debug_file
   # debug_file: ~/.claw/logs/llm_debug.log  # 默认路径，无需修改
+
+# ── 多模型路由（可选）────────────────────────────────────────────────────────
+# 当配置了 provider_router.task 时，RouterProvider 生效，忽略上方单模型的 provider 块。
+# 未填写的 tier 自动降级到 task，不会报错。
+#
+# 三层设计：
+#   Tier 1  routing  — 超低成本意图分类 (e.g. Gemini Flash-lite)
+#   Tier 2  task     — 核心对话 / 代码生成，默认通道 (e.g. Gemini 2.5 Pro)
+#   Tier 2  summary  — 批量摘要 / 知识蒸馏 (e.g. Gemini 2.0 Flash)
+#   Tier 3  thinking — 深度推理 / 复杂重构，用户用 /think 触发 (e.g. Claude Sonnet)
+#
+# provider_router:
+#   routing:
+#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+#     api_key: "${GEMINI_API_KEY}"
+#     model: "gemini-2.0-flash-lite"
+#     max_tokens: 1024
+#     timeout_seconds: 15
+#   task:
+#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+#     api_key: "${GEMINI_API_KEY}"
+#     model: "gemini-2.5-pro"
+#     max_tokens: 8192
+#     timeout_seconds: 120
+#   summary:
+#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+#     api_key: "${GEMINI_API_KEY}"
+#     model: "gemini-2.0-flash"
+#     max_tokens: 16384
+#     timeout_seconds: 60
+#   thinking:
+#     base_url: "https://api.anthropic.com/v1"
+#     api_key: "${ANTHROPIC_API_KEY}"
+#     model: "claude-3-5-sonnet-20241022"
+#     max_tokens: 8192
+#     timeout_seconds: 300
