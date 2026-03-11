@@ -63,29 +63,74 @@ func TestLoadMissingFile(t *testing.T) {
 
 func TestLoadUnsupportedProvider(t *testing.T) {
 	path := writeTemp(t, `
-provider:
-  type: anthropic
-  api_key: "sk-test"
+models:
+  m1:
+    type: anthropic
+    api_key: "sk-test"
+    model: "foo"
+primary_model: "m1"
 `)
-	_, err := config.Load(path)
-	if err == nil {
-		t.Error("expected error for unsupported provider type")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := config.ValidateServe(cfg); err != nil {
+		t.Fatalf("ValidateServe should allow provider type in model catalog: %v", err)
 	}
 }
 
-func TestValidateServeRequiresAPIKey(t *testing.T) {
-	path := writeTemp(t, ``)
+func TestValidateServeRoutingPolicyWithModels(t *testing.T) {
+	path := writeTemp(t, `
+models:
+  route:
+    api_key: "sk-route"
+    model: "gemini-2.0-flash-lite"
+  task:
+    api_key: "sk-task"
+    model: "gemini-2.5-pro"
+  think:
+    api_key: "sk-think"
+    base_url: "https://api.anthropic.com/v1"
+    model: "claude-3-5-sonnet-20241022"
+primary_model: "task"
+routing_policy:
+  routing_model: "route"
+  task_model: "task"
+  thinking_model: "think"
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := config.ValidateServe(cfg); err != nil {
+		t.Fatalf("ValidateServe: %v", err)
+	}
+}
+
+func TestValidateServeRequiresPrimaryModel(t *testing.T) {
+	path := writeTemp(t, `
+models:
+  m1:
+    api_key: "sk-test"
+    model: "gpt-4o-mini"
+`)
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if err := config.ValidateServe(cfg); err == nil {
-		t.Error("expected error when api_key is missing in serve mode")
+		t.Error("expected error when primary_model is missing")
 	}
 }
 
 func TestValidateServeRejectsOAuthPlaceholder(t *testing.T) {
-	path := writeTemp(t, `provider: {api_key: "qwen-oauth"}`)
+	path := writeTemp(t, `
+models:
+  m1:
+    api_key: "qwen-oauth"
+    model: "gpt-4o-mini"
+primary_model: "m1"
+`)
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -97,16 +142,20 @@ func TestValidateServeRejectsOAuthPlaceholder(t *testing.T) {
 
 func TestEnvOverrideAlwaysWins(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-env-override")
-	// Config file has a different (placeholder) key — env var must win.
-	path := writeTemp(t, `provider: {api_key: "qwen-oauth"}`)
+	path := writeTemp(t, `
+models:
+  m1:
+    api_key: "qwen-oauth"
+    model: "gpt-4o-mini"
+primary_model: "m1"
+`)
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Provider.APIKey != "sk-env-override" {
-		t.Errorf("want env override %q, got %q", "sk-env-override", cfg.Provider.APIKey)
+	if cfg.Models["m1"].APIKey != "sk-env-override" {
+		t.Errorf("want env override %q, got %q", "sk-env-override", cfg.Models["m1"].APIKey)
 	}
-	// With the env override the OAuth placeholder is gone, so serve validation passes.
 	if err := config.ValidateServe(cfg); err != nil {
 		t.Errorf("unexpected ValidateServe error after env override: %v", err)
 	}
@@ -157,6 +206,12 @@ func TestLoadOpenClawJSON_Basic(t *testing.T) {
 	}
 	if cfg.Provider.APIKey != "sk-live-key" {
 		t.Errorf("want APIKey %q, got %q", "sk-live-key", cfg.Provider.APIKey)
+	}
+	if cfg.PrimaryModel == "" {
+		t.Fatalf("want primary_model to be set")
+	}
+	if _, ok := cfg.Models[cfg.PrimaryModel]; !ok {
+		t.Fatalf("primary_model must reference models entry")
 	}
 	if cfg.Provider.BaseURL != "https://api.openai.com/v1" {
 		t.Errorf("unexpected BaseURL %q", cfg.Provider.BaseURL)
@@ -227,6 +282,26 @@ func TestLoadOpenClawJSON_FallbackPicksFirstProvider(t *testing.T) {
 	}
 	if cfg.Provider.Model != "default-model" {
 		t.Errorf("want model %q, got %q", "default-model", cfg.Provider.Model)
+	}
+	if cfg.PrimaryModel == "" {
+		t.Fatalf("want primary_model to be set")
+	}
+}
+
+func TestValidateServeWithoutRoutingPolicyUsesPrimaryModel(t *testing.T) {
+	path := writeTemp(t, `
+models:
+  default:
+    api_key: "sk-default"
+    model: "gpt-4o-mini"
+primary_model: "default"
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := config.ValidateServe(cfg); err != nil {
+		t.Fatalf("ValidateServe: %v", err)
 	}
 }
 

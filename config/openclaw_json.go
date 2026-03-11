@@ -85,44 +85,49 @@ func loadOpenClawJSON(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: model id %q contains invalid characters", modelID)
 	}
 
-	prov, ok := raw.Models.Providers[providerID]
-	if !ok {
+	if _, ok := raw.Models.Providers[providerID]; !ok {
 		return nil, fmt.Errorf("config: provider %q (from agents.defaults.model.primary) not found", providerID)
 	}
 
-	// Expand ${ENV_VAR} only in the two fields that legitimately need it.
-	baseURL, err := expandAPIEnvVar(prov.BaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("config: provider %q baseUrl: %w", providerID, err)
-	}
-	apiKey, err := expandAPIEnvVar(prov.APIKey)
-	if err != nil {
-		return nil, fmt.Errorf("config: provider %q apiKey: %w", providerID, err)
-	}
+	var cfg Config
+	cfg.Models = map[string]ProviderConfig{}
 
-	// baseUrl must be an http/https URL to prevent accidental file:// or other schemes.
-	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-		return nil, fmt.Errorf("config: provider %q baseUrl must start with http:// or https://", providerID)
-	}
-
-	// Resolve maxTokens from the selected model entry.
-	maxTokens := 0
-	for _, m := range prov.Models {
-		if m.ID == modelID && m.MaxTokens > 0 {
-			maxTokens = m.MaxTokens
-			break
+	for pid, p := range raw.Models.Providers {
+		pidURL, err := expandAPIEnvVar(p.BaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("config: provider %q baseUrl: %w", pid, err)
+		}
+		pidKey, err := expandAPIEnvVar(p.APIKey)
+		if err != nil {
+			return nil, fmt.Errorf("config: provider %q apiKey: %w", pid, err)
+		}
+		if !strings.HasPrefix(pidURL, "http://") && !strings.HasPrefix(pidURL, "https://") {
+			return nil, fmt.Errorf("config: provider %q baseUrl must start with http:// or https://", pid)
+		}
+		for _, m := range p.Models {
+			if !safeIDRe.MatchString(m.ID) {
+				return nil, fmt.Errorf("config: model id %q contains invalid characters", m.ID)
+			}
+			key := pid + "/" + m.ID
+			cfg.Models[key] = ProviderConfig{
+				Type:         "openai",
+				BaseURL:      pidURL,
+				APIKey:       pidKey,
+				Model:        m.ID,
+				SystemPrompt: raw.Agents.Defaults.SystemPrompt,
+				MaxTokens:    m.MaxTokens,
+			}
 		}
 	}
 
-	var cfg Config
-	cfg.Provider = ProviderConfig{
-		Type:         "openai",
-		BaseURL:      baseURL,
-		APIKey:       apiKey,
-		Model:        modelID,
-		SystemPrompt: raw.Agents.Defaults.SystemPrompt,
-		MaxTokens:    maxTokens,
+	modelKey := providerID + "/" + modelID
+	if _, ok := cfg.Models[modelKey]; !ok {
+		return nil, fmt.Errorf("config: model %q not found in provider %q", modelID, providerID)
 	}
+	cfg.PrimaryModel = modelKey
+
+	// Keep Provider populated for non-serve code paths that still read it.
+	cfg.Provider = cfg.Models[modelKey]
 	return &cfg, nil
 }
 

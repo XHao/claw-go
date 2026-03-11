@@ -27,6 +27,7 @@ const (
 )
 
 type hintKey struct{}
+type sourceKey struct{}
 
 // WithModelHint attaches a ModelHint to ctx so RouterProvider can route the
 // call to the appropriate tier.
@@ -39,4 +40,19 @@ func WithModelHint(ctx context.Context, hint ModelHint) context.Context {
 func HintFromContext(ctx context.Context) ModelHint {
 	h, _ := ctx.Value(hintKey{}).(ModelHint)
 	return h
+}
+
+// WithHintSource attaches a human-readable source label to ctx.
+// The label identifies which code path initiated the LLM call, e.g.
+// "agent/loop[i=0]", "agent/think", "distill/map[2/5]", "distill/reduce".
+// It is recorded in metrics and debug logs alongside the hint.
+func WithHintSource(ctx context.Context, source string) context.Context {
+	return context.WithValue(ctx, sourceKey{}, source)
+}
+
+// SourceFromContext reads the source label set by WithHintSource.
+// Returns an empty string if none was set.
+func SourceFromContext(ctx context.Context) string {
+	s, _ := ctx.Value(sourceKey{}).(string)
+	return s
 }

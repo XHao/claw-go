@@ -46,12 +46,20 @@ type ToolResult struct {
 	IsError bool   `json:"is_error,omitempty"`
 }
 
+// Usage holds token consumption reported by the LLM API for one call.
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+}
+
 // CompleteResult is returned by CompleteWithTools.
 // Exactly one of Content or ToolCalls will be non-zero.
 type CompleteResult struct {
 	Content    string            // final text reply
 	ToolCalls  []ToolCallRequest // tool calls requested by the model
 	StopReason string
+	Usage      Usage // token counts reported by the API
 }
 
 // Provider is the interface that any LLM backend must implement.

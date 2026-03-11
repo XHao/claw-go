@@ -60,3 +60,12 @@ func (r *Registry) AsToolDefs() []provider.ToolDef {
 	}
 	return out
 }
+
+// Names returns all registered skill names.
+func (r *Registry) Names() []string {
+	out := make([]string, len(r.defs))
+	for i, d := range r.defs {
+		out[i] = d.Name
+	}
+	return out
+}

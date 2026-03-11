@@ -111,7 +111,16 @@ func (d *DebugProvider) CompleteWithTools(ctx context.Context, messages []Messag
 	}
 
 	// ── CALL ─────────────────────────────────────────────────────────────
-	fmt.Fprintf(w, "\n── 请求发送 → 等待 LLM 响应 %s\n", thin)
+	hint := HintFromContext(ctx)
+	if hint == "" {
+		hint = ModelHintTask
+	}
+	source := SourceFromContext(ctx)
+	sourceStr := ""
+	if source != "" {
+		sourceStr = "  source=" + source
+	}
+	fmt.Fprintf(w, "\n── 请求发送 → 等待 LLM 响应  [hint=%s%s] %s\n", hint, sourceStr, thin)
 	start := time.Now()
 	result, err := d.inner.CompleteWithTools(ctx, messages, tools)
 	elapsed := time.Since(start).Milliseconds()
@@ -124,8 +133,10 @@ func (d *DebugProvider) CompleteWithTools(ctx context.Context, messages []Messag
 		return result, err
 	}
 
-	fmt.Fprintf(w, "\n── ✅ 响应  stop_reason=%-16s  elapsed=%dms %s\n",
-		result.StopReason, elapsed, thin)
+	fmt.Fprintf(w, "\n── ✅ 响应  stop_reason=%-16s  elapsed=%dms  tokens=%d(%d+%d) %s\n",
+		result.StopReason, elapsed,
+		result.Usage.TotalTokens, result.Usage.PromptTokens, result.Usage.CompletionTokens,
+		thin)
 
 	if result.Content != "" {
 		content := result.Content

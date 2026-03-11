@@ -22,22 +22,28 @@
 # 每会话保留的最大对话轮数（一问一答为一轮）
 max_history_turns: 20
 
-# ── LLM provider ─────────────────────────────────────────────────────────────
-provider:
-  type: openai
-  base_url: "https://api.openai.com/v1"
-  # api_key: "sk-..."        # or set OPENAI_API_KEY env var
-  model: "gpt-4o-mini"
-  system_prompt: |
-    You are a helpful assistant running on {os} ({arch}).
-    The user's login is {user} and their home directory is {home}.
-    The current working directory is {cwd}.
-    They are using the shell {shell}.
-    Today is {date}.
-    Be concise and prefer code examples over long explanations.
-    When working with files or paths, use the current directory context above.
-  max_tokens: 4096
-  timeout_seconds: 120
+# ── LLM models + default model ───────────────────────────────────────────────
+# 1) 定义 models 列表（每个模型的 base_url/api_key/model/max_tokens）。
+# 2) 通过 primary_model 指定主模型（必填）。
+# 3) 如需分层路由，再额外配置 routing_policy（可选）。
+models:
+  default_task:
+    type: openai
+    base_url: "https://api.openai.com/v1"
+    # api_key: "sk-..."        # or set OPENAI_API_KEY env var
+    model: "gpt-4o-mini"
+    system_prompt: |
+      You are a helpful assistant running on {os} ({arch}).
+      The user's login is {user} and their home directory is {home}.
+      The current working directory is {cwd}.
+      They are using the shell {shell}.
+      Today is {date}.
+      Be concise and prefer code examples over long explanations.
+      When working with files or paths, use the current directory context above.
+    max_tokens: 4096
+    timeout_seconds: 120
+
+primary_model: "default_task"
 
 # ── CLI client ────────────────────────────────────────────────────────────────
 cli:
@@ -98,39 +104,49 @@ tools:
 log:
   debug_llm: false            # true = 开启并记录完整 LLM 请求/响应到 debug_file
   # debug_file: ~/.claw/logs/llm_debug.log  # 默认路径，无需修改
+  metrics_enabled: false      # true = 开启结构化指标收集（JSONL，每行一条调用记录）
+  # metrics_file: ~/.claw/logs/llm_metrics.jsonl
+  #
+  # 指标字段：at/hint/prompt_tokens/completion_tokens/total_tokens/latency_ms/stop_reason/is_error
+  # hint 即 ModelHint tier: router/task/summary/thinking
+  # 示例分析（jq）:
+  #   cat ~/.claw/logs/llm_metrics.jsonl | jq -s 'group_by(.hint)[] | {hint: .[0].hint, calls: length, total_tokens: [.[].total_tokens] | add}'
+  #   cat ~/.claw/logs/llm_metrics.jsonl | jq -s '[.[].total_tokens] | add'
 
-# ── 多模型路由（可选）────────────────────────────────────────────────────────
-# 当配置了 provider_router.task 时，RouterProvider 生效，忽略上方单模型的 provider 块。
-# 未填写的 tier 自动降级到 task，不会报错。
+# ── 多模型目录 + 路由策略（推荐）────────────────────────────────────────────────
+# 先定义 models（模型目录），再用 routing_policy 指定各 tier 用哪个模型。
+# 未填写的 optional tier 自动降级到 task。
 #
-# 三层设计：
-#   Tier 1  routing  — 超低成本意图分类 (e.g. Gemini Flash-lite)
-#   Tier 2  task     — 核心对话 / 代码生成，默认通道 (e.g. Gemini 2.5 Pro)
-#   Tier 2  summary  — 批量摘要 / 知识蒸馏 (e.g. Gemini 2.0 Flash)
-#   Tier 3  thinking — 深度推理 / 复杂重构，用户用 /think 触发 (e.g. Claude Sonnet)
-#
-# provider_router:
-#   routing:
+# models:
+#   gemini_routing:
 #     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
 #     api_key: "${GEMINI_API_KEY}"
 #     model: "gemini-2.0-flash-lite"
 #     max_tokens: 1024
 #     timeout_seconds: 15
-#   task:
+#   gemini_task:
 #     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
 #     api_key: "${GEMINI_API_KEY}"
 #     model: "gemini-2.5-pro"
 #     max_tokens: 8192
 #     timeout_seconds: 120
-#   summary:
+#   gemini_summary:
 #     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
 #     api_key: "${GEMINI_API_KEY}"
 #     model: "gemini-2.0-flash"
 #     max_tokens: 16384
 #     timeout_seconds: 60
-#   thinking:
+#   claude_thinking:
 #     base_url: "https://api.anthropic.com/v1"
 #     api_key: "${ANTHROPIC_API_KEY}"
 #     model: "claude-3-5-sonnet-20241022"
 #     max_tokens: 8192
 #     timeout_seconds: 300
+#
+# routing_policy:
+#   routing_model: "gemini_routing"
+#   task_model: "gemini_task"
+#   summary_model: "gemini_summary"
+#   thinking_model: "claude_thinking"
+#
+# primary_model: "gemini_task"

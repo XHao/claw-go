@@ -28,6 +28,11 @@ func (r *Router) AsToolDefs() []provider.ToolDef {
 	return r.registry.AsToolDefs()
 }
 
+// Names returns all registered skill names for routing classification.
+func (r *Router) Names() []string {
+	return r.registry.Names()
+}
+
 // Execute runs a skill by name with the provided JSON arguments.
 func (r *Router) Execute(
 	ctx context.Context,

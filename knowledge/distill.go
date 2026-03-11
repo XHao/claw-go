@@ -70,7 +70,9 @@ func (d *Distiller) Distill(ctx context.Context, topic string, progress Progress
 	var mapResults []string
 	for i, chunk := range chunks {
 		progress(fmt.Sprintf("Map %d/%d — 提炼知识片段…", i+1, len(chunks)))
-		result, err := d.mapBatch(mapCtx, topic, chunk)
+		// Tag each batch with its index so metrics show exactly which batch was processed.
+		batchCtx := provider.WithHintSource(mapCtx, fmt.Sprintf("distill/map[%d/%d]", i+1, len(chunks)))
+		result, err := d.mapBatch(batchCtx, topic, chunk)
 		if err != nil {
 			return "", fmt.Errorf("distill: map batch %d: %w", i, err)
 		}
@@ -86,7 +88,8 @@ func (d *Distiller) Distill(ctx context.Context, topic string, progress Progress
 	// 4. Reduce phase — merge map outputs with existing experience.
 	progress("Reduce — 整合并去重…")
 	existing, _ := d.store.Load(topic)
-	final, err := d.reduce(ctx, topic, mapResults, existing)
+	reduceCtx := provider.WithHintSource(ctx, "distill/reduce")
+	final, err := d.reduce(reduceCtx, topic, mapResults, existing)
 	if err != nil {
 		return "", fmt.Errorf("distill: reduce: %w", err)
 	}

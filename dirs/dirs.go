@@ -46,6 +46,12 @@ func LogFile() string { return filepath.Join(Logs(), "claw-go.log") }
 // DebugLogFile returns the path to the LLM debug trace file.
 func DebugLogFile() string { return filepath.Join(Logs(), "llm_debug.log") }
 
+// MetricsFile returns the path to the JSONL LLM metrics file.
+func MetricsFile() string { return filepath.Join(Logs(), "llm_metrics.jsonl") }
+
+// QuotaStateFile returns the path to the local LLM quota state file.
+func QuotaStateFile() string { return filepath.Join(Logs(), "llm_quota_state.json") }
+
 // History returns the path to the readline input-history file.
 func History() string { return filepath.Join(Data(), "history") }
 

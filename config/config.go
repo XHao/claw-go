@@ -19,14 +19,32 @@ type Config struct {
 	SocketPath      string         `yaml:"socket_path"`
 	MaxHistoryTurns int            `yaml:"max_history_turns"`
 	Provider        ProviderConfig `yaml:"provider"`
-	// ProviderRouter enables the multi-tier model routing architecture.
-	// When set, RouterProvider is used instead of the single Provider above.
-	// Tiers that are omitted fall back to task automatically.
-	ProviderRouter RouterConfig `yaml:"provider_router"`
-	CLI            CLIConfig    `yaml:"cli"`
-	Tools          ToolsConfig  `yaml:"tools"`
-	Theme          ThemeConfig  `yaml:"theme"`
-	Log            LogConfig    `yaml:"log"`
+	// Models is a reusable provider catalog keyed by logical model name.
+	// Used by RoutingPolicy to separate model definitions from routing rules.
+	Models map[string]ProviderConfig `yaml:"models"`
+	// PrimaryModel is the required primary model name in Models.
+	// It is used when routing_policy is disabled and as runtime fallback on errors.
+	PrimaryModel string `yaml:"primary_model"`
+	// RoutingPolicy maps each logical tier to a model name in Models.
+	RoutingPolicy RoutingPolicyConfig `yaml:"routing_policy"`
+	CLI           CLIConfig           `yaml:"cli"`
+	Tools         ToolsConfig         `yaml:"tools"`
+	Theme         ThemeConfig         `yaml:"theme"`
+	Log           LogConfig           `yaml:"log"`
+}
+
+// RoutingPolicyConfig maps tiers to named model entries from Config.Models.
+// TaskModel is required when the policy is enabled.
+type RoutingPolicyConfig struct {
+	RoutingModel  string `yaml:"routing_model"`
+	TaskModel     string `yaml:"task_model"`
+	SummaryModel  string `yaml:"summary_model"`
+	ThinkingModel string `yaml:"thinking_model"`
+}
+
+// IsEnabled reports whether routing policy is configured.
+func (r RoutingPolicyConfig) IsEnabled() bool {
+	return strings.TrimSpace(r.TaskModel) != ""
 }
 
 // LogConfig controls daemon logging behaviour.
@@ -38,6 +56,11 @@ type LogConfig struct {
 	// DebugFile is the path to the LLM debug trace file.
 	// Defaults to ~/.claw/logs/llm_debug.log.
 	DebugFile string `yaml:"debug_file"`
+	// MetricsFile is the path to the JSONL metrics file.
+	// Each line is a JSON object with hint, token counts, latency, etc.
+	// Defaults to ~/.claw/logs/llm_metrics.jsonl when MetricsEnabled is true.
+	MetricsEnabled bool   `yaml:"metrics_enabled"`
+	MetricsFile    string `yaml:"metrics_file"`
 }
 
 // ThemeConfig controls terminal colour output.
@@ -75,39 +98,6 @@ type ToolsConfig struct {
 	BashTimeoutSeconds int `yaml:"bash_timeout_seconds"`
 }
 
-// RouterConfig describes the optional multi-tier model routing block.
-// Populate provider_router in config.yaml to enable it.
-type RouterConfig struct {
-	// Routing is the Tier-1 ultra-cheap intent classifier (e.g. Gemini Flash-lite).
-	// Optional — falls back to Task when omitted.
-	Routing *ProviderConfig `yaml:"routing"`
-	// Task is the Tier-2 default model used for normal conversation and code gen.
-	// Required when provider_router is set.
-	Task *ProviderConfig `yaml:"task"`
-	// Summary is the Tier-2 summarisation model used for distillation batches.
-	// Optional — falls back to Task when omitted.
-	Summary *ProviderConfig `yaml:"summary"`
-	// Thinking is the Tier-3 deep-reasoning model (e.g. Claude Sonnet).
-	// Optional — falls back to Task when omitted.
-	Thinking *ProviderConfig `yaml:"thinking"`
-}
-
-// IsEnabled reports whether the multi-model router is configured.
-func (r RouterConfig) IsEnabled() bool {
-	return r.Task != nil
-}
-
-// ProviderConfig describes the LLM backend.
-type ProviderConfig struct {
-	Type           string `yaml:"type"`
-	BaseURL        string `yaml:"base_url"`
-	APIKey         string `yaml:"api_key"`
-	Model          string `yaml:"model"`
-	SystemPrompt   string `yaml:"system_prompt"`
-	MaxTokens      int    `yaml:"max_tokens"`
-	TimeoutSeconds int    `yaml:"timeout_seconds"`
-}
-
 // CLIConfig holds settings for the interactive terminal client.
 type CLIConfig struct {
 	// Prompt is the readline prompt shown to the user.
@@ -121,6 +111,17 @@ type CLIConfig struct {
 	// AllowedCommands restricts which shell commands may be executed.
 	// An empty list means all commands are permitted.
 	AllowedCommands []string `yaml:"allowed_commands"`
+}
+
+// ProviderConfig describes the LLM backend.
+type ProviderConfig struct {
+	Type           string `yaml:"type"`
+	BaseURL        string `yaml:"base_url"`
+	APIKey         string `yaml:"api_key"`
+	Model          string `yaml:"model"`
+	SystemPrompt   string `yaml:"system_prompt"`
+	MaxTokens      int    `yaml:"max_tokens"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
 // Load reads and parses a config file. The format is selected by file
@@ -212,6 +213,23 @@ func applyDefaults(cfg *Config) {
 	if cfg.Provider.TimeoutSeconds == 0 {
 		cfg.Provider.TimeoutSeconds = 120
 	}
+	for name, pc := range cfg.Models {
+		if pc.BaseURL == "" {
+			pc.BaseURL = "https://api.openai.com/v1"
+		}
+		if pc.MaxTokens == 0 {
+			pc.MaxTokens = 4096
+		}
+		if pc.TimeoutSeconds == 0 {
+			pc.TimeoutSeconds = 120
+		}
+		cfg.Models[name] = pc
+	}
+	if cfg.Provider.SystemPrompt == "" && strings.TrimSpace(cfg.PrimaryModel) != "" {
+		if pc, ok := cfg.Models[cfg.PrimaryModel]; ok && strings.TrimSpace(pc.SystemPrompt) != "" {
+			cfg.Provider.SystemPrompt = pc.SystemPrompt
+		}
+	}
 	if cfg.Provider.SystemPrompt == "" {
 		cfg.Provider.SystemPrompt = "You are a helpful assistant."
 	}
@@ -243,6 +261,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Log.DebugFile == "" {
 		cfg.Log.DebugFile = dirs.DebugLogFile()
 	}
+	if cfg.Log.MetricsFile == "" {
+		cfg.Log.MetricsFile = dirs.MetricsFile()
+	}
 }
 
 func applyEnvOverrides(cfg *Config) {
@@ -251,54 +272,65 @@ func applyEnvOverrides(cfg *Config) {
 	// to edit the shared config file.
 	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
 		cfg.Provider.APIKey = v
+		for name, pc := range cfg.Models {
+			pc.APIKey = v
+			cfg.Models[name] = pc
+		}
 	}
 }
 
 func validate(cfg *Config) error {
-	// Validate single-model provider (only required when router is not configured).
-	if !cfg.ProviderRouter.IsEnabled() {
-		if cfg.Provider.Type == "" {
-			cfg.Provider.Type = "openai"
-		}
-		if cfg.Provider.Type != "openai" {
-			return fmt.Errorf("unsupported provider type %q", cfg.Provider.Type)
-		}
-	}
 	return nil
 }
 
 // ValidateServe performs additional validation required for daemon (serve) mode.
 func ValidateServe(cfg *Config) error {
-	// When the multi-tier router is enabled, validate each configured tier.
-	if cfg.ProviderRouter.IsEnabled() {
-		if err := validateProviderConfig("provider_router.task", cfg.ProviderRouter.Task); err != nil {
+	if len(cfg.Models) == 0 {
+		return fmt.Errorf("models catalog is empty")
+	}
+	if strings.TrimSpace(cfg.PrimaryModel) == "" {
+		return fmt.Errorf("primary_model is required")
+	}
+	defaultPC, ok := cfg.Models[cfg.PrimaryModel]
+	if !ok {
+		return fmt.Errorf("primary_model references unknown model %q", cfg.PrimaryModel)
+	}
+	if err := validateProviderConfig("models."+cfg.PrimaryModel, &defaultPC); err != nil {
+		return err
+	}
+
+	if cfg.RoutingPolicy.IsEnabled() {
+		mustGet := func(tier, name string) (*ProviderConfig, error) {
+			pc, ok := cfg.Models[name]
+			if !ok {
+				return nil, fmt.Errorf("routing_policy.%s_model references unknown model %q", tier, name)
+			}
+			return &pc, nil
+		}
+		taskPC, err := mustGet("task", cfg.RoutingPolicy.TaskModel)
+		if err != nil {
 			return err
 		}
-		for name, pc := range map[string]*ProviderConfig{
-			"provider_router.routing":  cfg.ProviderRouter.Routing,
-			"provider_router.summary":  cfg.ProviderRouter.Summary,
-			"provider_router.thinking": cfg.ProviderRouter.Thinking,
+		if err := validateProviderConfig("models."+cfg.RoutingPolicy.TaskModel, taskPC); err != nil {
+			return err
+		}
+		for tier, modelName := range map[string]string{
+			"routing":  cfg.RoutingPolicy.RoutingModel,
+			"summary":  cfg.RoutingPolicy.SummaryModel,
+			"thinking": cfg.RoutingPolicy.ThinkingModel,
 		} {
-			if pc != nil {
-				if err := validateProviderConfig(name, pc); err != nil {
-					return err
-				}
+			if strings.TrimSpace(modelName) == "" {
+				continue
+			}
+			pc, err := mustGet(tier, modelName)
+			if err != nil {
+				return err
+			}
+			if err := validateProviderConfig("models."+modelName, pc); err != nil {
+				return err
 			}
 		}
 		return nil
-	}
-	if cfg.Provider.APIKey == "" {
-		return fmt.Errorf("API key is not set — add provider.api_key to config or set OPENAI_API_KEY")
-	}
-	// Detect OAuth placeholder markers (e.g. "qwen-oauth", "anthropic-oauth").
-	// The official openclaw handles these via browser login; claw-go does not
-	// support OAuth flows and will receive a 401 if sent as a bearer token.
-	if strings.HasSuffix(cfg.Provider.APIKey, "-oauth") {
-		return fmt.Errorf(
-			"API key %q looks like an OAuth placeholder used by the official openclaw client.\n"+
-				"claw-go does not support OAuth flows — set OPENAI_API_KEY to a real API key",
-			cfg.Provider.APIKey,
-		)
 	}
 	return nil
 }

@@ -74,6 +74,11 @@ type oaResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -177,11 +182,17 @@ func (p *OpenAIProvider) CompleteWithTools(ctx context.Context, messages []Messa
 		return CompleteResult{}, fmt.Errorf("openai: no choices returned")
 	}
 
+	usage := Usage{
+		PromptTokens:     result.Usage.PromptTokens,
+		CompletionTokens: result.Usage.CompletionTokens,
+		TotalTokens:      result.Usage.TotalTokens,
+	}
 	choice := result.Choices[0]
 	if len(choice.Message.ToolCalls) > 0 {
 		return CompleteResult{
 			ToolCalls:  choice.Message.ToolCalls,
 			StopReason: choice.FinishReason,
+			Usage:      usage,
 		}, nil
 	}
 	content := choice.Message.Content
@@ -194,5 +205,6 @@ func (p *OpenAIProvider) CompleteWithTools(ctx context.Context, messages []Messa
 	return CompleteResult{
 		Content:    content,
 		StopReason: choice.FinishReason,
+		Usage:      usage,
 	}, nil
 }

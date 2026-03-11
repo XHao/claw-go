@@ -159,14 +159,17 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	log.Info("claw daemon starting",
 		"data_dir", dirs.Data(),
 		"socket", socketPath,
-		"provider", cfg.Provider.Type,
-		"model", cfg.Provider.Model,
+		"primary_model", cfg.PrimaryModel,
 	)
 
 	llm := buildLLM(cfg)
 	if cfg.Log.DebugLLM {
 		llm = provider.WrapDebug(llm, cfg.Log.DebugFile)
 		log.Info("已启用 LLM 调试日志", "file", cfg.Log.DebugFile)
+	}
+	if cfg.Log.MetricsEnabled {
+		llm = provider.WrapMetrics(llm, cfg.Log.MetricsFile)
+		log.Info("已启用 LLM 指标收集", "file", cfg.Log.MetricsFile)
 	}
 
 	sessions := session.NewStore(cfg.MaxHistoryTurns, config.ExpandPrompt(cfg.Provider.SystemPrompt), dirs.Sessions())
@@ -194,6 +197,15 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	ag.SetSkillRouter(skill.NewRouter(skillReg))
 	ag.SetExperienceStore(expStore)
 	log.Info("skill router ready", "skills", len(skillReg.AsToolDefs()))
+
+	// Wire auto-router: automatically selects task vs. thinking tier per message.
+	// Only enabled when a cheap routing-tier model is configured.
+	if cfg.RoutingPolicy.IsEnabled() && cfg.RoutingPolicy.RoutingModel != "" {
+		if pc, ok := cfg.Models[cfg.RoutingPolicy.RoutingModel]; ok {
+			ag.SetAutoRouter(provider.NewAutoRouter(llm))
+			log.Info("自动路由已启用", "classifier_model", pc.Model)
+		}
+	}
 
 	sock := channel.NewSocketChannel("default", socketPath, sessions)
 	ag.RegisterChannel(sock)
@@ -246,36 +258,45 @@ func runConnect(cfg *config.Config, socketPath string) {
 }
 
 // buildLLM constructs the Provider from config.
-// When provider_router.task is set, a RouterProvider is returned.
-// Otherwise the legacy single-model provider is used (backward compatible).
+// When routing_policy is configured, a RouterProvider is returned.
+// Otherwise the single-model provider is used.
 func buildLLM(cfg *config.Config) provider.Provider {
-	rc := cfg.ProviderRouter
-	if rc.IsEnabled() {
-		newOAI := func(pc *config.ProviderConfig) provider.Provider {
-			if pc == nil {
-				return nil
-			}
-			return provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds)
+	getByName := func(name string) *config.ProviderConfig {
+		if name == "" {
+			return nil
 		}
+		pc, ok := cfg.Models[name]
+		if !ok {
+			return nil
+		}
+		v := pc
+		return &v
+	}
+	newOAI := func(pc *config.ProviderConfig) provider.Provider {
+		if pc == nil {
+			return nil
+		}
+		return provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds)
+	}
+
+	defaultProvider := newOAI(getByName(cfg.PrimaryModel))
+
+	if cfg.RoutingPolicy.IsEnabled() {
 		rp, err := provider.NewRouterProvider(
-			newOAI(rc.Task),
-			newOAI(rc.Routing),
-			newOAI(rc.Summary),
-			newOAI(rc.Thinking),
+			newOAI(getByName(cfg.RoutingPolicy.TaskModel)),
+			newOAI(getByName(cfg.RoutingPolicy.RoutingModel)),
+			newOAI(getByName(cfg.RoutingPolicy.SummaryModel)),
+			newOAI(getByName(cfg.RoutingPolicy.ThinkingModel)),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: build router provider: %v\n", err)
 			os.Exit(1)
 		}
-		return rp
+		return provider.WrapFallback(rp, defaultProvider)
 	}
-	return provider.NewOpenAI(
-		cfg.Provider.BaseURL,
-		cfg.Provider.APIKey,
-		cfg.Provider.Model,
-		cfg.Provider.MaxTokens,
-		cfg.Provider.TimeoutSeconds,
-	)
+
+	// No routing policy: use default model directly.
+	return defaultProvider
 }
 
 func setupLogger(level, logFile string) *slog.Logger {

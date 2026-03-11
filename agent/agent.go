@@ -31,6 +31,7 @@ type Agent struct {
 	memory        *memory.Manager            // optional; nil = memory disabled
 	skillRouter   *skill.Router              // optional; nil = skills disabled
 	expStore      *knowledge.ExperienceStore // optional; nil = auto-inject disabled
+	autoRouter    *provider.AutoRouter       // optional; nil = manual /think only
 	autoInjected  sync.Map                   // tracks "sessionKey:topic" → true
 	log           *slog.Logger
 }
@@ -74,6 +75,14 @@ func (a *Agent) SetSkillRouter(r *skill.Router) {
 // Calling with nil disables auto-injection.
 func (a *Agent) SetExperienceStore(s *knowledge.ExperienceStore) {
 	a.expStore = s
+}
+
+// SetAutoRouter attaches an AutoRouter so that each incoming message is
+// automatically routed to the appropriate model tier (task vs. thinking)
+// without requiring the user to prefix messages with /think.
+// Calling with nil disables automatic routing.
+func (a *Agent) SetAutoRouter(ar *provider.AutoRouter) {
+	a.autoRouter = ar
 }
 
 // RegisterChannel adds a channel so the agent can dispatch replies through it.
@@ -131,6 +140,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 	if strings.HasPrefix(text, "/think ") || text == "/think" {
 		text = strings.TrimSpace(strings.TrimPrefix(text, "/think"))
 		ctx = provider.WithModelHint(ctx, provider.ModelHintThinking)
+		ctx = provider.WithHintSource(ctx, "agent/think")
 		if text == "" {
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
@@ -150,11 +160,26 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 	// Auto-inject relevant experience libraries before the first LLM call.
 	a.autoInjectExperiences(ctx, msg, ch)
 
+	// Auto-route: classify message complexity and select a model tier automatically.
+	// Only fires when no explicit hint is already set (e.g. via /think).
+	if a.autoRouter != nil && provider.HintFromContext(ctx) == provider.ModelHintDefault {
+		skillNames := []string{}
+		if a.skillRouter != nil {
+			skillNames = a.skillRouter.Names()
+		}
+		decision := a.autoRouter.Classify(ctx, text, sess.History(), skillNames)
+		ctx = provider.WithModelHint(ctx, decision.Hint)
+		log.Info("auto-routed", "hint", decision.Hint, "reason", decision.Reason)
+	}
+
 	// Accumulate tool actions for the memory summary.
 	var turnActions []memory.Action
 	for i := 0; i < a.maxIterations; i++ {
 		log.Info("calling LLM", "iteration", i)
 		start := time.Now()
+
+		// Tag every call with its loop iteration so metrics/debug show "agent/loop[i=N]".
+		loopCtx := provider.WithHintSource(ctx, fmt.Sprintf("agent/loop[i=%d]", i))
 
 		// Build the effective tool list: client-side tools + skill defs.
 		// Skill defs are always included (they execute server-side regardless
@@ -168,7 +193,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			tools = append(tools, a.tools...)
 		}
 
-		result, err := a.provider.CompleteWithTools(ctx, sess.History(), tools)
+		result, err := a.provider.CompleteWithTools(loopCtx, sess.History(), tools)
 		if err != nil {
 			log.Error("LLM completion failed", "err", err)
 			a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, i, true)
@@ -304,7 +329,8 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 func (a *Agent) InjectMessage(ctx context.Context, sessionKey, text string) (string, error) {
 	sess := a.sessions.Get(sessionKey)
 	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
-	reply, err := a.provider.Complete(ctx, sess.History())
+	injectCtx := provider.WithHintSource(ctx, "agent/inject")
+	reply, err := a.provider.Complete(injectCtx, sess.History())
 	if err != nil {
 		return "", err
 	}
