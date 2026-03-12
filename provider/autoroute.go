@@ -10,7 +10,7 @@ import (
 // RouteDecision is the output of AutoRouter.Classify.
 type RouteDecision struct {
 	Hint   ModelHint
-	Reason string // e.g. "heuristic:simple", "heuristic:skill", "llm:thinking", "llm:task"
+	Reason string // e.g. "heuristic:keyword", "heuristic:simple", "heuristic:skill", "llm:thinking", "llm:task"
 }
 
 // AutoRouter classifies each incoming user message into a model tier before
@@ -29,15 +29,50 @@ type RouteDecision struct {
 // attaches a ModelHint to the context.  Any Provider (including RouterProvider)
 // can be passed as the underlying provider.
 type AutoRouter struct {
-	provider Provider
+	provider         Provider
+	thinkingKeywords []string
+}
+
+// DefaultThinkingKeywords are built-in fast-path triggers for complex requests.
+var DefaultThinkingKeywords = []string{
+	"帮我规划",
+	"help me plan",
+	"plan this out",
+	"给个方案",
+	"give me a plan",
+	"give me a proposal",
+	"分步骤",
+	"step by step",
+	"break it down",
+	"怎么权衡",
+	"how to balance",
+	"how to trade off",
+	"利弊",
+	"pros and cons",
+	"trade-offs",
+	"深入分析",
+	"deep analysis",
+	"analyze in depth",
+	"根因",
+	"root cause",
+	"root cause analysis",
+	"重构",
+	"refactor",
+	"refactoring",
+	"架构",
+	"architecture",
+	"architecture design",
 }
 
 // NewAutoRouter creates an AutoRouter backed by provider.
 // For the routing to be cost-effective, provider should be (or wrap) a
 // RouterProvider so that classification calls — which carry ModelHintRouter —
 // are dispatched to the cheapest routing-tier model.
-func NewAutoRouter(p Provider) *AutoRouter {
-	return &AutoRouter{provider: p}
+func NewAutoRouter(p Provider, extraThinkingKeywords []string) *AutoRouter {
+	return &AutoRouter{
+		provider:         p,
+		thinkingKeywords: mergeKeywords(DefaultThinkingKeywords, extraThinkingKeywords),
+	}
 }
 
 // Classify determines the appropriate model tier for the current turn.
@@ -45,6 +80,9 @@ func NewAutoRouter(p Provider) *AutoRouter {
 // (already including text as the last user message); skillNames is the list
 // of available server-side skills/tools.
 func (a *AutoRouter) Classify(ctx context.Context, text string, history []Message, skillNames []string) RouteDecision {
+	if matchThinkingKeyword(text, a.thinkingKeywords) {
+		return RouteDecision{Hint: ModelHintThinking, Reason: "heuristic:keyword"}
+	}
 	if heuristicSimple(text) {
 		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:simple"}
 	}
@@ -126,6 +164,39 @@ func heuristicSimple(text string) bool {
 		return true
 	}
 	return false
+}
+
+func matchThinkingKeyword(text string, keywords []string) bool {
+	if len(keywords) == 0 {
+		return false
+	}
+	lower := strings.ToLower(text)
+	for _, kw := range keywords {
+		k := strings.TrimSpace(strings.ToLower(kw))
+		if k != "" && strings.Contains(lower, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeKeywords(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	out := make([]string, 0, len(base)+len(extra))
+	for _, list := range [][]string{base, extra} {
+		for _, kw := range list {
+			k := strings.TrimSpace(strings.ToLower(kw))
+			if k == "" {
+				continue
+			}
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // canHandleBySkill returns true if the message matches any available skill name.

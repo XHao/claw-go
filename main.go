@@ -202,7 +202,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	// Only enabled when a cheap routing-tier model is configured.
 	if cfg.RoutingPolicy.IsEnabled() && cfg.RoutingPolicy.RoutingModel != "" {
 		if pc, ok := cfg.Models[cfg.RoutingPolicy.RoutingModel]; ok {
-			ag.SetAutoRouter(provider.NewAutoRouter(llm))
+			ag.SetAutoRouter(provider.NewAutoRouter(llm, cfg.RoutingPolicy.ThinkingKeywords))
 			log.Info("自动路由已启用", "classifier_model", pc.Model)
 		}
 	}

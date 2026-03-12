@@ -148,5 +148,10 @@ log:
 #   task_model: "gemini_task"
 #   summary_model: "gemini_summary"
 #   thinking_model: "claude_thinking"
+#   thinking_keywords:
+#     - "重构"
+#     - "架构"
+#     - "high concurrency"
+#     - "system design"
 #
 # primary_model: "gemini_task"

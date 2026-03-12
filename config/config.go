@@ -36,10 +36,11 @@ type Config struct {
 // RoutingPolicyConfig maps tiers to named model entries from Config.Models.
 // TaskModel is required when the policy is enabled.
 type RoutingPolicyConfig struct {
-	RoutingModel  string `yaml:"routing_model"`
-	TaskModel     string `yaml:"task_model"`
-	SummaryModel  string `yaml:"summary_model"`
-	ThinkingModel string `yaml:"thinking_model"`
+	RoutingModel     string   `yaml:"routing_model"`
+	TaskModel        string   `yaml:"task_model"`
+	SummaryModel     string   `yaml:"summary_model"`
+	ThinkingModel    string   `yaml:"thinking_model"`
+	ThinkingKeywords []string `yaml:"thinking_keywords"`
 }
 
 // IsEnabled reports whether routing policy is configured.
