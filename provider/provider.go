@@ -53,6 +53,15 @@ type Usage struct {
 	TotalTokens      int
 }
 
+// ModelMeta describes which concrete model actually handled the call.
+//
+// ModelKey is the logical model name from config.models (when available),
+// while Model is the provider-native model identifier (e.g. gpt-4o-mini).
+type ModelMeta struct {
+	ModelKey string
+	Model    string
+}
+
 // CompleteResult is returned by CompleteWithTools.
 // Exactly one of Content or ToolCalls will be non-zero.
 type CompleteResult struct {
@@ -60,6 +69,7 @@ type CompleteResult struct {
 	ToolCalls  []ToolCallRequest // tool calls requested by the model
 	StopReason string
 	Usage      Usage // token counts reported by the API
+	Model      ModelMeta
 }
 
 // Provider is the interface that any LLM backend must implement.

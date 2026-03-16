@@ -26,6 +26,22 @@ type ToolResult struct {
 	IsError bool   `json:"is_error,omitempty"`
 }
 
+// LLMUsageEvent is emitted by the daemon after each LLM call.
+// It enables realtime token and throughput telemetry in the CLI.
+type LLMUsageEvent struct {
+	At               string `json:"at"`
+	Hint             string `json:"hint,omitempty"`
+	Source           string `json:"source,omitempty"`
+	ModelKey         string `json:"model_key,omitempty"`
+	Model            string `json:"model,omitempty"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	LatencyMs        int64  `json:"latency_ms"`
+	StopReason       string `json:"stop_reason,omitempty"`
+	IsError          bool   `json:"is_error,omitempty"`
+}
+
 // ToolExchangeFn is implemented by the channel layer and allows the agent
 // to synchronously request tool execution from the connected client.
 // The function sends tool calls to the client, blocks until results arrive,
@@ -64,8 +80,9 @@ type Msg struct {
 	Session  string        `json:"session,omitempty"`
 	Sessions []SessionInfo `json:"sessions,omitempty"`
 	// tool calling
-	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`   // server → client
-	ToolResults []ToolResult `json:"tool_results,omitempty"` // client → server
+	ToolCalls   []ToolCall     `json:"tool_calls,omitempty"`   // server → client
+	ToolResults []ToolResult   `json:"tool_results,omitempty"` // client → server
+	Usage       *LLMUsageEvent `json:"usage,omitempty"`
 	// recent history sent with select-ack
 	History []HistoryEntry `json:"history,omitempty"`
 }

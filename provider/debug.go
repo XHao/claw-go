@@ -133,9 +133,19 @@ func (d *DebugProvider) CompleteWithTools(ctx context.Context, messages []Messag
 		return result, err
 	}
 
-	fmt.Fprintf(w, "\n── ✅ 响应  stop_reason=%-16s  elapsed=%dms  tokens=%d(%d+%d) %s\n",
+	modelStr := ""
+	switch {
+	case result.Model.ModelKey != "" && result.Model.Model != "":
+		modelStr = fmt.Sprintf("  model=%s/%s", result.Model.ModelKey, result.Model.Model)
+	case result.Model.ModelKey != "":
+		modelStr = fmt.Sprintf("  model=%s", result.Model.ModelKey)
+	case result.Model.Model != "":
+		modelStr = fmt.Sprintf("  model=%s", result.Model.Model)
+	}
+	fmt.Fprintf(w, "\n── ✅ 响应  stop_reason=%-16s  elapsed=%dms  tokens=%d(%d+%d)%s %s\n",
 		result.StopReason, elapsed,
 		result.Usage.TotalTokens, result.Usage.PromptTokens, result.Usage.CompletionTokens,
+		modelStr,
 		thin)
 
 	if result.Content != "" {

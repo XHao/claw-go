@@ -13,13 +13,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chzyer/readline"
 	"github.com/XHao/claw-go/config"
 	"github.com/XHao/claw-go/ipc"
 	"github.com/XHao/claw-go/knowledge"
 	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
 	"github.com/XHao/claw-go/tool"
+	"github.com/chzyer/readline"
 )
 
 // Runner can execute a shell command with local stdin/stdout/stderr.
@@ -115,6 +115,7 @@ func Run(
 	_ = localRunner // used in printNextReply below
 
 	fmt.Printf("「%s」对话  （输入 /help 查看命令）\n", S.Bold(sessionName))
+	usageTracker := NewUsageTracker()
 
 	// ── Phase 4: chat loop (synchronous: send → wait for reply → repeat) ─────
 	// Using a synchronous model avoids all readline/goroutine concurrency issues:
@@ -151,7 +152,7 @@ func Run(
 				return fmt.Errorf("write: %w", err)
 			}
 			sp := NewSpinner("正在清空对话…")
-			err := printNextReply(ctx, scanner, enc, localRunner, sp)
+			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -189,7 +190,7 @@ func Run(
 			}
 			// Show spinner while waiting; stop it before rendering the reply.
 			sp := NewSpinner("思考中…")
-			err := printNextReply(ctx, scanner, enc, localRunner, sp)
+			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -202,7 +203,7 @@ func Run(
 // error is received. sp is the active spinner; it is stopped before any output
 // so the line is clean. If the daemon sends tool_calls, they are executed
 // locally, results sent back, and the spinner resumes waiting.
-func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, localRunner *tool.LocalRunner, sp *Spinner) error {
+func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, localRunner *tool.LocalRunner, sp *Spinner, usageTracker *UsageTracker) error {
 	for {
 		// Respect context cancellation (e.g. Ctrl-C).
 		if ctx.Err() != nil {
@@ -240,7 +241,7 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 					ToolResults: []ipc.ToolResult{},
 				})
 				newSp := NewSpinner("思考中…")
-				err := printNextReply(ctx, scanner, enc, localRunner, newSp)
+				err := printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker)
 				newSp.Stop()
 				return err
 			}
@@ -271,9 +272,21 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 			}
 			// Restart spinner while daemon processes results with LLM.
 			newSp := NewSpinner("处理结果中…")
-			err := printNextReply(ctx, scanner, enc, localRunner, newSp)
+			err := printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker)
 			newSp.Stop()
 			return err
+		}
+
+		// ── Usage telemetry: update live throughput label and keep waiting ─────
+		if msg.Usage != nil {
+			if usageTracker != nil {
+				usageTracker.Add(*msg.Usage)
+				label := usageTracker.SpinnerLabel()
+				if label != "" {
+					sp.UpdateLabel("思考中… " + label)
+				}
+			}
+			continue
 		}
 
 		// ── Terminal messages — always stop spinner first ──────────────────────
@@ -281,6 +294,11 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 		switch {
 		case msg.Reply != "":
 			renderMarkdown(msg.Reply)
+			if usageTracker != nil {
+				if line := usageTracker.SummaryLine(); line != "" {
+					fmt.Printf("%s %s\n", S.Dim("[指标]"), S.Dim(line))
+				}
+			}
 			return nil
 		case msg.Info != "":
 			fmt.Printf("%s %s\n", S.Dim("[提示]"), msg.Info)

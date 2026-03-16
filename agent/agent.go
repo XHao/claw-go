@@ -104,6 +104,14 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 	}
 
 	ch := a.channels[msg.ChannelType+":"+msg.ChannelName]
+	if ch != nil {
+		ctx = provider.WithUsageObserver(ctx, func(ev provider.UsageEvent) {
+			_ = ch.Send(ctx, channel.OutboundMessage{
+				ChatID: msg.ChatID,
+				Usage:  toIPCUsageEvent(ev),
+			})
+		})
+	}
 
 	if text == "/reset" || text == "/start" {
 		if msg.SessionKey == session.MainSessionKey {
@@ -322,6 +330,22 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			ChatID: msg.ChatID,
 			Text:   fmt.Sprintf("已达到最大工具调用次数（%d），最终状态可能不完整。", a.maxIterations),
 		})
+	}
+}
+
+func toIPCUsageEvent(ev provider.UsageEvent) *ipc.LLMUsageEvent {
+	return &ipc.LLMUsageEvent{
+		At:               ev.At,
+		Hint:             ev.Hint,
+		Source:           ev.Source,
+		ModelKey:         ev.ModelKey,
+		Model:            ev.Model,
+		PromptTokens:     ev.PromptTokens,
+		CompletionTokens: ev.CompletionTokens,
+		TotalTokens:      ev.TotalTokens,
+		LatencyMs:        ev.LatencyMs,
+		StopReason:       ev.StopReason,
+		IsError:          ev.IsError,
 	}
 }
 

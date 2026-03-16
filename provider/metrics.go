@@ -13,9 +13,11 @@ import (
 // MetricsRecord captures one LLM call event in a structured form.
 // Written as a JSONL line to the metrics file.
 type MetricsRecord struct {
-	At               string `json:"at"`                // RFC3339Nano timestamp
-	Hint             string `json:"hint"`              // ModelHint tier ("task", "router", …)
-	Source           string `json:"source,omitempty"`  // call site label, e.g. "agent/loop[i=0]"
+	At               string `json:"at"`               // RFC3339Nano timestamp
+	Hint             string `json:"hint"`             // ModelHint tier ("task", "router", …)
+	Source           string `json:"source,omitempty"` // call site label, e.g. "agent/loop[i=0]"
+	ModelKey         string `json:"model_key,omitempty"`
+	Model            string `json:"model,omitempty"`
 	PromptTokens     int    `json:"prompt_tokens"`     // tokens in the request
 	CompletionTokens int    `json:"completion_tokens"` // tokens in the response
 	TotalTokens      int    `json:"total_tokens"`      // prompt + completion
@@ -75,6 +77,8 @@ func (m *MetricsProvider) CompleteWithTools(ctx context.Context, messages []Mess
 		At:               start.UTC().Format(time.RFC3339),
 		Hint:             hint,
 		Source:           SourceFromContext(ctx),
+		ModelKey:         result.Model.ModelKey,
+		Model:            result.Model.Model,
 		PromptTokens:     result.Usage.PromptTokens,
 		CompletionTokens: result.Usage.CompletionTokens,
 		TotalTokens:      result.Usage.TotalTokens,

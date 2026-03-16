@@ -171,6 +171,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		llm = provider.WrapMetrics(llm, cfg.Log.MetricsFile)
 		log.Info("已启用 LLM 指标收集", "file", cfg.Log.MetricsFile)
 	}
+	llm = provider.WrapObserve(llm)
 
 	sessions := session.NewStore(cfg.MaxHistoryTurns, config.ExpandPrompt(cfg.Provider.SystemPrompt), dirs.Sessions())
 
@@ -272,21 +273,25 @@ func buildLLM(cfg *config.Config) provider.Provider {
 		v := pc
 		return &v
 	}
-	newOAI := func(pc *config.ProviderConfig) provider.Provider {
+	newOAI := func(modelKey string, pc *config.ProviderConfig) provider.Provider {
 		if pc == nil {
 			return nil
 		}
-		return provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds)
+		inner := provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds)
+		return provider.WrapIdentity(inner, modelKey)
+	}
+	newOAIByName := func(modelKey string) provider.Provider {
+		return newOAI(modelKey, getByName(modelKey))
 	}
 
-	defaultProvider := newOAI(getByName(cfg.PrimaryModel))
+	defaultProvider := newOAIByName(cfg.PrimaryModel)
 
 	if cfg.RoutingPolicy.IsEnabled() {
 		rp, err := provider.NewRouterProvider(
-			newOAI(getByName(cfg.RoutingPolicy.TaskModel)),
-			newOAI(getByName(cfg.RoutingPolicy.RoutingModel)),
-			newOAI(getByName(cfg.RoutingPolicy.SummaryModel)),
-			newOAI(getByName(cfg.RoutingPolicy.ThinkingModel)),
+			newOAIByName(cfg.RoutingPolicy.TaskModel),
+			newOAIByName(cfg.RoutingPolicy.RoutingModel),
+			newOAIByName(cfg.RoutingPolicy.SummaryModel),
+			newOAIByName(cfg.RoutingPolicy.ThinkingModel),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: build router provider: %v\n", err)

@@ -282,7 +282,7 @@ func (s *SocketChannel) Send(_ context.Context, msg OutboundMessage) error {
 	if state == nil {
 		return nil
 	}
-	return state.encoder.Encode(ipc.Msg{Reply: msg.Text})
+	return state.encoder.Encode(ipc.Msg{Reply: msg.Text, Usage: msg.Usage})
 }
 
 // Status returns the channel health.

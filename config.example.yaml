@@ -107,7 +107,7 @@ log:
   metrics_enabled: false      # true = 开启结构化指标收集（JSONL，每行一条调用记录）
   # metrics_file: ~/.claw/logs/llm_metrics.jsonl
   #
-  # 指标字段：at/hint/prompt_tokens/completion_tokens/total_tokens/latency_ms/stop_reason/is_error
+  # 指标字段：at/hint/source/model_key/model/prompt_tokens/completion_tokens/total_tokens/latency_ms/stop_reason/is_error
   # hint 即 ModelHint tier: router/task/summary/thinking
   # 示例分析（jq）:
   #   cat ~/.claw/logs/llm_metrics.jsonl | jq -s 'group_by(.hint)[] | {hint: .[0].hint, calls: length, total_tokens: [.[].total_tokens] | add}'

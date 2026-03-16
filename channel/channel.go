@@ -26,6 +26,7 @@ type OutboundMessage struct {
 	ChatID           string
 	Text             string
 	ReplyToMessageID string
+	Usage            *ipc.LLMUsageEvent
 }
 
 // DispatchFunc is called by the channel for each inbound user message.

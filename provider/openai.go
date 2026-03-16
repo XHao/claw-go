@@ -193,6 +193,9 @@ func (p *OpenAIProvider) CompleteWithTools(ctx context.Context, messages []Messa
 			ToolCalls:  choice.Message.ToolCalls,
 			StopReason: choice.FinishReason,
 			Usage:      usage,
+			Model: ModelMeta{
+				Model: p.model,
+			},
 		}, nil
 	}
 	content := choice.Message.Content
@@ -206,5 +209,8 @@ func (p *OpenAIProvider) CompleteWithTools(ctx context.Context, messages []Messa
 		Content:    content,
 		StopReason: choice.FinishReason,
 		Usage:      usage,
+		Model: ModelMeta{
+			Model: p.model,
+		},
 	}, nil
 }
