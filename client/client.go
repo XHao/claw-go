@@ -18,6 +18,7 @@ import (
 	"github.com/XHao/claw-go/knowledge"
 	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
+	"github.com/XHao/claw-go/session"
 	"github.com/XHao/claw-go/tool"
 	"github.com/chzyer/readline"
 )
@@ -114,7 +115,7 @@ func Run(
 	}
 	_ = localRunner // used in printNextReply below
 
-	fmt.Printf("「%s」对话  （输入 /help 查看命令）\n", S.Bold(sessionName))
+	fmt.Printf("「%s」对话  （输入 /help 查看命令）\n", S.Bold(displaySessionName(sessionName)))
 	usageTracker := NewUsageTracker()
 
 	// ── Phase 4: chat loop (synchronous: send → wait for reply → repeat) ─────
@@ -146,6 +147,9 @@ func Run(
 			return nil
 		case line == "/help":
 			printHelp()
+			continue
+		case strings.HasPrefix(line, "/tokens"):
+			handleTokensCommand(line, usageTracker)
 			continue
 		case line == "/reset":
 			if err := enc.Encode(ipc.Msg{Cmd: "reset"}); err != nil {
@@ -185,6 +189,7 @@ func Run(
 				fmt.Fprintf(os.Stderr, "%s %v\n", S.Err("[错误]"), err)
 			}
 		default:
+			usageTracker.BeginTurn()
 			if err := enc.Encode(ipc.Msg{Text: line}); err != nil {
 				return fmt.Errorf("write: %w", err)
 			}
@@ -295,8 +300,15 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 		case msg.Reply != "":
 			renderMarkdown(msg.Reply)
 			if usageTracker != nil {
-				if line := usageTracker.SummaryLine(); line != "" {
-					fmt.Printf("%s %s\n", S.Dim("[指标]"), S.Dim(line))
+				if line := usageTracker.TurnSummaryLine(); line != "" {
+					style := S.Dim
+					switch usageTracker.TurnLevel() {
+					case "critical":
+						style = S.Err
+					case "warn":
+						style = S.Warn
+					}
+					fmt.Printf("%s %s\n", style("[指标]"), style(line))
 				}
 			}
 			return nil
@@ -305,13 +317,13 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 			return nil
 		case msg.Error != "":
 			// Friendly boxed error — non-blocking.
-			w := 44
-			// top: ╭─(2) + " 错误 "(visW=6) + dashes(w-7) + ╮(1) = w+2 = bottom width
-			fmt.Fprintf(os.Stderr, "\n%s\n", S.Err("╭─ 错误 "+strings.Repeat("─", w-7)+"╮"))
+			w := boxInnerWidth(44, 36, maxBoxWidth)
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, boxTopLine(w, " 错误 "))
 			for _, ln := range strings.Split(msg.Error, "\n") {
-				fmt.Fprintf(os.Stderr, "%s %s\n", S.Err("│"), ln)
+				fmt.Fprintf(os.Stderr, "%s%s%s\n", S.Err("│"), padRight(truncatePlain(ln, w), w), S.Err("│"))
 			}
-			fmt.Fprintf(os.Stderr, "%s\n", S.Err("╰"+strings.Repeat("─", w)+"╯"))
+			fmt.Fprintln(os.Stderr, boxBottomLine(w))
 			return nil
 		default:
 			// Empty or unrecognised frame — do NOT loop forever; return cleanly.
@@ -325,20 +337,41 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 // Protocol: server sends sessions list → client sends cmd → server sends
 // info (success) or error + new sessions list (retry).
 func selectSession(enc *json.Encoder, scanner *bufio.Scanner, sessions []ipc.SessionInfo) (string, []ipc.HistoryEntry, error) {
+	inputReader := bufio.NewReader(os.Stdin)
 	for {
 		// Draw the boxed session chooser; it also prints the input prompt.
 		fmt.Println()
 		DrawSessionList(sessions)
 
-		// Read user input (no server round-trip for invalid local input).
-		var input string
-		_, scanErr := fmt.Scanln(&input)
-		if scanErr != nil {
-			// Ctrl-D / EOF — exit cleanly.
+		line, readErr := inputReader.ReadString('\n')
+		if readErr != nil && readErr != io.EOF {
+			return "", nil, readErr
+		}
+		input := strings.TrimSpace(line)
+		if readErr == io.EOF && input == "" {
 			fmt.Println()
 			return "", nil, io.EOF
 		}
-		input = strings.TrimSpace(input)
+		if input == "" && len(sessions) > 0 {
+			if chosen, ok := defaultSessionName(sessions); ok {
+				if err := enc.Encode(ipc.Msg{Cmd: "select", Session: chosen}); err != nil {
+					return "", nil, fmt.Errorf("write: %w", err)
+				}
+				resp, err := readMsg(scanner)
+				if err != nil {
+					return "", nil, err
+				}
+				if resp.Error != "" {
+					fmt.Fprintf(os.Stderr, "%s %s\n", S.Err("错误："), resp.Error)
+					sessions, err = readSessionList(scanner)
+					if err != nil {
+						return "", nil, err
+					}
+					continue
+				}
+				return chosen, resp.History, nil
+			}
+		}
 		if input == "" {
 			// Server hasn't moved; no list refresh needed.
 			continue
@@ -408,6 +441,18 @@ func selectSession(enc *json.Encoder, scanner *bufio.Scanner, sessions []ipc.Ses
 	}
 }
 
+func defaultSessionName(sessions []ipc.SessionInfo) (string, bool) {
+	if len(sessions) == 0 {
+		return "", false
+	}
+	for _, s := range sessions {
+		if s.Name == session.MainSessionKey {
+			return s.Name, true
+		}
+	}
+	return sessions[0].Name, true
+}
+
 // readSessionList reads one message from the server and returns its Sessions
 // field. Used to consume the refreshed session list the server sends after an
 // error in the selection phase.
@@ -473,20 +518,25 @@ func runExp(ctx context.Context, arg string, store *knowledge.ExperienceStore,
 			fmt.Println(S.Dim("暂无经验库。使用 /learn \"<主题>\" 开始提炼。"))
 			return
 		}
-		w := 50
-		pipe := S.Border("│")
-		fmt.Println(S.Border("╭─") + S.Bold(" Experience Library ") + S.Border(strings.Repeat("─", w-22)+"─╮"))
+		w := boxInnerWidth(50, 46, maxBoxWidth)
+		printBoxTop(w, "Experience Library")
+		contentW := boxContentWidth(w)
 		for i, m := range list {
+			header := fmt.Sprintf("%d. %s", i+1, m.Topic)
+			for _, l := range wrapPlain(header, contentW) {
+				printBoxStyledLine(w, S.Bold(l))
+			}
 			size := fmt.Sprintf("%d KB", (m.Size+512)/1024)
 			updated := m.UpdatedAt.Format("01-02 15:04")
-			fmt.Printf("%s  %s  %s %s  %s\n",
-				pipe,
-				padRight(S.Bold(fmt.Sprintf("%2d", i+1)), 2),
-				padRight(S.Bold(m.Topic), 28),
-				padRight(S.Dim(size), 6),
-				S.Dim(updated))
+			meta := fmt.Sprintf("   size: %s   updated: %s", size, updated)
+			for _, l := range wrapPlain(meta, contentW) {
+				printBoxStyledLine(w, S.Dim(l))
+			}
+			if i < len(list)-1 {
+				printBoxDivider(w)
+			}
 		}
-		fmt.Println(S.Border("╰" + strings.Repeat("─", w) + "╯"))
+		printBoxBottom(w)
 		fmt.Println(S.Dim("提示: /exp show <主题>  /exp use <主题>  /exp rm <主题>"))
 
 	case "show":
@@ -553,10 +603,12 @@ func runExp(ctx context.Context, arg string, store *knowledge.ExperienceStore,
 }
 
 func printHelp() {
-	w := 58
-	// top: ╭─(2) + " 帮助 "(visW=6) + dashes(w-8) + ─╮(2) = w+2 = bottom width
-	fmt.Println(S.Border("╭─") + S.Bold(" 帮助 ") + S.Border(strings.Repeat("─", w-8)+"─╮"))
-	pipe := S.Border("│")
+	w := boxInnerWidth(58, 54, maxBoxWidth)
+	printBoxTop(w, "帮助")
+	cmdWidth := 22
+	if w < 58 {
+		cmdWidth = 18
+	}
 	// Extra non-slash entries shown at the bottom.
 	extras := [][2]string{
 		{"!<命令>", "直接运行本地 Shell 命令（需开启 shell_enabled）"},
@@ -567,10 +619,85 @@ func printHelp() {
 		if len(e.args) > 0 {
 			argHint = " " + strings.Join(e.args, "|")
 		}
-		fmt.Printf("%s  %s %s\n", pipe, padRight(S.Bold(e.cmd+argHint), 24), S.Dim(e.desc))
+		printBoxKeyValueLines(w, e.cmd+argHint, e.desc, cmdWidth, S.Bold, S.Dim)
 	}
+	printBoxDivider(w)
 	for _, item := range extras {
-		fmt.Printf("%s  %s %s\n", pipe, padRight(S.Bold(item[0]), 24), S.Dim(item[1]))
+		printBoxKeyValueLines(w, item[0], item[1], cmdWidth, S.Bold, S.Dim)
 	}
-	fmt.Println(S.Border("╰" + strings.Repeat("─", w) + "╯"))
+	printBoxBottom(w)
+}
+
+func printTokenReport(usageTracker *UsageTracker) {
+	if usageTracker == nil {
+		fmt.Println(S.Dim("暂无 token 统计。"))
+		return
+	}
+	w := boxInnerWidth(86, 48, maxBoxWidth)
+	lines := usageTracker.PrettyReportLines()
+	if isCompactWidth(w) {
+		lines = usageTracker.CompactReportLines()
+	}
+	title := " Token 报表 "
+	printBoxTop(w, title)
+	keyWidth := 12
+	if isCompactWidth(w) {
+		keyWidth = 10
+	}
+	first := true
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "- ") {
+			printBoxWrappedTextLines(w, "  "+line, S.Dim)
+			first = false
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx <= 0 {
+			printBoxWrappedTextLines(w, line, S.Dim)
+			first = false
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		value := strings.TrimSpace(line[idx+1:])
+		if value == "" {
+			if !first {
+				printBoxDivider(w)
+			}
+			printBoxWrappedTextLines(w, key, S.Bold)
+			first = false
+			continue
+		}
+		printBoxKeyValueLines(w, key, value, keyWidth, S.Bold, S.Dim)
+		first = false
+	}
+	printBoxBottom(w)
+}
+
+func handleTokensCommand(line string, usageTracker *UsageTracker) {
+	if usageTracker == nil {
+		fmt.Println(S.Dim("暂无 token 统计。"))
+		return
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(line, "/tokens"))
+	if arg == "" || arg == "report" || arg == "r" {
+		printTokenReport(usageTracker)
+		return
+	}
+	switch arg {
+	case "turn", "t":
+		if s := usageTracker.TurnSummaryLine(); s != "" {
+			fmt.Printf("%s %s\n", S.Bold("[本轮]"), S.Dim(s))
+		} else {
+			fmt.Println(S.Dim("本轮暂无 token 调用。"))
+		}
+	case "clear", "c", "reset":
+		usageTracker.Reset()
+		fmt.Println(S.Success("[tokens] 已清空本次 CLI 的 token 统计。"))
+	default:
+		fmt.Println(S.Warn("用法: /tokens [report|turn|clear]"))
+	}
 }

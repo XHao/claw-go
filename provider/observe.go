@@ -2,7 +2,10 @@ package provider
 
 import (
 	"context"
+	"math"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type usageObserverKey struct{}
@@ -14,6 +17,8 @@ type UsageEvent struct {
 	Source           string
 	ModelKey         string
 	Model            string
+	InputTokensEst   int
+	ContextTokensEst int
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
@@ -67,6 +72,7 @@ func (o *ObserveProvider) CompleteWithTools(ctx context.Context, messages []Mess
 		if hint == "" {
 			hint = string(ModelHintTask)
 		}
+		inputEst, contextEst := estimatePromptBreakdown(messages, result.Usage.PromptTokens)
 		stopReason := result.StopReason
 		if err != nil && stopReason == "" {
 			stopReason = "error"
@@ -77,6 +83,8 @@ func (o *ObserveProvider) CompleteWithTools(ctx context.Context, messages []Mess
 			Source:           SourceFromContext(ctx),
 			ModelKey:         result.Model.ModelKey,
 			Model:            result.Model.Model,
+			InputTokensEst:   inputEst,
+			ContextTokensEst: contextEst,
 			PromptTokens:     result.Usage.PromptTokens,
 			CompletionTokens: result.Usage.CompletionTokens,
 			TotalTokens:      result.Usage.TotalTokens,
@@ -86,4 +94,42 @@ func (o *ObserveProvider) CompleteWithTools(ctx context.Context, messages []Mess
 		})
 	}
 	return result, err
+}
+
+func estimatePromptBreakdown(messages []Message, promptTokens int) (inputTokensEst, contextTokensEst int) {
+	if promptTokens <= 0 {
+		return 0, 0
+	}
+	totalLen := 0
+	lastUserLen := 0
+	for _, m := range messages {
+		content := strings.TrimSpace(m.Content)
+		if content == "" {
+			continue
+		}
+		totalLen += utf8.RuneCountInString(content)
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(messages[i].Content)
+		if content == "" {
+			continue
+		}
+		lastUserLen = utf8.RuneCountInString(content)
+		break
+	}
+	if totalLen <= 0 || lastUserLen <= 0 {
+		return 0, promptTokens
+	}
+	inputTokensEst = int(math.Round(float64(promptTokens) * float64(lastUserLen) / float64(totalLen)))
+	if inputTokensEst < 0 {
+		inputTokensEst = 0
+	}
+	if inputTokensEst > promptTokens {
+		inputTokensEst = promptTokens
+	}
+	contextTokensEst = promptTokens - inputTokensEst
+	return inputTokensEst, contextTokensEst
 }

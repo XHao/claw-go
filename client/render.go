@@ -4,17 +4,19 @@ import (
 	"github.com/charmbracelet/glamour"
 )
 
-// mdRenderer is initialized once and reused.
-var mdRenderer *glamour.TermRenderer
-
-func init() {
+func newMarkdownRenderer() *glamour.TermRenderer {
+	wrap := boxInnerWidth(100, 40, maxBoxWidth) - 2
+	if wrap < 20 {
+		wrap = 20
+	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(100),
+		glamour.WithWordWrap(wrap),
 	)
-	if err == nil {
-		mdRenderer = r
+	if err != nil {
+		return nil
 	}
+	return r
 }
 
 // renderMarkdown prints the assistant reply with a decorative header.
@@ -22,6 +24,7 @@ func init() {
 // otherwise it is printed as plain text.
 func renderMarkdown(content string) {
 	PrintAssistantHeader()
+	mdRenderer := newMarkdownRenderer()
 
 	if mdRenderer == nil || !looksLikeMarkdown(content) {
 		// Plain text — just print indented under the header.

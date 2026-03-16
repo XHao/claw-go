@@ -340,6 +340,8 @@ func toIPCUsageEvent(ev provider.UsageEvent) *ipc.LLMUsageEvent {
 		Source:           ev.Source,
 		ModelKey:         ev.ModelKey,
 		Model:            ev.Model,
+		InputTokensEst:   ev.InputTokensEst,
+		ContextTokensEst: ev.ContextTokensEst,
 		PromptTokens:     ev.PromptTokens,
 		CompletionTokens: ev.CompletionTokens,
 		TotalTokens:      ev.TotalTokens,

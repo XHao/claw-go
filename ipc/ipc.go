@@ -34,6 +34,8 @@ type LLMUsageEvent struct {
 	Source           string `json:"source,omitempty"`
 	ModelKey         string `json:"model_key,omitempty"`
 	Model            string `json:"model,omitempty"`
+	InputTokensEst   int    `json:"input_tokens_est,omitempty"`
+	ContextTokensEst int    `json:"context_tokens_est,omitempty"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
 	TotalTokens      int    `json:"total_tokens"`

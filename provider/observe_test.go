@@ -31,7 +31,11 @@ func TestWrapObserveEmitsUsageEvent(t *testing.T) {
 		got = ev
 	})
 
-	_, err := obs.CompleteWithTools(ctx, nil, nil)
+	msgs := []Message{
+		{Role: "system", Content: "You are a helpful coding assistant."},
+		{Role: "user", Content: "请帮我设计一个 API"},
+	}
+	_, err := obs.CompleteWithTools(ctx, msgs, nil)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -46,5 +50,8 @@ func TestWrapObserveEmitsUsageEvent(t *testing.T) {
 	}
 	if got.TotalTokens != 30 {
 		t.Fatalf("want total tokens 30, got %d", got.TotalTokens)
+	}
+	if got.InputTokensEst+got.ContextTokensEst != got.PromptTokens {
+		t.Fatalf("prompt split mismatch: input=%d context=%d prompt=%d", got.InputTokensEst, got.ContextTokensEst, got.PromptTokens)
 	}
 }

@@ -3,28 +3,33 @@ package client
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	runewidth "github.com/mattn/go-runewidth"
 	"github.com/XHao/claw-go/ipc"
+	"github.com/XHao/claw-go/session"
+	runewidth "github.com/mattn/go-runewidth"
+	"golang.org/x/term"
 )
 
 const (
-	uiWidth = 54 // visual width of horizontal lines
-	maxName = 26 // max visible chars for a session name
+	uiWidth      = 54 // preferred visual width of horizontal lines
+	maxName      = 26 // preferred max visible chars for a session name
+	minBoxWidth  = 40
+	maxBoxWidth  = 88
+	compactWidth = 68
 )
 
 // DrawWelcomeBanner prints a one-time greeting the first time the session
 // chooser is shown.
 func DrawWelcomeBanner() {
-	w := uiWidth + 8
-	bdr := S.Border("│")
-	fmt.Println(S.Border("╭") + S.Border(strings.Repeat("─", w)) + S.Border("╮"))
-	fmt.Printf("%s%s%s\n", bdr, padRight("  "+S.Bold("🤖  OpenClaw AI 小助手"), w), bdr)
-	fmt.Printf("%s%s%s\n", bdr, padRight("  "+S.Dim("与 AI 进行智能对话，随时保存知识与经验"), w), bdr)
-	fmt.Println(S.Border("╰") + S.Border(strings.Repeat("─", w)) + S.Border("╯"))
+	w := boxInnerWidth(uiWidth+8, 48, maxBoxWidth)
+	printBoxTop(w, "")
+	printBoxStyledLine(w, S.Bold("🤖  OpenClaw AI 小助手"))
+	printBoxStyledLine(w, S.Dim("与 AI 进行智能对话，随时保存知识与经验"))
+	printBoxBottom(w)
 	fmt.Println()
 }
 
@@ -54,6 +59,204 @@ func padRight(s string, col int) string {
 	return s
 }
 
+func truncatePlain(s string, col int) string {
+	if col <= 0 || visWidth(s) <= col {
+		return s
+	}
+	if col == 1 {
+		return "…"
+	}
+	width := 0
+	var out []rune
+	for _, r := range []rune(s) {
+		rw := runewidth.RuneWidth(r)
+		if rw <= 0 {
+			rw = 1
+		}
+		if width+rw > col-1 {
+			break
+		}
+		out = append(out, r)
+		width += rw
+	}
+	return string(out) + "…"
+}
+
+func wrapPlain(s string, col int) []string {
+	if col <= 0 {
+		return []string{s}
+	}
+	var lines []string
+	remaining := strings.TrimSpace(s)
+	for remaining != "" {
+		if visWidth(remaining) <= col {
+			lines = append(lines, remaining)
+			break
+		}
+		width := 0
+		split := 0
+		lastSpace := -1
+		for i, r := range []rune(remaining) {
+			rw := runewidth.RuneWidth(r)
+			if rw <= 0 {
+				rw = 1
+			}
+			if width+rw > col {
+				break
+			}
+			width += rw
+			split = i + 1
+			if r == ' ' {
+				lastSpace = split
+			}
+		}
+		if split == 0 {
+			break
+		}
+		if lastSpace > 0 {
+			split = lastSpace
+		}
+		chunk := strings.TrimSpace(string([]rune(remaining)[:split]))
+		if chunk == "" {
+			chunk = truncatePlain(remaining, col)
+			lines = append(lines, chunk)
+			break
+		}
+		lines = append(lines, chunk)
+		remaining = strings.TrimSpace(string([]rune(remaining)[split:]))
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func terminalColumns() int {
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
+		return width
+	}
+	return 80
+}
+
+func boxInnerWidth(preferred, minWidth, maxWidth int) int {
+	available := terminalColumns() - 2
+	if available < minWidth {
+		available = minWidth
+	}
+	w := preferred
+	if w < minWidth {
+		w = minWidth
+	}
+	if maxWidth > 0 && w > maxWidth {
+		w = maxWidth
+	}
+	if w > available {
+		w = available
+	}
+	return w
+}
+
+func boxContentWidth(innerWidth int) int {
+	cw := innerWidth - 2
+	if cw < 1 {
+		return 1
+	}
+	return cw
+}
+
+func printBoxTop(innerWidth int, title string) {
+	fmt.Println(boxTopLine(innerWidth, title))
+}
+
+func boxTopLine(innerWidth int, title string) string {
+	if title == "" {
+		return S.Border("╭") + hr(innerWidth) + S.Border("╮")
+	}
+	label := " " + strings.TrimSpace(title) + " "
+	remain := innerWidth - visWidth(label)
+	if remain < 0 {
+		remain = 0
+	}
+	left := remain / 2
+	right := remain - left
+	return S.Border("╭") + hr(left) + S.Bold(label) + hr(right) + S.Border("╮")
+}
+
+func printBoxDivider(innerWidth int) {
+	fmt.Println(S.Border("├") + hr(innerWidth) + S.Border("┤"))
+}
+
+func printBoxBottom(innerWidth int) {
+	fmt.Println(boxBottomLine(innerWidth))
+}
+
+func boxBottomLine(innerWidth int) string {
+	return S.Border("╰") + hr(innerWidth) + S.Border("╯")
+}
+
+func printBoxStyledLine(innerWidth int, content string) {
+	pipe := S.Border("│")
+	contentWidth := boxContentWidth(innerWidth)
+	fmt.Printf("%s %s %s\n", pipe, padRight(content, contentWidth), pipe)
+}
+
+func printBoxTextLine(innerWidth int, text string, styler func(string) string) {
+	if styler == nil {
+		styler = func(s string) string { return s }
+	}
+	trimmed := truncatePlain(text, innerWidth)
+	printBoxStyledLine(innerWidth, styler(trimmed))
+}
+
+func printBoxWrappedTextLines(innerWidth int, text string, styler func(string) string) {
+	if styler == nil {
+		styler = func(s string) string { return s }
+	}
+	for _, line := range wrapPlain(text, innerWidth) {
+		printBoxStyledLine(innerWidth, styler(line))
+	}
+}
+
+func printBoxKeyValueLines(
+	innerWidth int,
+	key, value string,
+	keyWidth int,
+	keyStyler func(string) string,
+	valueStyler func(string) string,
+) {
+	if keyStyler == nil {
+		keyStyler = func(s string) string { return s }
+	}
+	if valueStyler == nil {
+		valueStyler = func(s string) string { return s }
+	}
+	contentW := boxContentWidth(innerWidth)
+	if keyWidth < 6 {
+		keyWidth = 6
+	}
+	if keyWidth > contentW-4 {
+		keyWidth = contentW - 4
+	}
+	valueW := contentW - keyWidth - 1
+	if valueW < 8 {
+		valueW = 8
+	}
+	wrapped := wrapPlain(value, valueW)
+	if len(wrapped) == 0 {
+		wrapped = []string{""}
+	}
+	first := keyStyler(padRight(truncatePlain(key, keyWidth), keyWidth)) + " " + valueStyler(wrapped[0])
+	printBoxStyledLine(innerWidth, first)
+	for _, line := range wrapped[1:] {
+		cont := strings.Repeat(" ", keyWidth) + " " + valueStyler(line)
+		printBoxStyledLine(innerWidth, cont)
+	}
+}
+
+func isCompactWidth(innerWidth int) bool {
+	return innerWidth <= compactWidth
+}
+
 // ─── Session chooser ─────────────────────────────────────────────────────────
 
 // DrawSessionList renders the bordered conversation chooser and prints
@@ -67,27 +270,33 @@ func padRight(s string, col int) string {
 //	╰──────────────────────────────────────────────────╯
 //	Select [1-2 / n]:
 func DrawSessionList(sessions []ipc.SessionInfo) {
-	w := uiWidth
+	w := boxInnerWidth(uiWidth, 48, maxBoxWidth)
 	pipe := S.Border("│")
-
-	// Top border + title.
-	// visWidth counts CJK chars as 2 columns, so border dashes are exact.
-	titleText := " 我的对话 "
-	titleDashes := w - 4 - visWidth(titleText)
-	if titleDashes < 0 {
-		titleDashes = 0
+	contentW := boxContentWidth(w)
+	turnWidth := 10
+	indexWidth := 4
+	nameWidth := contentW - indexWidth - turnWidth - 6
+	if nameWidth > maxName {
+		nameWidth = maxName
 	}
-	fmt.Println(S.Border("╭─") + S.Bold(titleText) + hr(titleDashes) + S.Border("─╮"))
+	if nameWidth < 12 {
+		nameWidth = 12
+	}
+
+	printBoxTop(w, "我的对话")
 
 	if len(sessions) == 0 {
-		fmt.Printf("%s%s%s\n", pipe, padRight("  "+S.Dim("还没有对话，输入 n 新建一个吧！"), w-2), pipe)
+		printBoxStyledLine(w, S.Dim("还没有对话，输入 n 新建一个吧！"))
 	} else {
 		for i, s := range sessions {
-			name := s.Name
+			name := displaySessionName(s.Name)
+			if s.Name == session.MainSessionKey {
+				name += " " + S.Dim("(默认)")
+			}
 			// Trim to maxName visual columns.
-			if visWidth(name) > maxName {
+			if visWidth(name) > nameWidth {
 				runes := []rune(name)
-				for visWidth(string(runes)) > maxName-1 {
+				for visWidth(string(runes)) > nameWidth-1 {
 					runes = runes[:len(runes)-1]
 				}
 				name = string(runes) + "…"
@@ -97,26 +306,26 @@ func DrawSessionList(sessions []ipc.SessionInfo) {
 				busy = " " + S.Warn("[忙碌]")
 			}
 			// Build row with exact-width columns, then pad to fill inner width.
-			row := "  " + padRight(S.Bold(fmt.Sprintf("%2d", i+1)), 2) +
-				"  " + padRight(name, maxName) +
-				"  " + padRight(S.Dim(formatTurns(s.TurnCount)), 9) + busy
-			fmt.Printf("%s%s%s\n", pipe, padRight(row, w-2), pipe)
+			row := padRight(S.Bold(fmt.Sprintf("%2d", i+1)), 2) +
+				"  " + padRight(name, nameWidth) +
+				"  " + padRight(S.Dim(formatTurns(s.TurnCount)), turnWidth) + busy
+			fmt.Printf("%s %s %s\n", pipe, padRight(row, contentW), pipe)
 		}
 	}
 
 	// Divider before "new" option.
-	fmt.Println(S.Border("├") + hr(w-2) + S.Border("┤"))
-	newRow := "  " + padRight(S.Bold(" n"), 4) + "＋ 新建对话"
-	fmt.Printf("%s%s%s\n", pipe, padRight(newRow, w-2), pipe)
+	printBoxDivider(w)
+	newRow := padRight(S.Bold("n"), 2) + "  ＋ 新建对话"
+	fmt.Printf("%s %s %s\n", pipe, padRight(newRow, contentW), pipe)
 
 	// Bottom border.
-	fmt.Printf("%s%s%s\n", S.Border("╰"), hr(w-2), S.Border("╯"))
+	printBoxBottom(w)
 
 	// Prompt.
 	if len(sessions) == 0 {
 		fmt.Printf("%s：", S.Bold("请输入对话名称"))
 	} else {
-		fmt.Printf("%s [1～%d 选择 / n 新建 / Ctrl-D 退出]： ", S.Bold("请选择"), len(sessions))
+		fmt.Printf("%s [回车=主会话 / 1～%d 选择 / n 新建 / Ctrl-D 退出]： ", S.Bold("请选择"), len(sessions))
 	}
 }
 
@@ -135,17 +344,15 @@ func DrawHistory(entries []ipc.HistoryEntry) {
 	}
 
 	pipe := S.Border("│")
-	w := uiWidth + 8 // slightly wider for content
+	w := boxInnerWidth(uiWidth+8, 56, maxBoxWidth)
+	contentW := boxContentWidth(w)
 
-	// Top border.
-	titleText := " 最近消息 "
-	titleDashes := w - 4 - visWidth(titleText)
-	if titleDashes < 1 {
-		titleDashes = 1
+	printBoxTop(w, "最近消息")
+
+	maxContent := contentW - 8
+	if maxContent < 20 {
+		maxContent = 20
 	}
-	fmt.Println(S.Border("╭─") + S.Dim(titleText) + hr(titleDashes) + S.Border("─╮"))
-
-	const maxContent = 58 // content column width
 
 	for _, e := range entries {
 		var roleLabel string
@@ -167,11 +374,12 @@ func DrawHistory(entries []ipc.HistoryEntry) {
 			content = string(runes[:maxContent-1]) + "…"
 		}
 
-		fmt.Printf("%s %s %s\n", pipe, roleLabel, S.Dim(content))
+		row := roleLabel + " " + S.Dim(truncatePlain(content, maxContent))
+		fmt.Printf("%s %s %s\n", pipe, padRight(row, contentW), pipe)
 	}
 
 	// Bottom border.
-	fmt.Printf("%s%s%s\n", S.Border("╰"), hr(w-2), S.Border("╯"))
+	printBoxBottom(w)
 	fmt.Println()
 }
 
@@ -185,10 +393,11 @@ func PrintAssistantHeader() {
 	now := time.Now().Format("15:04:05")
 	label := " 助手 "
 	ts := " " + now + " ─"
+	w := boxInnerWidth(uiWidth, 48, maxBoxWidth)
 
 	// ╭─ <label> <dashes> <ts>
 	used := 2 + visWidth(label) + len(ts)
-	dashes := uiWidth - used
+	dashes := w - used
 	if dashes < 2 {
 		dashes = 2
 	}
@@ -206,4 +415,11 @@ func formatTurns(n int) string {
 	default:
 		return fmt.Sprintf("%d 轮对话", n)
 	}
+}
+
+func displaySessionName(name string) string {
+	if name == session.MainSessionKey {
+		return "主会话"
+	}
+	return name
 }
