@@ -3,13 +3,30 @@
 package ipc
 
 import (
+	"bufio"
 	"encoding/json"
+	"io"
 
 	"github.com/XHao/claw-go/dirs"
 )
 
+const (
+	// DefaultScannerBuffer is the initial token buffer for newline-delimited IPC frames.
+	DefaultScannerBuffer = 64 * 1024
+	// MaxFrameBytes is the maximum JSON frame size accepted over the socket.
+	// It must be comfortably larger than tool results such as read_file output.
+	MaxFrameBytes = 1024 * 1024
+)
+
 // DefaultSocketPath returns the default Unix socket path.
 func DefaultSocketPath() string { return dirs.SocketPath() }
+
+// NewScanner returns a newline-delimited JSON scanner configured for larger IPC frames.
+func NewScanner(r io.Reader) *bufio.Scanner {
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, DefaultScannerBuffer), MaxFrameBytes)
+	return s
+}
 
 // ToolCall is a tool invocation request sent from daemon → client.
 type ToolCall struct {

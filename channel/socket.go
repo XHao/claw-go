@@ -102,7 +102,7 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 	// One scanner for the entire connection lifetime.
 	// Critical: do NOT create a second bufio.Scanner on the same conn; the
 	// first scanner buffers ahead and any bytes it pre-read would be lost.
-	scanner := bufio.NewScanner(conn)
+	scanner := ipc.NewScanner(conn)
 
 	// Phase 1: conversation selection (no lock held yet).
 	sessionName, err := s.runSelectionPhase(enc, scanner)

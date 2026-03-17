@@ -71,7 +71,7 @@ func Run(
 	defer conn.Close()
 
 	enc := json.NewEncoder(conn)
-	scanner := bufio.NewScanner(conn)
+	scanner := ipc.NewScanner(conn)
 
 	// ── Phase 1: read session list (or busy error) ────────────────────────────
 	if !scanner.Scan() {
