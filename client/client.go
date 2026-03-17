@@ -9,8 +9,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/XHao/claw-go/config"
@@ -114,6 +117,9 @@ func Run(
 		runner = tool.NewShellExecutor("", shellTimeoutSeconds, allowedCommands)
 	}
 	_ = localRunner // used in printNextReply below
+	interruptCh := make(chan os.Signal, 1)
+	signal.Notify(interruptCh, os.Interrupt)
+	defer signal.Stop(interruptCh)
 
 	fmt.Printf("「%s」对话  （输入 /help 查看命令）\n", S.Bold(displaySessionName(sessionName)))
 	usageTracker := NewUsageTracker()
@@ -126,9 +132,12 @@ func Run(
 			return nil
 		}
 
-		line, err := rl.Readline()
+		line, err := readLineWithContinuation(rl, prompt)
 		if err != nil {
 			if err == readline.ErrInterrupt {
+				if strings.TrimSpace(line) == "" {
+					return nil
+				}
 				continue
 			}
 			if err == io.EOF {
@@ -156,7 +165,28 @@ func Run(
 				return fmt.Errorf("write: %w", err)
 			}
 			sp := NewSpinner("正在清空对话…")
-			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker)
+			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker, interruptCh)
+			sp.Stop()
+			if err != nil {
+				return err
+			}
+		case line == "/ml":
+			msg, ok, err := readMultilineInput(rl, prompt)
+			if err != nil {
+				if err == io.EOF {
+					return nil
+				}
+				return err
+			}
+			if !ok {
+				continue
+			}
+			usageTracker.BeginTurn()
+			if err := enc.Encode(ipc.Msg{Text: msg}); err != nil {
+				return fmt.Errorf("write: %w", err)
+			}
+			sp := NewSpinner("思考中…")
+			err = printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker, interruptCh)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -195,7 +225,7 @@ func Run(
 			}
 			// Show spinner while waiting; stop it before rendering the reply.
 			sp := NewSpinner("思考中…")
-			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker)
+			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker, interruptCh)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -208,7 +238,45 @@ func Run(
 // error is received. sp is the active spinner; it is stopped before any output
 // so the line is clean. If the daemon sends tool_calls, they are executed
 // locally, results sent back, and the spinner resumes waiting.
-func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, localRunner *tool.LocalRunner, sp *Spinner, usageTracker *UsageTracker) error {
+func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, localRunner *tool.LocalRunner, sp *Spinner, usageTracker *UsageTracker, interruptCh <-chan os.Signal) error {
+	var encMu sync.Mutex
+	sendFrame := func(msg ipc.Msg) {
+		encMu.Lock()
+		defer encMu.Unlock()
+		_ = enc.Encode(msg)
+	}
+	for {
+		select {
+		case <-interruptCh:
+			// Drop stale Ctrl+C events fired outside the waiting phase.
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	defer cancelTurn()
+
+	var interrupted atomic.Bool
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-interruptCh:
+				if interrupted.CompareAndSwap(false, true) {
+					cancelTurn()
+					sp.Stop()
+					sendFrame(ipc.Msg{Cmd: "cancel"})
+					fmt.Printf("%s 已请求中断当前任务，等待服务端确认…\n", S.Warn("[中断]"))
+				}
+			}
+		}
+	}()
+
 	for {
 		// Respect context cancellation (e.g. Ctrl-C).
 		if ctx.Err() != nil {
@@ -238,28 +306,37 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 
 		// ── Tool calls: execute locally and send results back ─────────────────
 		if len(msg.ToolCalls) > 0 {
+			if interrupted.Load() {
+				continue
+			}
 			sp.Stop()
 			if localRunner == nil {
 				// Tools disabled on the client — send empty results so daemon continues.
-				_ = enc.Encode(ipc.Msg{
+				sendFrame(ipc.Msg{
 					Cmd:         "tool_results",
 					ToolResults: []ipc.ToolResult{},
 				})
 				newSp := NewSpinner("思考中…")
-				err := printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker)
+				err := printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker, interruptCh)
 				newSp.Stop()
 				return err
 			}
 			fmt.Printf("%s 调用 %d 个工具\n", S.Dim("[工具]"), len(msg.ToolCalls))
 			results := make([]ipc.ToolResult, len(msg.ToolCalls))
 			for i, tc := range msg.ToolCalls {
+				if interrupted.Load() {
+					break
+				}
 				argsJSON := ""
 				if tc.Args != nil {
 					argsJSON = string(tc.Args)
 				}
 				toolSp := NewSpinner(fmt.Sprintf("  ↳ %s", S.ToolName(tc.Name)))
-				output, isErr := localRunner.Run(ctx, tc.Name, argsJSON)
+				output, isErr := localRunner.Run(turnCtx, tc.Name, argsJSON)
 				toolSp.Stop()
+				if interrupted.Load() {
+					break
+				}
 				statusIcon := S.Success("✓")
 				if isErr {
 					statusIcon = S.Err("✗")
@@ -272,12 +349,18 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 					IsError: isErr,
 				}
 			}
-			if err := enc.Encode(ipc.Msg{Cmd: "tool_results", ToolResults: results}); err != nil {
+			if interrupted.Load() {
+				continue
+			}
+			encMu.Lock()
+			err := enc.Encode(ipc.Msg{Cmd: "tool_results", ToolResults: results})
+			encMu.Unlock()
+			if err != nil {
 				return fmt.Errorf("发送工具结果失败：%w", err)
 			}
 			// Restart spinner while daemon processes results with LLM.
 			newSp := NewSpinner("处理结果中…")
-			err := printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker)
+			err = printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker, interruptCh)
 			newSp.Stop()
 			return err
 		}
@@ -298,6 +381,10 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 		sp.Stop()
 		switch {
 		case msg.Reply != "":
+			if interrupted.Load() {
+				fmt.Println(S.Dim("[已中断] 本轮回复已取消。"))
+				return nil
+			}
 			renderMarkdown(msg.Reply)
 			if usageTracker != nil {
 				if line := usageTracker.TurnSummaryLine(); line != "" {
@@ -476,6 +563,78 @@ func readMsg(scanner *bufio.Scanner) (ipc.Msg, error) {
 		return ipc.Msg{}, fmt.Errorf("无效响应：%w", err)
 	}
 	return msg, nil
+}
+
+func readLineWithContinuation(rl *readline.Instance, basePrompt string) (string, error) {
+	line, err := rl.Readline()
+	if err != nil {
+		return line, err
+	}
+
+	parts := []string{}
+	current := line
+	promptChanged := false
+	for {
+		r := strings.TrimRight(current, " \t")
+		if !strings.HasSuffix(r, "\\") {
+			parts = append(parts, current)
+			break
+		}
+		parts = append(parts, strings.TrimSuffix(r, "\\"))
+		if !promptChanged {
+			rl.SetPrompt("... ")
+			promptChanged = true
+		}
+		next, readErr := rl.Readline()
+		if readErr != nil {
+			if promptChanged {
+				rl.SetPrompt(basePrompt)
+			}
+			return strings.Join(parts, "\n"), readErr
+		}
+		current = next
+	}
+	if promptChanged {
+		rl.SetPrompt(basePrompt)
+	}
+	return strings.Join(parts, "\n"), nil
+}
+
+func readMultilineInput(rl *readline.Instance, basePrompt string) (string, bool, error) {
+	fmt.Println(S.Dim("多行输入模式：输入 /send 发送，/abort 取消。"))
+	rl.SetPrompt("... ")
+	defer rl.SetPrompt(basePrompt)
+
+	var lines []string
+	for {
+		line, err := rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt {
+				fmt.Println(S.Dim("已取消多行输入。"))
+				return "", false, nil
+			}
+			if err == io.EOF {
+				return "", false, io.EOF
+			}
+			return "", false, err
+		}
+
+		trimmed := strings.TrimSpace(line)
+		switch trimmed {
+		case "/abort":
+			fmt.Println(S.Dim("已取消多行输入。"))
+			return "", false, nil
+		case "/send":
+			msg := strings.TrimSpace(strings.Join(lines, "\n"))
+			if msg == "" {
+				fmt.Fprintln(os.Stderr, S.Warn("多行内容为空，已取消。"))
+				return "", false, nil
+			}
+			return msg, true, nil
+		default:
+			lines = append(lines, line)
+		}
+	}
 }
 
 // runLearn runs the knowledge distillation pipeline for topic and prints

@@ -21,6 +21,7 @@ type cmdEntry struct {
 // Keep this table in sync with the switch cases in client.go.
 var commands = []cmdEntry{
 	{"/help", "显示帮助信息", nil},
+	{"/ml", "进入多行输入模式（/send 发送，/abort 取消）", nil},
 	{"/tokens", "显示 token 消耗（report/turn/clear）", []string{"report", "turn", "clear"}},
 	{"/reset", "清空当前对话历史（主会话保留，子会话删除）", nil},
 	{"/learn", "将记忆提炼为指定主题的经验库，如 /learn \"Linux\"", []string{"\"<主题>\""}},

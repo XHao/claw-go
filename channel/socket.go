@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -92,6 +93,12 @@ func (s *SocketChannel) Start(ctx context.Context, dispatch DispatchFunc) error 
 func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch DispatchFunc) {
 	defer conn.Close()
 	enc := json.NewEncoder(conn)
+	var encMu sync.Mutex
+	sendFrame := func(msg ipc.Msg) error {
+		encMu.Lock()
+		defer encMu.Unlock()
+		return enc.Encode(msg)
+	}
 	// One scanner for the entire connection lifetime.
 	// Critical: do NOT create a second bufio.Scanner on the same conn; the
 	// first scanner buffers ahead and any bytes it pre-read would be lost.
@@ -110,68 +117,165 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 		s.mu.Unlock()
 	}()
 
-	// Phase 2: chat loop (reuses the same scanner).
-	for scanner.Scan() {
-		if ctx.Err() != nil {
+	// Phase 2: async chat loop that can consume "cancel" while a dispatch is in-flight.
+	frameCh := make(chan ipc.Msg)
+	scanErrCh := make(chan error, 1)
+	go func() {
+		defer close(frameCh)
+		for scanner.Scan() {
+			var msg ipc.Msg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				frameCh <- ipc.Msg{Cmd: "__decode_error"}
+				continue
+			}
+			frameCh <- msg
+		}
+		if err := scanner.Err(); err != nil {
+			scanErrCh <- err
 			return
 		}
-		var msg ipc.Msg
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
-			_ = enc.Encode(ipc.Msg{Error: "invalid message"})
-			continue
+		scanErrCh <- io.EOF
+	}()
+
+	var (
+		running      bool
+		cancelRun    context.CancelFunc
+		runDoneCh    chan struct{}
+		toolResultCh chan ipc.Msg
+	)
+
+	startDispatch := func(text string, withExchange bool) {
+		runCtx, cancel := context.WithCancel(ctx)
+		cancelRun = cancel
+		running = true
+		runDoneCh = make(chan struct{}, 1)
+		toolResultCh = make(chan ipc.Msg, 4)
+
+		inbound := InboundMessage{
+			ChannelName: s.name,
+			ChannelType: "socket",
+			SessionKey:  sessionName,
+			ChatID:      sessionName,
+			UserID:      "local",
+			Text:        text,
+			Timestamp:   time.Now(),
 		}
-		switch msg.Cmd {
-		case "ping":
-			_ = enc.Encode(ipc.Msg{Info: "pong"})
-		case "inject_ctx":
-			// Client is mounting an experience document as extra session context.
-			if msg.Text == "" {
-				_ = enc.Encode(ipc.Msg{Error: "inject_ctx: empty content"})
-			} else {
-				s.sessions.InjectContext(sessionName, msg.Text)
-				_ = enc.Encode(ipc.Msg{Info: "context injected"})
+
+		go func() {
+			defer func() { runDoneCh <- struct{}{} }()
+			var exchange ipc.ToolExchangeFn
+			if withExchange {
+				exchange = func(calls []ipc.ToolCall) ([]ipc.ToolResult, error) {
+					if err := sendFrame(ipc.Msg{ToolCalls: calls}); err != nil {
+						return nil, fmt.Errorf("tool_calls send: %w", err)
+					}
+					for {
+						select {
+						case <-runCtx.Done():
+							return nil, fmt.Errorf("tool exchange canceled")
+						case res, ok := <-toolResultCh:
+							if !ok {
+								return nil, fmt.Errorf("tool result channel closed")
+							}
+							if res.Cmd != "tool_results" {
+								continue
+							}
+							return res.ToolResults, nil
+						}
+					}
+				}
 			}
-		case "reset":
-			dispatch(InboundMessage{
-				ChannelName: s.name,
-				ChannelType: "socket",
-				SessionKey:  sessionName,
-				ChatID:      sessionName,
-				Text:        "/reset",
-				Timestamp:   time.Now(),
-			}, nil)
-		default:
+			dispatch(inbound, exchange)
+		}()
+	}
+
+	for {
+		if ctx.Err() != nil {
+			if cancelRun != nil {
+				cancelRun()
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			if cancelRun != nil {
+				cancelRun()
+			}
+			return
+		case <-runDoneCh:
+			running = false
+			cancelRun = nil
+			close(toolResultCh)
+			toolResultCh = nil
+			runDoneCh = nil
+		case err := <-scanErrCh:
+			if cancelRun != nil {
+				cancelRun()
+			}
+			if err == io.EOF {
+				return
+			}
+			return
+		case msg, ok := <-frameCh:
+			if !ok {
+				if cancelRun != nil {
+					cancelRun()
+				}
+				return
+			}
+			if msg.Cmd == "__decode_error" {
+				_ = sendFrame(ipc.Msg{Error: "invalid message"})
+				continue
+			}
+
+			switch msg.Cmd {
+			case "ping":
+				_ = sendFrame(ipc.Msg{Info: "pong"})
+				continue
+			case "cancel":
+				if running && cancelRun != nil {
+					cancelRun()
+					_ = sendFrame(ipc.Msg{Info: "已取消当前请求"})
+				} else {
+					_ = sendFrame(ipc.Msg{Info: "当前没有可取消的请求"})
+				}
+				continue
+			case "tool_results":
+				if !running || toolResultCh == nil {
+					_ = sendFrame(ipc.Msg{Error: "unexpected tool_results"})
+					continue
+				}
+				toolResultCh <- msg
+				continue
+			case "inject_ctx":
+				if running {
+					_ = sendFrame(ipc.Msg{Error: "当前请求处理中，请稍后再注入经验"})
+					continue
+				}
+				if msg.Text == "" {
+					_ = sendFrame(ipc.Msg{Error: "inject_ctx: empty content"})
+				} else {
+					s.sessions.InjectContext(sessionName, msg.Text)
+					_ = sendFrame(ipc.Msg{Info: "context injected"})
+				}
+				continue
+			case "reset":
+				if running {
+					_ = sendFrame(ipc.Msg{Error: "当前请求处理中，可发送 cancel 中断"})
+					continue
+				}
+				startDispatch("/reset", false)
+				continue
+			}
+
 			if msg.Text == "" {
 				continue
 			}
-			// Build a synchronous tool-exchange function that encodes tool calls
-			// to this connection and blocks until the client sends tool_results.
-			exchange := func(calls []ipc.ToolCall) ([]ipc.ToolResult, error) {
-				if err := enc.Encode(ipc.Msg{ToolCalls: calls}); err != nil {
-					return nil, fmt.Errorf("tool_calls send: %w", err)
-				}
-				// Block until client sends tool_results.
-				if !scanner.Scan() {
-					return nil, fmt.Errorf("connection closed waiting for tool_results")
-				}
-				var res ipc.Msg
-				if err := json.Unmarshal(scanner.Bytes(), &res); err != nil {
-					return nil, fmt.Errorf("tool_results decode: %w", err)
-				}
-				if res.Cmd != "tool_results" {
-					return nil, fmt.Errorf("expected tool_results, got cmd=%q", res.Cmd)
-				}
-				return res.ToolResults, nil
+			if running {
+				_ = sendFrame(ipc.Msg{Error: "当前请求处理中，可发送 cancel 中断"})
+				continue
 			}
-			dispatch(InboundMessage{
-				ChannelName: s.name,
-				ChannelType: "socket",
-				SessionKey:  sessionName,
-				ChatID:      sessionName,
-				UserID:      "local",
-				Text:        msg.Text,
-				Timestamp:   time.Now(),
-			}, exchange)
+			startDispatch(msg.Text, true)
 		}
 	}
 }

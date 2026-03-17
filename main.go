@@ -230,7 +230,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 
 // runConnect starts the interactive CLI client and connects to the daemon.
 func runConnect(cfg *config.Config, socketPath string) {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
 
 	cli := cfg.CLI
