@@ -251,8 +251,8 @@ func TestTrimByTokenBudgetDropsOldestTurnBlocks(t *testing.T) {
 
 	for i := 0; i < 6; i++ {
 		long := strings.Repeat("payload ", 90)
-		s.Append(provider.Message{Role: "user", Content: "u" + long}, st.MaxTurns())
-		s.Append(provider.Message{Role: "assistant", Content: "a" + long}, st.MaxTurns())
+		s.Append(provider.Message{Role: "user", Content: fmt.Sprintf("u%d %s", i, long)}, st.MaxTurns())
+		s.Append(provider.Message{Role: "assistant", Content: fmt.Sprintf("a%d %s", i, long)}, st.MaxTurns())
 	}
 
 	h := s.History()
@@ -262,7 +262,7 @@ func TestTrimByTokenBudgetDropsOldestTurnBlocks(t *testing.T) {
 
 	// Oldest user message should have been summarized away under strict token budget.
 	for _, m := range h {
-		if m.Role == "user" && strings.Contains(m.Content, "u"+strings.Repeat("payload ", 90)) {
+		if m.Role == "user" && strings.Contains(m.Content, "u0 ") {
 			t.Fatal("expected oldest oversized user messages to be removed by token budget")
 		}
 	}
@@ -472,13 +472,17 @@ func TestHistoryForLLMUsesHintBudgetScale(t *testing.T) {
 
 func TestTrimPrefersKeepingToolHeavyTurns(t *testing.T) {
 	st := session.NewStore(4, "sys", "")
-	st.SetTokenBudget(2600)
+	st.SetTokenBudget(2000)
 	st.SetRecentRawTurns(1)
+	st.SetHintBudgetScale(provider.ModelHintTask, 0.5)
 	s := st.Get("tool-priority")
 
-	plainLong := strings.Repeat("plain ", 120)
-	toolLong := strings.Repeat("tool ", 120)
-	newestLong := strings.Repeat("newest ", 120)
+	plainLong := strings.Repeat("plain ", 180)
+	toolLong := strings.Repeat("tool ", 180)
+	// newestLong is shorter so that after the plain turn is trimmed the remaining
+	// turn2 (tool-heavy) + turn3 (newest) fit within the scaled budget (1000 tokens),
+	// confirming that tool-heavy turns are spared once plain turns are gone first.
+	newestLong := strings.Repeat("newest ", 80)
 
 	// Oldest plain turn should be trimmed before the later tool-heavy turn.
 	s.Append(provider.Message{Role: "user", Content: "plain-user " + plainLong}, st.MaxTurns())

@@ -97,3 +97,60 @@ func TestSanitizeHistoryForToolProtocolKeepsValidToolSequence(t *testing.T) {
 		t.Fatalf("expected matching tool result preserved, got %+v", got[1])
 	}
 }
+
+func TestSanitizeHistoryOrphanAssistantToolCallsAtEndDropped(t *testing.T) {
+	// Daemon crashed after appending assistant(tool_calls) but before tool results.
+	tc := mkToolCall("tc-1", "read_file")
+	history := []provider.Message{
+		{Role: "user", Content: "check file"},
+		{Role: "assistant", ToolCalls: []provider.ToolCallRequest{tc}},
+		// tool result never appended
+	}
+	got := sanitizeHistoryForToolProtocol(history)
+	if len(got) != 1 || got[0].Role != "user" {
+		t.Fatalf("expected only user message after dropping orphaned assistant(tool_calls), got len=%d %+v", len(got), got)
+	}
+}
+
+func TestSanitizeHistoryOrphanAssistantToolCallsFollowedByUser(t *testing.T) {
+	// Incomplete turn in middle: new user message arrives before tool results were stored.
+	tc := mkToolCall("tc-1", "read_file")
+	history := []provider.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", ToolCalls: []provider.ToolCallRequest{tc}},
+		// tool result missing
+		{Role: "user", Content: "second"},
+	}
+	got := sanitizeHistoryForToolProtocol(history)
+	// The orphaned assistant block (and its missing tool result) must be stripped;
+	// both user messages should remain.
+	if len(got) != 2 {
+		t.Fatalf("expected 2 user messages, got len=%d %+v", len(got), got)
+	}
+	if got[0].Content != "first" || got[1].Content != "second" {
+		t.Fatalf("unexpected message contents: %+v", got)
+	}
+}
+
+func TestSanitizeHistoryCompleteToolSequenceThenIncompleteDropsLast(t *testing.T) {
+	// First turn is complete; second turn's tool results are missing.
+	tc1 := mkToolCall("tc-1", "read_file")
+	tc2 := mkToolCall("tc-2", "grep_file")
+	history := []provider.Message{
+		{Role: "user", Content: "turn1"},
+		{Role: "assistant", ToolCalls: []provider.ToolCallRequest{tc1}},
+		{Role: "tool", ToolCallID: "tc-1", Name: "read_file", Content: "ok"},
+		{Role: "assistant", Content: "done with turn1"},
+		{Role: "user", Content: "turn2"},
+		{Role: "assistant", ToolCalls: []provider.ToolCallRequest{tc2}},
+		// tool result for tc-2 is missing
+	}
+	got := sanitizeHistoryForToolProtocol(history)
+	// The incomplete second assistant block should be dropped; everything before it kept.
+	if len(got) != 5 {
+		t.Fatalf("expected 5 messages (first full turn + user2), got len=%d", len(got))
+	}
+	if got[4].Content != "turn2" {
+		t.Fatalf("expected last message to be user turn2, got %+v", got[4])
+	}
+}

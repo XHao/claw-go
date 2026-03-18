@@ -1,176 +1,82 @@
-# Example claw-go configuration
+# claw-go config (simplified)
 #
-# ── Data directory ────────────────────────────────────────────────────────────
-# All persistent data lives under a single root directory:
-#
-#   ~/.claw/              (default; override with $OPENCLAW_STATE_DIR)
-#   ├── config.yaml       this file (if placed there)
-#   ├── sessions/         one JSON file per conversation — survives restarts
-#   ├── logs/claw-go.log daemon log
-#   └── history           readline input history
-#
-# The daemon creates the sessions/ and logs/ directories automatically on first
-# start if they do not already exist.
-# ─────────────────────────────────────────────────────────────────────────────
+# Start with this file in ~/.claw/config.yaml.
+# Required: models + primary_model (+ api_key via env or file).
 
-# Unix Domain Socket used by the daemon and CLI client.
-# Default (in priority order):
-#   $XDG_RUNTIME_DIR/claw-go.sock   (Linux tmpfs, auto-cleaned on logout)
-#   ~/.claw/claw-go.sock            (macOS and fallback)
 # socket_path: "~/.claw/claw-go.sock"
 
-# 每会话保留的最大对话轮数（一问一答为一轮）
+# ---- Conversation Memory (recommended defaults) ----
 max_history_turns: 20
-
-# 会话上下文裁剪的近似 token 预算（0=按 max_history_turns 自动推导）
-# 超预算时会按“最老事务块”淘汰并写入滚动摘要。
-# max_history_tokens: 0
-
-# token 估算系数（每 token 约多少字符，0=自动默认 4.0，并会结合真实 prompt_tokens 自适应校准）
-# 对 CJK 或符号密集内容可适当调小（如 2.5~3.5）以更保守裁剪；显式设置后将固定，不再自动校准。
-# history_chars_per_token: 0
-
-# 按调用层级控制最终送给模型的历史预算倍率。
-# router 通常应更小；thinking 可更大，以保留更多上下文用于深度推理。
-# history_budget_scale:
+# max_history_tokens: 0          # 0 = auto from max_history_turns
+# recent_raw_turns: 0            # 0 = auto (default 4)
+# history_chars_per_token: 0     # 0 = auto adaptive
+# history_budget_scale:          # optional: hint-specific history budgets
 #   router: 0.35
 #   task: 1.0
 #   summary: 0.85
 #   thinking: 1.5
 
-# 始终保留原文的最近轮数（0=自动，默认 4 或不超过 max_history_turns）
-# recent_raw_turns: 0
-
-# ── LLM models + default model ───────────────────────────────────────────────
-# 1) 定义 models 列表（每个模型的 base_url/api_key/model/max_tokens）。
-# 2) 通过 primary_model 指定主模型（必填）。
-# 3) 如需分层路由，再额外配置 routing_policy（可选）。
+# ---- Models (required) ----
 models:
   default_task:
     type: openai
     base_url: "https://api.openai.com/v1"
-    # api_key: "sk-..."        # or set OPENAI_API_KEY env var
+    # api_key: "sk-..."         # or export OPENAI_API_KEY
     model: "gpt-4o-mini"
     system_prompt: |
       You are a helpful assistant running on {os} ({arch}).
-      The user's login is {user} and their home directory is {home}.
-      The current working directory is {cwd}.
-      They are using the shell {shell}.
-      Today is {date}.
-      Be concise and prefer code examples over long explanations.
-      When working with files or paths, use the current directory context above.
+      User: {user}  Home: {home}
+      Working directory: {cwd}
+      Shell: {shell}
+      Date: {date}
+      Be concise and prefer concrete steps.
     max_tokens: 4096
     timeout_seconds: 120
 
 primary_model: "default_task"
 
-# ── CLI client ────────────────────────────────────────────────────────────────
+# ---- Optional auto routing (router/task/summary/thinking) ----
+# routing_policy:
+#   routing_model: "default_task"
+#   task_model: "default_task"
+#   summary_model: "default_task"
+#   thinking_model: "default_task"
+#   thinking_keywords:
+#     - "重构"
+#     - "架构"
+#     - "trade-off"
+
+# ---- CLI ----
 cli:
   prompt: "You ❯ "
-  # history_file defaults to ~/.claw/history when empty.
-  # Set an explicit path to override, or leave empty to use the default.
-  # history_file: ""
-  shell_enabled: true          # allow !<cmd> to run local shell commands
-  shell_timeout_seconds: 300   # 0 = no timeout
-  # allowed_commands:          # restrict shell access; omit = all allowed
+  shell_enabled: true
+  shell_timeout_seconds: 300
+  # history_file: "~/.claw/history"
+  # allowed_commands:
   #   - git
-  #   - python3
   #   - ls
 
-# ── Theme / colour palette ───────────────────────────────────────────────────
-# Controls all terminal colours.  Presets: default | dark | minimal | none.
-# Individual colour slots accept raw ANSI SGR codes, e.g. "1;36" = bold cyan.
-# Set NO_COLOR=1 in the environment to disable all styling unconditionally.
-theme:
-  preset: "default"      # default | dark | minimal | none
-  # colors:              # override any individual slot (ANSI SGR parameter)
-  #   assistant: "1;36" # bold cyan   — assistant reply label
-  #   user:      "1;32" # bold green  — user prompt (future)
-  #   dim:       "90"   # dark gray   — secondary info, spinners
-  #   success:   "32"   # green       — tool success ✓
-  #   warn:      "33"   # yellow      — warnings, [busy]
-  #   error:     "31"   # red         — error messages
-  #   bold:      "1"    # bold        — labels, emphasis
-  #   border:    "36"   # cyan        — box-drawing characters
-  #   timestamp: "90"   # dark gray   — time display
-  #   tool_name: "35"   # magenta     — tool name in progress list
-
-# When enabled, the LLM can request tool executions (bash, file I/O) that run
-# locally on the client machine.  The daemon orchestrates the loop; the CLI
-# client executes the tools and returns results.
+# ---- Tools ----
 tools:
-  enabled: false               # set to true to enable tool calling
-  max_iterations: 10           # max tool-call rounds per user message
-  bash_timeout_seconds: 30     # per-bash-call timeout
-  # allowed:                   # restrict which tools the LLM may use; omit = all
+  enabled: false
+  max_iterations: 10
+  bash_timeout_seconds: 30
+  # allowed:
   #   - bash
+  #   - inspect_file
+  #   - grep_file
+  #   - search_file
   #   - read_file
   #   - write_file
   #   - list_files
 
-# ── 调试日志 ───────────────────────────────────────────────────────────────────────────
-# 启用后，每次 LLM 调用都会将完整的请求/响应记录到一份人类可读的 debug 文件中。
-# 格式示例：
-#   ═════ LLM 调用 #1  2026-03-06 15:01:35 ═════
-#   ── 可用工具 (6 个) distill_knowledge / list_experiences / ...
-#   ── 消息历史 (3 条)
-#   [1] SYSTEM   You are a helpful assistant...
-#   [2] USER     帮我总结 C++ 开发经验
-#   ── 响应  stop_reason=tool_calls  elapsed=1900ms
-#       ▶ TOOL CALL: distill_knowledge
-#         { "topic": "C++开发" }
-#   ═══════════════════════════════════════════
-log:
-  debug_llm: false            # true = 开启并记录完整 LLM 请求/响应到 debug_file
-  # debug_file: ~/.claw/logs/llm_debug.log  # 默认路径，无需修改
-  metrics_enabled: false      # true = 开启结构化指标收集（JSONL，每行一条调用记录）
-  # metrics_file: ~/.claw/logs/llm_metrics.jsonl
-  #
-  # 指标字段：at/hint/source/model_key/model/prompt_tokens/completion_tokens/total_tokens/latency_ms/stop_reason/is_error
-  # hint 即 ModelHint tier: router/task/summary/thinking
-  # 示例分析（jq）:
-  #   cat ~/.claw/logs/llm_metrics.jsonl | jq -s 'group_by(.hint)[] | {hint: .[0].hint, calls: length, total_tokens: [.[].total_tokens] | add}'
-  #   cat ~/.claw/logs/llm_metrics.jsonl | jq -s '[.[].total_tokens] | add'
+# ---- Theme ----
+theme:
+  preset: "default"
 
-# ── 多模型目录 + 路由策略（推荐）────────────────────────────────────────────────
-# 先定义 models（模型目录），再用 routing_policy 指定各 tier 用哪个模型。
-# 未填写的 optional tier 自动降级到 task。
-#
-# models:
-#   gemini_routing:
-#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
-#     api_key: "${GEMINI_API_KEY}"
-#     model: "gemini-2.0-flash-lite"
-#     max_tokens: 1024
-#     timeout_seconds: 15
-#   gemini_task:
-#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
-#     api_key: "${GEMINI_API_KEY}"
-#     model: "gemini-2.5-pro"
-#     max_tokens: 8192
-#     timeout_seconds: 120
-#   gemini_summary:
-#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
-#     api_key: "${GEMINI_API_KEY}"
-#     model: "gemini-2.0-flash"
-#     max_tokens: 16384
-#     timeout_seconds: 60
-#   claude_thinking:
-#     base_url: "https://api.anthropic.com/v1"
-#     api_key: "${ANTHROPIC_API_KEY}"
-#     model: "claude-3-5-sonnet-20241022"
-#     max_tokens: 8192
-#     timeout_seconds: 300
-#
-# routing_policy:
-#   routing_model: "gemini_routing"
-#   task_model: "gemini_task"
-#   summary_model: "gemini_summary"
-#   thinking_model: "claude_thinking"
-#   thinking_keywords:
-#     - "重构"
-#     - "架构"
-#     - "high concurrency"
-#     - "system design"
-#
-# primary_model: "gemini_task"
+# ---- Logs ----
+log:
+  debug_llm: false
+  metrics_enabled: false
+  # debug_file: "~/.claw/logs/llm_debug.log"
+  # metrics_file: "~/.claw/logs/llm_metrics.jsonl"

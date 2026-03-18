@@ -137,6 +137,9 @@ func sanitizeHistoryForToolProtocol(history []provider.Message) []provider.Messa
 	}
 	out := make([]provider.Message, 0, len(history))
 	pendingToolCalls := make(map[string]struct{})
+	// pendingStartIdx is the index in out where the current "pending" assistant
+	// tool-calls block begins.  -1 means no pending block.
+	pendingStartIdx := -1
 
 	for _, m := range history {
 		if m.Role == "tool" {
@@ -148,21 +151,37 @@ func sanitizeHistoryForToolProtocol(history []provider.Message) []provider.Messa
 			}
 			out = append(out, m)
 			delete(pendingToolCalls, m.ToolCallID)
+			if len(pendingToolCalls) == 0 {
+				pendingStartIdx = -1
+			}
 			continue
 		}
 
 		if len(pendingToolCalls) > 0 {
+			// A non-tool message arrived while tool results are still outstanding.
+			// The assistant(tool_calls) block is orphaned — roll back out to
+			// before it so we never send an incomplete tool sequence to the API.
+			out = out[:pendingStartIdx]
 			pendingToolCalls = make(map[string]struct{})
+			pendingStartIdx = -1
 		}
 
 		out = append(out, m)
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			pendingStartIdx = len(out) - 1
 			for _, tc := range m.ToolCalls {
 				if tc.ID != "" {
 					pendingToolCalls[tc.ID] = struct{}{}
 				}
 			}
 		}
+	}
+
+	// If we reach the end of history with unresolved tool calls, the trailing
+	// assistant(tool_calls) block is also orphaned (e.g. daemon crashed before
+	// tool results were appended).  Remove it.
+	if len(pendingToolCalls) > 0 && pendingStartIdx >= 0 {
+		out = out[:pendingStartIdx]
 	}
 
 	return out
@@ -215,6 +234,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			if a.memory != nil {
 				_ = a.memory.ClearSession(msg.SessionKey)
 			}
+			a.clearAutoInjected(msg.SessionKey)
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
@@ -227,6 +247,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			if a.memory != nil {
 				_ = a.memory.DeleteSession(msg.SessionKey)
 			}
+			a.clearAutoInjected(msg.SessionKey)
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
@@ -484,12 +505,16 @@ func (a *Agent) InjectMessage(ctx context.Context, sessionKey, text string) (str
 	sess := a.sessions.Get(sessionKey)
 	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
 	injectCtx := provider.WithHintSource(ctx, "agent/inject")
-	reply, err := a.provider.Complete(injectCtx, sess.HistoryForLLM(provider.HintFromContext(injectCtx)))
+	messages := sess.HistoryForLLM(provider.HintFromContext(injectCtx))
+	result, err := a.provider.CompleteWithTools(injectCtx, messages, nil)
 	if err != nil {
 		return "", err
 	}
-	sess.Append(provider.Message{Role: "assistant", Content: reply}, a.sessions.MaxTurns())
-	return reply, nil
+	if result.Usage.PromptTokens > 0 {
+		a.sessions.ObservePromptUsage(messages, result.Usage.PromptTokens)
+	}
+	sess.Append(provider.Message{Role: "assistant", Content: result.Content}, a.sessions.MaxTurns())
+	return result.Content, nil
 }
 
 // History returns the conversation history for a session key.
@@ -526,6 +551,19 @@ func (a *Agent) saveTurnMemory(
 	if err := a.memory.ForSession(sessionKey).SaveTurn(summary); err != nil {
 		log.Warn("memory save failed", "err", err)
 	}
+}
+
+// clearAutoInjected removes all auto-injection records for the given session
+// so that experience libraries will be re-injected if still relevant after a
+// /reset or session delete.
+func (a *Agent) clearAutoInjected(sessionKey string) {
+	prefix := sessionKey + ":"
+	a.autoInjected.Range(func(k, _ any) bool {
+		if strings.HasPrefix(k.(string), prefix) {
+			a.autoInjected.Delete(k)
+		}
+		return true
+	})
 }
 
 // autoInjectExperiences checks whether any saved experience library is

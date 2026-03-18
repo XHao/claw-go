@@ -86,9 +86,12 @@ func (d *Distiller) Distill(ctx context.Context, topic string, progress Progress
 	}
 
 	// 4. Reduce phase — merge map outputs with existing experience.
+	// Use ModelHintSummary consistent with the map phase so both legs are
+	// routed to the cheap long-context tier (see doc: map/reduce 分别打 source).
 	progress("Reduce — 整合并去重…")
 	existing, _ := d.store.Load(topic)
-	reduceCtx := provider.WithHintSource(ctx, "distill/reduce")
+	reduceCtx := provider.WithModelHint(ctx, provider.ModelHintSummary)
+	reduceCtx = provider.WithHintSource(reduceCtx, "distill/reduce")
 	final, err := d.reduce(reduceCtx, topic, mapResults, existing)
 	if err != nil {
 		return "", fmt.Errorf("distill: reduce: %w", err)
