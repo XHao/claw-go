@@ -1,7 +1,9 @@
 package session_test
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/XHao/claw-go/provider"
@@ -194,5 +196,321 @@ func TestNoPersistenceWhenDirEmpty(t *testing.T) {
 	s.Append(provider.Message{Role: "user", Content: "test"}, 10)
 	if s.TurnCount() != 1 {
 		t.Errorf("expected 1 turn, got %d", s.TurnCount())
+	}
+}
+
+func mkToolCall(id, name string) provider.ToolCallRequest {
+	var tc provider.ToolCallRequest
+	tc.ID = id
+	tc.Type = "function"
+	tc.Function.Name = name
+	tc.Function.Arguments = `{}`
+	return tc
+}
+
+func TestTrimPreservesToolTransactionAtomicity(t *testing.T) {
+	st := session.NewStore(1, "sys", "")
+	s := st.Get("atomic")
+
+	// Turn 1 with tool transaction
+	s.Append(provider.Message{Role: "user", Content: "analyze file"}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", ToolCalls: []provider.ToolCallRequest{mkToolCall("call-1", "read_file")}}, st.MaxTurns())
+	s.Append(provider.Message{Role: "tool", ToolCallID: "call-1", Name: "read_file", Content: `{"type":"file_segment"}`}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", Content: "done"}, st.MaxTurns())
+
+	// Turn 2 forces turn-1 trimming into summary
+	s.Append(provider.Message{Role: "user", Content: "next question"}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", Content: "answer"}, st.MaxTurns())
+
+	h := s.History()
+	for i, m := range h {
+		if m.Role != "tool" {
+			continue
+		}
+		if i == 0 || h[i-1].Role != "assistant" || len(h[i-1].ToolCalls) == 0 {
+			t.Fatalf("found orphan tool message at index %d: %+v", i, m)
+		}
+	}
+
+	foundSummary := false
+	for _, m := range h {
+		if m.Role == "system" && strings.HasPrefix(m.Content, "[History summary]\n") {
+			foundSummary = true
+			break
+		}
+	}
+	if !foundSummary {
+		t.Fatal("expected history summary after trimming old turn")
+	}
+}
+
+func TestTrimByTokenBudgetDropsOldestTurnBlocks(t *testing.T) {
+	st := session.NewStore(6, "sys", "")
+	st.SetTokenBudget(2200)
+	s := st.Get("budget")
+
+	for i := 0; i < 6; i++ {
+		long := strings.Repeat("payload ", 90)
+		s.Append(provider.Message{Role: "user", Content: "u" + long}, st.MaxTurns())
+		s.Append(provider.Message{Role: "assistant", Content: "a" + long}, st.MaxTurns())
+	}
+
+	h := s.History()
+	if len(h) == 0 {
+		t.Fatal("history should not be empty")
+	}
+
+	// Oldest user message should have been summarized away under strict token budget.
+	for _, m := range h {
+		if m.Role == "user" && strings.Contains(m.Content, "u"+strings.Repeat("payload ", 90)) {
+			t.Fatal("expected oldest oversized user messages to be removed by token budget")
+		}
+	}
+
+	foundSummary := false
+	for _, m := range h {
+		if m.Role == "system" && strings.HasPrefix(m.Content, "[History summary]\n") {
+			foundSummary = true
+			break
+		}
+	}
+	if !foundSummary {
+		t.Fatal("expected summary message after token-budget trimming")
+	}
+}
+
+func TestTrimKeepsConfiguredRecentRawTurns(t *testing.T) {
+	st := session.NewStore(6, "sys", "")
+	st.SetTokenBudget(2200)
+	st.SetRecentRawTurns(2)
+	s := st.Get("recent")
+
+	for i := 0; i < 6; i++ {
+		long := strings.Repeat("payload ", 90)
+		s.Append(provider.Message{Role: "user", Content: fmt.Sprintf("u%d %s", i, long)}, st.MaxTurns())
+		s.Append(provider.Message{Role: "assistant", Content: fmt.Sprintf("a%d %s", i, long)}, st.MaxTurns())
+	}
+
+	h := s.History()
+	userCount := 0
+	for _, m := range h {
+		if m.Role == "user" {
+			userCount++
+		}
+	}
+	if userCount < 2 {
+		t.Fatalf("expected at least 2 recent raw turns kept, got %d users", userCount)
+	}
+
+	lastUser := ""
+	for _, m := range h {
+		if m.Role == "user" {
+			lastUser = m.Content
+		}
+	}
+	if !strings.Contains(lastUser, "u5") {
+		t.Fatalf("expected newest turn to remain in raw history, got last user=%q", lastUser)
+	}
+}
+
+func TestTrimWithStricterCharsPerTokenEstimator(t *testing.T) {
+	stDefault := session.NewStore(6, "sys", "")
+	stDefault.SetTokenBudget(2400)
+	stDefault.SetRecentRawTurns(1)
+	sDefault := stDefault.Get("default-estimator")
+
+	stStrict := session.NewStore(6, "sys", "")
+	stStrict.SetTokenBudget(2400)
+	stStrict.SetRecentRawTurns(1)
+	stStrict.SetCharsPerToken(2)
+	sStrict := stStrict.Get("strict-estimator")
+
+	for i := 0; i < 6; i++ {
+		long := strings.Repeat("payload ", 100)
+		user := fmt.Sprintf("u%d %s", i, long)
+		assistant := fmt.Sprintf("a%d %s", i, long)
+		sDefault.Append(provider.Message{Role: "user", Content: user}, stDefault.MaxTurns())
+		sDefault.Append(provider.Message{Role: "assistant", Content: assistant}, stDefault.MaxTurns())
+		sStrict.Append(provider.Message{Role: "user", Content: user}, stStrict.MaxTurns())
+		sStrict.Append(provider.Message{Role: "assistant", Content: assistant}, stStrict.MaxTurns())
+	}
+
+	countUsers := func(h []provider.Message) int {
+		n := 0
+		for _, m := range h {
+			if m.Role == "user" {
+				n++
+			}
+		}
+		return n
+	}
+
+	defaultUsers := countUsers(sDefault.History())
+	strictUsers := countUsers(sStrict.History())
+	if strictUsers > defaultUsers {
+		t.Fatalf("expected stricter estimator to keep <= user turns, default=%d strict=%d", defaultUsers, strictUsers)
+	}
+}
+
+func TestObservePromptUsageAdaptsEstimator(t *testing.T) {
+	control := session.NewStore(6, "sys", "")
+	control.SetTokenBudget(2400)
+	control.SetRecentRawTurns(1)
+	controlSession := control.Get("control-adaptive")
+
+	adaptive := session.NewStore(6, "sys", "")
+	adaptive.SetTokenBudget(2400)
+	adaptive.SetRecentRawTurns(1)
+	adaptiveSession := adaptive.Get("adaptive")
+
+	probe := []provider.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: strings.Repeat("dense", 120)},
+		{Role: "assistant", Content: strings.Repeat("dense", 120)},
+	}
+	adaptive.ObservePromptUsage(probe, 1200)
+
+	for i := 0; i < 6; i++ {
+		long := strings.Repeat("payload ", 100)
+		user := fmt.Sprintf("u%d %s", i, long)
+		assistant := fmt.Sprintf("a%d %s", i, long)
+		controlSession.Append(provider.Message{Role: "user", Content: user}, control.MaxTurns())
+		controlSession.Append(provider.Message{Role: "assistant", Content: assistant}, control.MaxTurns())
+		adaptiveSession.Append(provider.Message{Role: "user", Content: user}, adaptive.MaxTurns())
+		adaptiveSession.Append(provider.Message{Role: "assistant", Content: assistant}, adaptive.MaxTurns())
+	}
+
+	countUsers := func(h []provider.Message) int {
+		n := 0
+		for _, m := range h {
+			if m.Role == "user" {
+				n++
+			}
+		}
+		return n
+	}
+
+	controlUsers := countUsers(controlSession.History())
+	adaptiveUsers := countUsers(adaptiveSession.History())
+	if adaptiveUsers > controlUsers {
+		t.Fatalf("expected adaptive estimator to keep <= user turns after dense prompt observation, control=%d adaptive=%d", controlUsers, adaptiveUsers)
+	}
+}
+
+func TestObservePromptUsageDoesNotOverrideFixedEstimator(t *testing.T) {
+	control := session.NewStore(6, "sys", "")
+	control.SetTokenBudget(2400)
+	control.SetRecentRawTurns(1)
+	control.SetCharsPerToken(6)
+	controlSession := control.Get("fixed-control")
+
+	target := session.NewStore(6, "sys", "")
+	target.SetTokenBudget(2400)
+	target.SetRecentRawTurns(1)
+	target.SetCharsPerToken(6)
+	target.ObservePromptUsage([]provider.Message{{Role: "user", Content: strings.Repeat("abcd", 200)}}, 1200)
+	targetSession := target.Get("fixed-target")
+
+	for i := 0; i < 6; i++ {
+		long := strings.Repeat("payload ", 100)
+		user := fmt.Sprintf("u%d %s", i, long)
+		assistant := fmt.Sprintf("a%d %s", i, long)
+		controlSession.Append(provider.Message{Role: "user", Content: user}, control.MaxTurns())
+		controlSession.Append(provider.Message{Role: "assistant", Content: assistant}, control.MaxTurns())
+		targetSession.Append(provider.Message{Role: "user", Content: user}, target.MaxTurns())
+		targetSession.Append(provider.Message{Role: "assistant", Content: assistant}, target.MaxTurns())
+	}
+
+	countUsers := func(h []provider.Message) int {
+		n := 0
+		for _, m := range h {
+			if m.Role == "user" {
+				n++
+			}
+		}
+		return n
+	}
+
+	if countUsers(controlSession.History()) != countUsers(targetSession.History()) {
+		t.Fatal("expected fixed estimator behavior to remain unchanged after ObservePromptUsage")
+	}
+}
+
+func TestHistoryForLLMUsesHintBudgetScale(t *testing.T) {
+	st := session.NewStore(8, "sys", "")
+	st.SetTokenBudget(2600)
+	st.SetRecentRawTurns(1)
+	st.SetHintBudgetScale(provider.ModelHintRouter, 0.35)
+	st.SetHintBudgetScale(provider.ModelHintThinking, 1.6)
+	s := st.Get("hint-aware")
+
+	for i := 0; i < 8; i++ {
+		long := strings.Repeat("payload ", 100)
+		s.Append(provider.Message{Role: "user", Content: fmt.Sprintf("u%d %s", i, long)}, st.MaxTurns())
+		s.Append(provider.Message{Role: "assistant", Content: fmt.Sprintf("a%d %s", i, long)}, st.MaxTurns())
+	}
+
+	countUsers := func(h []provider.Message) int {
+		n := 0
+		for _, m := range h {
+			if m.Role == "user" {
+				n++
+			}
+		}
+		return n
+	}
+
+	routerUsers := countUsers(s.HistoryForLLM(provider.ModelHintRouter))
+	thinkingUsers := countUsers(s.HistoryForLLM(provider.ModelHintThinking))
+	if thinkingUsers < routerUsers {
+		t.Fatalf("expected thinking history to keep >= router history, router=%d thinking=%d", routerUsers, thinkingUsers)
+	}
+	if routerUsers == thinkingUsers {
+		t.Fatalf("expected hint budget scale to produce different retained history, router=%d thinking=%d", routerUsers, thinkingUsers)
+	}
+}
+
+func TestTrimPrefersKeepingToolHeavyTurns(t *testing.T) {
+	st := session.NewStore(4, "sys", "")
+	st.SetTokenBudget(2600)
+	st.SetRecentRawTurns(1)
+	s := st.Get("tool-priority")
+
+	plainLong := strings.Repeat("plain ", 120)
+	toolLong := strings.Repeat("tool ", 120)
+	newestLong := strings.Repeat("newest ", 120)
+
+	// Oldest plain turn should be trimmed before the later tool-heavy turn.
+	s.Append(provider.Message{Role: "user", Content: "plain-user " + plainLong}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", Content: "plain-assistant " + plainLong}, st.MaxTurns())
+
+	s.Append(provider.Message{Role: "user", Content: "tool-user " + toolLong}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", ToolCalls: []provider.ToolCallRequest{mkToolCall("call-keep", "read_file")}}, st.MaxTurns())
+	s.Append(provider.Message{Role: "tool", ToolCallID: "call-keep", Name: "read_file", Content: `{"type":"tool_result"}`}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", Content: "tool-assistant " + toolLong}, st.MaxTurns())
+
+	s.Append(provider.Message{Role: "user", Content: "newest-user " + newestLong}, st.MaxTurns())
+	s.Append(provider.Message{Role: "assistant", Content: "newest-assistant " + newestLong}, st.MaxTurns())
+
+	h := s.HistoryForLLM(provider.ModelHintTask)
+	joined := ""
+	for _, m := range h {
+		joined += m.Content + "\n"
+	}
+	if strings.Contains(joined, "plain-user "+plainLong) {
+		t.Fatal("expected oldest plain turn to be trimmed before tool-heavy turn")
+	}
+	if !strings.Contains(joined, "tool-user "+toolLong) {
+		t.Fatal("expected tool-heavy turn to be retained under the same budget")
+	}
+	foundToolMessage := false
+	for _, m := range h {
+		if m.Role == "tool" && m.Name == "read_file" {
+			foundToolMessage = true
+			break
+		}
+	}
+	if !foundToolMessage {
+		t.Fatal("expected tool result to remain when tool-heavy turn is prioritized")
 	}
 }

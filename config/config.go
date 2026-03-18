@@ -16,9 +16,13 @@ import (
 type Config struct {
 	// SocketPath is the Unix Domain Socket path used by the daemon and client.
 	// Defaults to ipc.DefaultSocketPath() when empty.
-	SocketPath      string         `yaml:"socket_path"`
-	MaxHistoryTurns int            `yaml:"max_history_turns"`
-	Provider        ProviderConfig `yaml:"provider"`
+	SocketPath           string                   `yaml:"socket_path"`
+	MaxHistoryTurns      int                      `yaml:"max_history_turns"`
+	MaxHistoryTokens     int                      `yaml:"max_history_tokens"`
+	RecentRawTurns       int                      `yaml:"recent_raw_turns"`
+	HistoryCharsPerToken float64                  `yaml:"history_chars_per_token"`
+	HistoryBudgetScale   HistoryBudgetScaleConfig `yaml:"history_budget_scale"`
+	Provider             ProviderConfig           `yaml:"provider"`
 	// Models is a reusable provider catalog keyed by logical model name.
 	// Used by RoutingPolicy to separate model definitions from routing rules.
 	Models map[string]ProviderConfig `yaml:"models"`
@@ -31,6 +35,15 @@ type Config struct {
 	Tools         ToolsConfig         `yaml:"tools"`
 	Theme         ThemeConfig         `yaml:"theme"`
 	Log           LogConfig           `yaml:"log"`
+}
+
+// HistoryBudgetScaleConfig configures hint-specific multipliers applied when
+// building the final history view for router/task/summary/thinking calls.
+type HistoryBudgetScaleConfig struct {
+	Router   float64 `yaml:"router"`
+	Task     float64 `yaml:"task"`
+	Summary  float64 `yaml:"summary"`
+	Thinking float64 `yaml:"thinking"`
 }
 
 // RoutingPolicyConfig maps tiers to named model entries from Config.Models.
@@ -202,6 +215,25 @@ func applyDefaults(cfg *Config) {
 	if cfg.MaxHistoryTurns == 0 {
 		cfg.MaxHistoryTurns = 20
 	}
+	if cfg.RecentRawTurns == 0 {
+		if cfg.MaxHistoryTurns < 4 {
+			cfg.RecentRawTurns = cfg.MaxHistoryTurns
+		} else {
+			cfg.RecentRawTurns = 4
+		}
+	}
+	if cfg.HistoryBudgetScale.Router == 0 {
+		cfg.HistoryBudgetScale.Router = 0.35
+	}
+	if cfg.HistoryBudgetScale.Task == 0 {
+		cfg.HistoryBudgetScale.Task = 1.0
+	}
+	if cfg.HistoryBudgetScale.Summary == 0 {
+		cfg.HistoryBudgetScale.Summary = 0.85
+	}
+	if cfg.HistoryBudgetScale.Thinking == 0 {
+		cfg.HistoryBudgetScale.Thinking = 1.5
+	}
 	if cfg.Provider.BaseURL == "" {
 		cfg.Provider.BaseURL = "https://api.openai.com/v1"
 	}
@@ -281,6 +313,34 @@ func applyEnvOverrides(cfg *Config) {
 }
 
 func validate(cfg *Config) error {
+	if cfg.MaxHistoryTurns < 0 {
+		return fmt.Errorf("max_history_turns must be >= 0")
+	}
+	if cfg.MaxHistoryTokens < 0 {
+		return fmt.Errorf("max_history_tokens must be >= 0")
+	}
+	if cfg.RecentRawTurns < 0 {
+		return fmt.Errorf("recent_raw_turns must be >= 0")
+	}
+	if cfg.HistoryCharsPerToken < 0 {
+		return fmt.Errorf("history_chars_per_token must be >= 0")
+	}
+	if cfg.HistoryCharsPerToken > 0 && cfg.HistoryCharsPerToken < 1 {
+		return fmt.Errorf("history_chars_per_token must be >= 1 when set")
+	}
+	for name, value := range map[string]float64{
+		"history_budget_scale.router":   cfg.HistoryBudgetScale.Router,
+		"history_budget_scale.task":     cfg.HistoryBudgetScale.Task,
+		"history_budget_scale.summary":  cfg.HistoryBudgetScale.Summary,
+		"history_budget_scale.thinking": cfg.HistoryBudgetScale.Thinking,
+	} {
+		if value < 0 {
+			return fmt.Errorf("%s must be >= 0", name)
+		}
+		if value > 0 && value < 0.1 {
+			return fmt.Errorf("%s must be >= 0.1 when set", name)
+		}
+	}
 	return nil
 }
 

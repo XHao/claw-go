@@ -22,6 +22,25 @@
 # 每会话保留的最大对话轮数（一问一答为一轮）
 max_history_turns: 20
 
+# 会话上下文裁剪的近似 token 预算（0=按 max_history_turns 自动推导）
+# 超预算时会按“最老事务块”淘汰并写入滚动摘要。
+# max_history_tokens: 0
+
+# token 估算系数（每 token 约多少字符，0=自动默认 4.0，并会结合真实 prompt_tokens 自适应校准）
+# 对 CJK 或符号密集内容可适当调小（如 2.5~3.5）以更保守裁剪；显式设置后将固定，不再自动校准。
+# history_chars_per_token: 0
+
+# 按调用层级控制最终送给模型的历史预算倍率。
+# router 通常应更小；thinking 可更大，以保留更多上下文用于深度推理。
+# history_budget_scale:
+#   router: 0.35
+#   task: 1.0
+#   summary: 0.85
+#   thinking: 1.5
+
+# 始终保留原文的最近轮数（0=自动，默认 4 或不超过 max_history_turns）
+# recent_raw_turns: 0
+
 # ── LLM models + default model ───────────────────────────────────────────────
 # 1) 定义 models 列表（每个模型的 base_url/api_key/model/max_tokens）。
 # 2) 通过 primary_model 指定主模型（必填）。

@@ -46,11 +46,59 @@ provider:
 	if cfg.MaxHistoryTurns != 20 {
 		t.Errorf("want MaxHistoryTurns 20, got %d", cfg.MaxHistoryTurns)
 	}
+	if cfg.RecentRawTurns != 4 {
+		t.Errorf("want RecentRawTurns default 4, got %d", cfg.RecentRawTurns)
+	}
+	if cfg.HistoryCharsPerToken != 0 {
+		t.Errorf("want HistoryCharsPerToken default 0 (auto), got %v", cfg.HistoryCharsPerToken)
+	}
+	if cfg.HistoryBudgetScale.Router != 0.35 || cfg.HistoryBudgetScale.Task != 1.0 || cfg.HistoryBudgetScale.Summary != 0.85 || cfg.HistoryBudgetScale.Thinking != 1.5 {
+		t.Errorf("unexpected history budget scale defaults: %+v", cfg.HistoryBudgetScale)
+	}
 	if cfg.Provider.Model != "gpt-4o-mini" {
 		t.Errorf("want default model, got %q", cfg.Provider.Model)
 	}
 	if cfg.CLI.Prompt == "" {
 		t.Error("want non-empty default CLI prompt")
+	}
+}
+
+func TestValidateHistoryCharsPerTokenTooSmall(t *testing.T) {
+	path := writeTemp(t, `
+max_history_turns: 20
+history_chars_per_token: 0.5
+provider:
+  api_key: "sk-test"
+`)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected validation error for history_chars_per_token < 1")
+	}
+}
+
+func TestValidateNegativeHistoryConfig(t *testing.T) {
+	path := writeTemp(t, `
+max_history_turns: 20
+max_history_tokens: -1
+provider:
+  api_key: "sk-test"
+`)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected validation error for negative max_history_tokens")
+	}
+}
+
+func TestValidateHistoryBudgetScaleTooSmall(t *testing.T) {
+	path := writeTemp(t, `
+history_budget_scale:
+  router: 0.05
+provider:
+  api_key: "sk-test"
+`)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected validation error for history_budget_scale.router < 0.1")
 	}
 }
 

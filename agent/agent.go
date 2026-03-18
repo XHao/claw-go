@@ -111,6 +111,7 @@ func (a *Agent) RegisterChannel(ch channel.Channel) {
 }
 
 func prepareMessagesForLLM(history []provider.Message, tools []provider.ToolDef) []provider.Message {
+	history = sanitizeHistoryForToolProtocol(history)
 	if !hasFileToolWorkflow(tools) {
 		return history
 	}
@@ -128,6 +129,43 @@ func prepareMessagesForLLM(history []provider.Message, tools []provider.ToolDef)
 	prepared = append(prepared, guide)
 	prepared = append(prepared, history[1:]...)
 	return prepared
+}
+
+func sanitizeHistoryForToolProtocol(history []provider.Message) []provider.Message {
+	if len(history) == 0 {
+		return history
+	}
+	out := make([]provider.Message, 0, len(history))
+	pendingToolCalls := make(map[string]struct{})
+
+	for _, m := range history {
+		if m.Role == "tool" {
+			if m.ToolCallID == "" {
+				continue
+			}
+			if _, ok := pendingToolCalls[m.ToolCallID]; !ok {
+				continue
+			}
+			out = append(out, m)
+			delete(pendingToolCalls, m.ToolCallID)
+			continue
+		}
+
+		if len(pendingToolCalls) > 0 {
+			pendingToolCalls = make(map[string]struct{})
+		}
+
+		out = append(out, m)
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				if tc.ID != "" {
+					pendingToolCalls[tc.ID] = struct{}{}
+				}
+			}
+		}
+	}
+
+	return out
 }
 
 func hasFileToolWorkflow(tools []provider.ToolDef) bool {
@@ -232,7 +270,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		if a.skillRouter != nil {
 			skillNames = a.skillRouter.Names()
 		}
-		decision := a.autoRouter.Classify(ctx, text, sess.History(), skillNames)
+		decision := a.autoRouter.Classify(ctx, text, sess.HistoryForLLM(provider.ModelHintRouter), skillNames)
 		ctx = provider.WithModelHint(ctx, decision.Hint)
 		log.Info("auto-routed", "hint", decision.Hint, "reason", decision.Reason, "reason_code", decision.ReasonCode, "confidence", decision.Confidence)
 	}
@@ -258,7 +296,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			tools = append(tools, a.tools...)
 		}
 
-		messages := prepareMessagesForLLM(sess.History(), tools)
+		messages := prepareMessagesForLLM(sess.HistoryForLLM(provider.HintFromContext(loopCtx)), tools)
 		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
 			log.Error("LLM completion failed", "err", err)
@@ -271,6 +309,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			}
 			return
 		}
+		a.sessions.ObservePromptUsage(messages, result.Usage.PromptTokens)
 		log.Info("LLM response", "elapsed_ms", time.Since(start).Milliseconds(), "stop_reason", result.StopReason)
 
 		// Case 1: LLM wants to call tools (may include server-side skills).
@@ -445,7 +484,7 @@ func (a *Agent) InjectMessage(ctx context.Context, sessionKey, text string) (str
 	sess := a.sessions.Get(sessionKey)
 	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
 	injectCtx := provider.WithHintSource(ctx, "agent/inject")
-	reply, err := a.provider.Complete(injectCtx, sess.History())
+	reply, err := a.provider.Complete(injectCtx, sess.HistoryForLLM(provider.HintFromContext(injectCtx)))
 	if err != nil {
 		return "", err
 	}

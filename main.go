@@ -174,6 +174,19 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	llm = provider.WrapObserve(llm)
 
 	sessions := session.NewStore(cfg.MaxHistoryTurns, config.ExpandPrompt(cfg.Provider.SystemPrompt), dirs.Sessions())
+	if cfg.MaxHistoryTokens > 0 {
+		sessions.SetTokenBudget(cfg.MaxHistoryTokens)
+	}
+	if cfg.RecentRawTurns > 0 {
+		sessions.SetRecentRawTurns(cfg.RecentRawTurns)
+	}
+	if cfg.HistoryCharsPerToken > 0 {
+		sessions.SetCharsPerToken(cfg.HistoryCharsPerToken)
+	}
+	sessions.SetHintBudgetScale(provider.ModelHintRouter, cfg.HistoryBudgetScale.Router)
+	sessions.SetHintBudgetScale(provider.ModelHintTask, cfg.HistoryBudgetScale.Task)
+	sessions.SetHintBudgetScale(provider.ModelHintSummary, cfg.HistoryBudgetScale.Summary)
+	sessions.SetHintBudgetScale(provider.ModelHintThinking, cfg.HistoryBudgetScale.Thinking)
 
 	// Ensure the built-in "main" session always exists from the first run.
 	// It is created (or loaded from disk) here; it cannot be deleted at runtime.
