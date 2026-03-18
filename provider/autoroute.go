@@ -9,8 +9,10 @@ import (
 
 // RouteDecision is the output of AutoRouter.Classify.
 type RouteDecision struct {
-	Hint   ModelHint
-	Reason string // e.g. "heuristic:keyword", "heuristic:simple", "heuristic:skill", "llm:thinking", "llm:task"
+	Hint       ModelHint
+	Reason     string  // e.g. "heuristic:keyword", "heuristic:simple", "heuristic:skill", "llm:thinking", "llm:task"
+	ReasonCode string  // machine-readable reason label
+	Confidence float64 // 0..1 estimate when available
 }
 
 // AutoRouter classifies each incoming user message into a model tier before
@@ -81,19 +83,19 @@ func NewAutoRouter(p Provider, extraThinkingKeywords []string) *AutoRouter {
 // of available server-side skills/tools.
 func (a *AutoRouter) Classify(ctx context.Context, text string, history []Message, skillNames []string) RouteDecision {
 	if matchThinkingKeyword(text, a.thinkingKeywords) {
-		return RouteDecision{Hint: ModelHintThinking, Reason: "heuristic:keyword"}
+		return RouteDecision{Hint: ModelHintThinking, Reason: "heuristic:keyword", ReasonCode: "keyword_match", Confidence: 0.99}
 	}
 	if heuristicSimple(text) {
-		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:simple"}
+		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:simple", ReasonCode: "simple_message", Confidence: 0.95}
 	}
 	if canHandleBySkill(text, skillNames) {
-		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:skill"}
+		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:skill", ReasonCode: "skill_match", Confidence: 0.95}
 	}
 	return a.llmClassify(ctx, history)
 }
 
 // autoRouteSystemPrompt is sent to the cheap routing-tier model.
-// Keep it minimal — the classifier only outputs {"tier":"task"} or {"tier":"thinking"}.
+// Keep it minimal and machine-readable.
 const autoRouteSystemPrompt = `You are a task routing classifier for an AI coding assistant.
 Analyze the conversation and respond with ONLY valid JSON — no explanation, no markdown.
 
@@ -105,7 +107,8 @@ Route to "thinking" ONLY when the task clearly requires:
 
 Route to "task" for everything else: questions, explanations, simple code, short commands, translations.
 
-Respond ONLY with: {"tier":"task"} or {"tier":"thinking"}`
+Respond ONLY with JSON using this schema:
+{"tier":"task|thinking","reason_code":"short_snake_case","confidence":0.0}`
 
 // llmClassify sends the last few conversation turns to the routing-tier model
 // and parses its decision.
@@ -130,7 +133,7 @@ func (a *AutoRouter) llmClassify(ctx context.Context, history []Message) RouteDe
 	reply, err := a.provider.Complete(classifyCtx, msgs)
 	if err != nil {
 		// Classification failure is non-fatal: fall back to task tier.
-		return RouteDecision{Hint: ModelHintTask, Reason: "llm:error"}
+		return RouteDecision{Hint: ModelHintTask, Reason: "llm:error", ReasonCode: "classifier_error", Confidence: 0}
 	}
 
 	// Parse — strip any accidental markdown fences.
@@ -141,15 +144,26 @@ func (a *AutoRouter) llmClassify(ctx context.Context, history []Message) RouteDe
 	clean = strings.TrimSpace(clean)
 
 	var result struct {
-		Tier string `json:"tier"`
+		Tier       string  `json:"tier"`
+		ReasonCode string  `json:"reason_code"`
+		Confidence float64 `json:"confidence"`
 	}
 	if err := json.Unmarshal([]byte(clean), &result); err != nil {
-		return RouteDecision{Hint: ModelHintTask, Reason: "llm:parse_error"}
+		return RouteDecision{Hint: ModelHintTask, Reason: "llm:parse_error", ReasonCode: "parse_error", Confidence: 0}
+	}
+	if result.Confidence < 0 {
+		result.Confidence = 0
+	}
+	if result.Confidence > 1 {
+		result.Confidence = 1
+	}
+	if strings.TrimSpace(result.ReasonCode) == "" {
+		result.ReasonCode = "classifier_output"
 	}
 	if result.Tier == "thinking" {
-		return RouteDecision{Hint: ModelHintThinking, Reason: "llm:thinking"}
+		return RouteDecision{Hint: ModelHintThinking, Reason: "llm:thinking", ReasonCode: result.ReasonCode, Confidence: result.Confidence}
 	}
-	return RouteDecision{Hint: ModelHintTask, Reason: "llm:task"}
+	return RouteDecision{Hint: ModelHintTask, Reason: "llm:task", ReasonCode: result.ReasonCode, Confidence: result.Confidence}
 }
 
 // heuristicSimple returns true for messages that are clearly low-complexity

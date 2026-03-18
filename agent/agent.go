@@ -21,6 +21,26 @@ import (
 
 const defaultMaxToolIterations = 10
 
+const fileToolSelectionPrompt = `When analyzing files, prefer a staged workflow instead of reading blindly.
+
+- For unknown, large, binary-like, Office, HTML, flamegraph, minified, or generated files: call inspect_file first.
+- Treat inspect_file, tool_guard, large_file_preview, grep_file, search_file, and read_file outputs as machine-readable JSON. Use recommended_strategy, risk_level, structure, is_binary, matches, truncated, content, range_start, and range_end as primary decision fields.
+- Tool messages are normalized as a tool_result JSON envelope. Read ok/is_json first, then consume payload for structured tool outputs, text for plain outputs, and error for failures.
+- For line-oriented text such as source code, logs, configs, and stack traces: prefer grep_file before read_file.
+- For HTML, flamegraphs, minified text, dense traces, or content without meaningful line structure: prefer search_file before read_file.
+- Use read_file only after you know the file type or have narrowed to a relevant segment.
+- Avoid direct text reads of binary-like or Office container files unless a prior inspection says it is safe.`
+
+type normalizedToolMessage struct {
+	Type    string      `json:"type"`
+	Tool    string      `json:"tool"`
+	OK      bool        `json:"ok"`
+	IsJSON  bool        `json:"is_json"`
+	Payload interface{} `json:"payload,omitempty"`
+	Text    string      `json:"text,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
 // Agent ties together provider, session store, and channels.
 type Agent struct {
 	provider      provider.Provider
@@ -88,6 +108,43 @@ func (a *Agent) SetAutoRouter(ar *provider.AutoRouter) {
 // RegisterChannel adds a channel so the agent can dispatch replies through it.
 func (a *Agent) RegisterChannel(ch channel.Channel) {
 	a.channels[ch.ID()] = ch
+}
+
+func prepareMessagesForLLM(history []provider.Message, tools []provider.ToolDef) []provider.Message {
+	if !hasFileToolWorkflow(tools) {
+		return history
+	}
+	guide := provider.Message{Role: "system", Content: fileToolSelectionPrompt}
+	if len(history) == 0 {
+		return []provider.Message{guide}
+	}
+	prepared := make([]provider.Message, 0, len(history)+1)
+	prepared = append(prepared, history[0])
+	if history[0].Role == "system" {
+		prepared = append(prepared, guide)
+		prepared = append(prepared, history[1:]...)
+		return prepared
+	}
+	prepared = append(prepared, guide)
+	prepared = append(prepared, history[1:]...)
+	return prepared
+}
+
+func hasFileToolWorkflow(tools []provider.ToolDef) bool {
+	var hasInspect, hasRead, hasGrep, hasSearch bool
+	for _, tool := range tools {
+		switch tool.Name {
+		case "inspect_file":
+			hasInspect = true
+		case "read_file":
+			hasRead = true
+		case "grep_file":
+			hasGrep = true
+		case "search_file":
+			hasSearch = true
+		}
+	}
+	return hasInspect && hasRead && (hasGrep || hasSearch)
 }
 
 // Dispatch handles a single inbound user message end-to-end.
@@ -177,7 +234,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		}
 		decision := a.autoRouter.Classify(ctx, text, sess.History(), skillNames)
 		ctx = provider.WithModelHint(ctx, decision.Hint)
-		log.Info("auto-routed", "hint", decision.Hint, "reason", decision.Reason)
+		log.Info("auto-routed", "hint", decision.Hint, "reason", decision.Reason, "reason_code", decision.ReasonCode, "confidence", decision.Confidence)
 	}
 
 	// Accumulate tool actions for the memory summary.
@@ -201,7 +258,8 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			tools = append(tools, a.tools...)
 		}
 
-		result, err := a.provider.CompleteWithTools(loopCtx, sess.History(), tools)
+		messages := prepareMessagesForLLM(sess.History(), tools)
+		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
 			log.Error("LLM completion failed", "err", err)
 			a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, i, true)
@@ -285,10 +343,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 
 			// Append all tool results as "tool" role messages.
 			for _, res := range allResults {
-				content := res.Output
-				if res.IsError {
-					content = fmt.Sprintf("[error] %s", res.Output)
-				}
+				content := normalizeToolResultContent(res)
 				log.Info("tool result", "tool", res.Name, "call_id", res.CallID, "is_error", res.IsError)
 				sess.Append(provider.Message{
 					Role:       "tool",
@@ -331,6 +386,40 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			Text:   fmt.Sprintf("已达到最大工具调用次数（%d），最终状态可能不完整。", a.maxIterations),
 		})
 	}
+}
+
+func normalizeToolResultContent(res ipc.ToolResult) string {
+	msg := normalizedToolMessage{
+		Type: "tool_result",
+		Tool: res.Name,
+		OK:   !res.IsError,
+	}
+
+	var payload interface{}
+	if err := json.Unmarshal([]byte(res.Output), &payload); err == nil {
+		msg.IsJSON = true
+		msg.Payload = payload
+	} else {
+		msg.IsJSON = false
+		if res.IsError {
+			msg.Error = res.Output
+		} else {
+			msg.Text = res.Output
+		}
+	}
+
+	if res.IsError && msg.Error == "" {
+		msg.Error = res.Output
+	}
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		if res.IsError {
+			return fmt.Sprintf("[error] %s", res.Output)
+		}
+		return res.Output
+	}
+	return string(b)
 }
 
 func toIPCUsageEvent(ev provider.UsageEvent) *ipc.LLMUsageEvent {

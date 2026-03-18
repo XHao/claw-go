@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +21,7 @@ import (
 // AllDefs returns the ToolDef list for every built-in tool that is enabled.
 // Pass the names you wish to expose (nil = all built-ins).
 func AllDefs(allowed []string) []provider.ToolDef {
-	all := []provider.ToolDef{BashDef, ReadFileDef, GrepFileDef, SearchFileDef, WriteFileDef, ListFilesDef}
+	all := []provider.ToolDef{BashDef, InspectFileDef, ReadFileDef, GrepFileDef, SearchFileDef, WriteFileDef, ListFilesDef}
 	if len(allowed) == 0 {
 		return all
 	}
@@ -45,21 +46,27 @@ var BashDef = provider.ToolDef{
 	Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute."}},"required":["command"]}`),
 }
 
+var InspectFileDef = provider.ToolDef{
+	Name:        "inspect_file",
+	Description: "Inspect a file before any content read. Returns metadata, text/binary heuristics, format hints, and a recommended analysis strategy. This should usually be the first step for unknown, large, binary, Office, archive, flamegraph, HTML, or generated files.",
+	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."}},"required":["path"]}`),
+}
+
 var ReadFileDef = provider.ToolDef{
 	Name:        "read_file",
-	Description: "Read a file as text. Supports optional offset/max_bytes for segmented reads. Large files return a guided preview instead of the entire content.",
+	Description: "Read a file as text. Supports optional offset/max_bytes for segmented reads. Do not use this as the first step for unknown or large files: inspect_file first, then grep_file or search_file to locate relevant regions, and finally use read_file for targeted segments.",
 	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"offset":{"type":"integer","description":"Optional byte offset to start reading from. Defaults to 0."},"max_bytes":{"type":"integer","description":"Optional maximum bytes to read for this call. Useful for large-file segmented inspection."}},"required":["path"]}`),
 }
 
 var SearchFileDef = provider.ToolDef{
 	Name:        "search_file",
-	Description: "Search within a file without loading the whole file into the model context. Returns byte offsets and short snippets around each match. Prefer this for large logs, traces, flamegraphs, and minified HTML before using read_file segments.",
+	Description: "Search within a file without loading the whole file into the model context. Returns byte offsets and short snippets around each match. Prefer this for flamegraphs, HTML, minified assets, dense traces, and other non-line-oriented large text before using read_file segments.",
 	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"query":{"type":"string","description":"Text to search for inside the file."},"max_matches":{"type":"integer","description":"Maximum number of matches to return. Defaults to 5."},"context_bytes":{"type":"integer","description":"Bytes of surrounding context to include around each match. Defaults to 96."},"case_sensitive":{"type":"boolean","description":"Whether the search is case-sensitive. Defaults to false."}},"required":["path","query"]}`),
 }
 
 var GrepFileDef = provider.ToolDef{
 	Name:        "grep_file",
-	Description: "Search a text file line by line and return matching line numbers. Supports plain substring or regular expression matching. Prefer this for logs, code, configs, stack traces, and other line-oriented text files.",
+	Description: "Search a text file line by line and return matching line numbers. Supports plain substring or regular expression matching. Prefer this for logs, source code, configs, stack traces, and other line-oriented text files after inspect_file confirms the file is text-like.",
 	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"query":{"type":"string","description":"Substring or regular expression to search for."},"is_regexp":{"type":"boolean","description":"Interpret query as a regular expression. Defaults to false."},"case_sensitive":{"type":"boolean","description":"Whether the search is case-sensitive. Defaults to false."},"max_matches":{"type":"integer","description":"Maximum number of matching lines to return. Defaults to 20."}},"required":["path","query"]}`),
 }
 
@@ -90,6 +97,12 @@ func (r *LocalRunner) Run(ctx context.Context, name, argsJSON string) (output st
 	switch name {
 	case "bash":
 		out, err := r.runBash(ctx, argsJSON)
+		if err != nil {
+			return err.Error(), true
+		}
+		return out, false
+	case "inspect_file":
+		out, err := r.runInspectFile(argsJSON)
 		if err != nil {
 			return err.Error(), true
 		}
@@ -226,6 +239,14 @@ func (r *LocalRunner) runReadFile(argsJSON string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	ext := strings.ToLower(filepath.Ext(args.Path))
+	sample, err := readAtMost(f, 0, minInt64(8*1024, info.Size()))
+	if err != nil {
+		return "", err
+	}
+	if msg, blocked := blockTextToolUse(args.Path, ext, sample); blocked {
+		return msg, nil
+	}
 
 	// If the caller did not request a segment and the file is large, return a guided preview.
 	if args.Offset == 0 && args.MaxBytes <= 0 && info.Size() > limit {
@@ -265,25 +286,37 @@ func previewLargeFile(f *os.File, path string, size, limit int64) (string, error
 		}
 	}
 
-	var sb strings.Builder
-	sb.WriteString("[large file preview]\n")
-	sb.WriteString(fmt.Sprintf("path: %s\n", path))
-	sb.WriteString(fmt.Sprintf("size: %d bytes\n", size))
-	sb.WriteString(fmt.Sprintf("default_read_limit: %d bytes\n", limit))
-	sb.WriteString("note: full file was not returned because it exceeds the safe read limit.\n")
-	sb.WriteString("hint: use grep_file {path, query} for line-oriented text, or search_file {path, query} for minified/HTML-like content, then read_file {path, offset, max_bytes} for targeted inspection.\n")
+	type previewReport struct {
+		Type             string   `json:"type"`
+		Path             string   `json:"path"`
+		Size             int64    `json:"size"`
+		DefaultReadLimit int64    `json:"default_read_limit"`
+		RecommendedNext  string   `json:"recommended_next"`
+		RiskLevel        string   `json:"risk_level"`
+		Hints            []string `json:"hints,omitempty"`
+		HeadPreview      string   `json:"head_preview"`
+		TailPreview      string   `json:"tail_preview,omitempty"`
+	}
+	hints := []string{"Use inspect_file first when the format is unclear", "For text files, use grep_file or search_file before read_file segments"}
 	if looksLikeFlamegraph(path, head) {
-		sb.WriteString("hint: this looks like a flamegraph/html trace; search for keywords such as translog, fsync, flush, write, sync before reading segments.\n")
+		hints = append(hints, "Flamegraph/HTML trace detected: search for translog, fsync, flush, write, sync before reading segments")
 	}
-	sb.WriteString("\n--- BEGIN HEAD PREVIEW ---\n")
-	sb.WriteString(head)
-	sb.WriteString("\n--- END HEAD PREVIEW ---\n")
-	if tail != "" {
-		sb.WriteString(fmt.Sprintf("\n--- BEGIN TAIL PREVIEW (offset=%d) ---\n", size-int64(len(tail))))
-		sb.WriteString(tail)
-		sb.WriteString("\n--- END TAIL PREVIEW ---\n")
+	report := previewReport{
+		Type:             "large_file_preview",
+		Path:             path,
+		Size:             size,
+		DefaultReadLimit: limit,
+		RecommendedNext:  "inspect_file -> grep_file/search_file -> read_file(segment)",
+		RiskLevel:        "medium",
+		Hints:            hints,
+		HeadPreview:      head,
+		TailPreview:      tail,
 	}
-	return sb.String(), nil
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("preview_large_file: marshal report: %w", err)
+	}
+	return string(b), nil
 }
 
 func readFileSegment(f *os.File, path string, size, offset, maxBytes int64) (string, error) {
@@ -295,18 +328,33 @@ func readFileSegment(f *os.File, path string, size, offset, maxBytes int64) (str
 		return "", err
 	}
 	end := offset + int64(len(chunk))
-	var sb strings.Builder
-	if offset > 0 || end < size {
-		sb.WriteString("[file segment]\n")
-		sb.WriteString(fmt.Sprintf("path: %s\n", path))
-		sb.WriteString(fmt.Sprintf("range: [%d, %d) of %d bytes\n", offset, end, size))
-		sb.WriteString("\n")
+	type segmentReport struct {
+		Type       string `json:"type"`
+		Path       string `json:"path"`
+		Size       int64  `json:"size"`
+		RangeStart int64  `json:"range_start"`
+		RangeEnd   int64  `json:"range_end"`
+		Truncated  bool   `json:"truncated"`
+		NextOffset int64  `json:"next_offset,omitempty"`
+		Content    string `json:"content"`
 	}
-	sb.WriteString(chunk)
+	report := segmentReport{
+		Type:       "file_segment",
+		Path:       path,
+		Size:       size,
+		RangeStart: offset,
+		RangeEnd:   end,
+		Truncated:  end < size,
+		Content:    chunk,
+	}
 	if end < size {
-		sb.WriteString(fmt.Sprintf("\n[file truncated, next_offset=%d]", end))
+		report.NextOffset = end
 	}
-	return sb.String(), nil
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("read_file: marshal segment report: %w", err)
+	}
+	return string(b), nil
 }
 
 func readAtMost(f *os.File, offset, maxBytes int64) (string, error) {
@@ -321,6 +369,39 @@ func readAtMost(f *os.File, offset, maxBytes int64) (string, error) {
 	return string(buf[:n]), nil
 }
 
+func blockTextToolUse(path, ext, sample string) (string, bool) {
+	type guardReport struct {
+		Type                string `json:"type"`
+		Path                string `json:"path"`
+		RiskLevel           string `json:"risk_level"`
+		Reason              string `json:"reason"`
+		RecommendedStrategy string `json:"recommended_strategy"`
+	}
+	if isOfficeContainer(ext) {
+		report := guardReport{
+			Type:                "tool_guard",
+			Path:                path,
+			RiskLevel:           "high",
+			Reason:              fmt.Sprintf("Office container detected (%s); plain-text reads are unsafe and low-value", ext),
+			RecommendedStrategy: "inspect_file -> metadata_only_or_specialized_extractor",
+		}
+		b, _ := json.MarshalIndent(report, "", "  ")
+		return string(b), true
+	}
+	if looksBinary(sample) {
+		report := guardReport{
+			Type:                "tool_guard",
+			Path:                path,
+			RiskLevel:           "high",
+			Reason:              "Binary-like content detected; avoid direct text search/read tools",
+			RecommendedStrategy: "inspect_file -> metadata_only",
+		}
+		b, _ := json.MarshalIndent(report, "", "  ")
+		return string(b), true
+	}
+	return "", false
+}
+
 func looksLikeFlamegraph(path, head string) bool {
 	lowerPath := strings.ToLower(path)
 	lowerHead := strings.ToLower(head)
@@ -333,6 +414,226 @@ func minInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func (r *LocalRunner) runInspectFile(argsJSON string) (string, error) {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("inspect_file: parse args: %w", err)
+	}
+	if args.Path == "" {
+		return "", fmt.Errorf("inspect_file: path is empty")
+	}
+	info, err := os.Stat(args.Path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("inspect_file: path is a directory")
+	}
+	f, err := os.Open(args.Path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	sampleSize := minInt64(32*1024, info.Size())
+	sample, err := readAtMost(f, 0, sampleSize)
+	if err != nil {
+		return "", err
+	}
+
+	ext := strings.ToLower(filepath.Ext(args.Path))
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType == "" {
+		mimeType = detectMimeFromContent(ext, sample)
+	}
+	binary := looksBinary(sample)
+	lang := detectLanguageHint(ext)
+	structure := detectStructure(args.Path, sample, binary)
+	recommended, rationale, risk := recommendStrategy(ext, mimeType, binary, structure, lang)
+	hints := []string{}
+	if isOfficeContainer(ext) {
+		hints = append(hints, "Office container detected: prefer specialized extraction or export to text/CSV/Markdown")
+	}
+	if binary {
+		hints = append(hints, "Binary-like content detected: avoid direct text read/search tools")
+	}
+	if structure == "flamegraph_html" {
+		hints = append(hints, "keywords: translog, fsync, flush, write, sync")
+	}
+	type inspectReport struct {
+		Type                string   `json:"type"`
+		Path                string   `json:"path"`
+		Size                int64    `json:"size"`
+		Extension           string   `json:"extension"`
+		MIME                string   `json:"mime"`
+		IsBinary            bool     `json:"is_binary"`
+		LanguageHint        string   `json:"language_hint"`
+		Structure           string   `json:"structure"`
+		RecommendedStrategy string   `json:"recommended_strategy"`
+		RiskLevel           string   `json:"risk_level"`
+		Rationale           string   `json:"rationale"`
+		Hints               []string `json:"hints,omitempty"`
+	}
+	report := inspectReport{
+		Type:                "file_inspect",
+		Path:                args.Path,
+		Size:                info.Size(),
+		Extension:           emptyAsUnknown(ext),
+		MIME:                emptyAsUnknown(mimeType),
+		IsBinary:            binary,
+		LanguageHint:        lang,
+		Structure:           structure,
+		RecommendedStrategy: recommended,
+		RiskLevel:           risk,
+		Rationale:           rationale,
+		Hints:               hints,
+	}
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("inspect_file: marshal report: %w", err)
+	}
+	return string(b), nil
+}
+
+func detectMimeFromContent(ext, sample string) string {
+	lower := strings.ToLower(sample)
+	switch {
+	case strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype html"):
+		return "text/html"
+	case strings.Contains(lower, "<svg"):
+		return "image/svg+xml"
+	case strings.HasSuffix(ext, ".json"):
+		return "application/json"
+	case strings.HasSuffix(ext, ".yaml") || strings.HasSuffix(ext, ".yml"):
+		return "application/yaml"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func looksBinary(sample string) bool {
+	if sample == "" {
+		return false
+	}
+	data := []byte(sample)
+	nul := bytes.Count(data, []byte{0})
+	if nul > 0 {
+		return true
+	}
+	bad := 0
+	for _, b := range data {
+		if b == '\n' || b == '\r' || b == '\t' {
+			continue
+		}
+		if b < 0x20 || b == 0x7f {
+			bad++
+		}
+	}
+	return len(data) > 0 && float64(bad)/float64(len(data)) > 0.10
+}
+
+func detectLanguageHint(ext string) string {
+	switch ext {
+	case ".go":
+		return "go"
+	case ".py":
+		return "python"
+	case ".js", ".mjs", ".cjs":
+		return "javascript"
+	case ".ts", ".tsx":
+		return "typescript"
+	case ".java":
+		return "java"
+	case ".rb":
+		return "ruby"
+	case ".rs":
+		return "rust"
+	case ".c", ".h":
+		return "c"
+	case ".cc", ".cpp", ".hpp":
+		return "cpp"
+	case ".sh", ".bash", ".zsh":
+		return "shell"
+	case ".json":
+		return "json"
+	case ".yaml", ".yml":
+		return "yaml"
+	case ".html", ".htm":
+		return "html"
+	case ".css":
+		return "css"
+	case ".xml":
+		return "xml"
+	case ".log", ".txt", ".md":
+		return "plain_text"
+	default:
+		return "unknown"
+	}
+}
+
+func detectStructure(path, sample string, binary bool) string {
+	if binary {
+		if isOfficeContainer(strings.ToLower(filepath.Ext(path))) {
+			return "office_container"
+		}
+		return "binary"
+	}
+	if looksLikeFlamegraph(path, sample) {
+		return "flamegraph_html"
+	}
+	lineCount := 1 + strings.Count(sample, "\n")
+	maxLine := 0
+	for _, line := range strings.Split(sample, "\n") {
+		if len(line) > maxLine {
+			maxLine = len(line)
+		}
+	}
+	if lineCount <= 3 && maxLine > 400 {
+		return "minified_text"
+	}
+	if strings.Contains(strings.ToLower(sample), "<html") || strings.Contains(strings.ToLower(sample), "<svg") {
+		return "html"
+	}
+	if maxLine > 200 {
+		return "dense_text"
+	}
+	return "line_text"
+}
+
+func recommendStrategy(ext, mimeType string, binary bool, structure string, lang string) (string, string, string) {
+	if isOfficeContainer(ext) {
+		return "metadata_only_or_specialized_extractor", "container document format; plain-text reading is low-value and misleading", "high"
+	}
+	if binary {
+		return "metadata_only", "binary-like content should not be sent directly to text-oriented tools", "high"
+	}
+	if structure == "flamegraph_html" || structure == "minified_text" || strings.Contains(mimeType, "html") {
+		return "search_file -> read_file(segment)", "large or minified markup is better searched by byte offset before targeted reads", "medium"
+	}
+	if lang != "unknown" && lang != "plain_text" && lang != "html" && lang != "json" && lang != "yaml" {
+		return "grep_file -> read_file(segment)", "source code is line-oriented and usually best explored via line matches first", "low"
+	}
+	return "grep_file -> read_file(segment)", "line-oriented text is best narrowed by matching lines before detailed reads", "low"
+}
+
+func isOfficeContainer(ext string) bool {
+	switch ext {
+	case ".docx", ".xlsx", ".pptx":
+		return true
+	default:
+		return false
+	}
+}
+
+func emptyAsUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
 
 func (r *LocalRunner) runGrepFile(argsJSON string) (string, error) {
@@ -366,15 +667,27 @@ func (r *LocalRunner) runGrepFile(argsJSON string) (string, error) {
 	if info.IsDir() {
 		return "", fmt.Errorf("grep_file: path is a directory")
 	}
-	data, err := os.ReadFile(args.Path)
+	f, err := os.Open(args.Path)
 	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	ext := strings.ToLower(filepath.Ext(args.Path))
+	sample, err := readAtMost(f, 0, minInt64(8*1024, info.Size()))
+	if err != nil {
+		return "", err
+	}
+	if msg, blocked := blockTextToolUse(args.Path, ext, sample); blocked {
+		return msg, nil
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
 	matcher, err := compileLineMatcher(args.Query, args.IsRegexp, args.CaseSensitive)
 	if err != nil {
 		return "", err
 	}
-	return grepLines(data, args.Path, args.Query, args.IsRegexp, args.CaseSensitive, args.MaxMatches, matcher), nil
+	return grepFileLines(f, info.Size(), args.Path, args.Query, args.IsRegexp, args.CaseSensitive, args.MaxMatches, matcher)
 }
 
 func compileLineMatcher(query string, isRegexp, caseSensitive bool) (func(string) bool, error) {
@@ -396,44 +709,63 @@ func compileLineMatcher(query string, isRegexp, caseSensitive bool) (func(string
 	return re.MatchString, nil
 }
 
-func grepLines(data []byte, path, query string, isRegexp, caseSensitive bool, maxMatches int, match func(string) bool) string {
-	var sb strings.Builder
-	sb.WriteString("[file grep]\n")
-	sb.WriteString(fmt.Sprintf("path: %s\n", path))
-	sb.WriteString(fmt.Sprintf("size: %d bytes\n", len(data)))
-	sb.WriteString(fmt.Sprintf("query: %q\n", query))
+func grepFileLines(r io.Reader, size int64, path, query string, isRegexp, caseSensitive bool, maxMatches int, match func(string) bool) (string, error) {
 	mode := "substring"
 	if isRegexp {
 		mode = "regexp"
 	}
-	sb.WriteString(fmt.Sprintf("mode: %s\n", mode))
-	sb.WriteString(fmt.Sprintf("case_sensitive: %t\n", caseSensitive))
+	type grepMatch struct {
+		Line    int    `json:"line"`
+		Snippet string `json:"snippet"`
+	}
+	type grepReport struct {
+		Type          string      `json:"type"`
+		Path          string      `json:"path"`
+		Size          int64       `json:"size"`
+		Query         string      `json:"query"`
+		Mode          string      `json:"mode"`
+		CaseSensitive bool        `json:"case_sensitive"`
+		Matches       []grepMatch `json:"matches"`
+		Truncated     bool        `json:"truncated"`
+		Note          string      `json:"note,omitempty"`
+	}
 
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	lineNo := 1
-	count := 0
-	for _, rawLine := range strings.Split(string(data), "\n") {
-		line := strings.TrimRight(rawLine, "\r")
+	report := grepReport{
+		Type:          "file_grep",
+		Path:          path,
+		Size:          size,
+		Query:         query,
+		Mode:          mode,
+		CaseSensitive: caseSensitive,
+	}
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
 		if match(line) {
-			count++
-			if count == 1 {
-				sb.WriteString("matches:\n")
-			}
-			sb.WriteString(fmt.Sprintf("- L%d: %s\n", lineNo, truncateSearchLine(line, 240)))
-			if count >= maxMatches {
+			report.Matches = append(report.Matches, grepMatch{Line: lineNo, Snippet: truncateSearchLine(line, 240)})
+			if len(report.Matches) >= maxMatches {
+				report.Truncated = true
 				break
 			}
 		}
 		lineNo++
 	}
-	if count == 0 {
-		sb.WriteString("matches: 0\n")
-		sb.WriteString("note: no matching lines found.\n")
-		return sb.String()
+	if err := scanner.Err(); err != nil {
+		return "", err
 	}
-	if count >= maxMatches {
-		sb.WriteString("[note] match limit reached; refine query or increase max_matches if needed.\n")
+	if len(report.Matches) == 0 {
+		report.Note = "no matching lines found"
 	}
-	return sb.String()
+	if report.Truncated {
+		report.Note = "match limit reached; refine query or increase max_matches if needed"
+	}
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("grep_file: marshal report: %w", err)
+	}
+	return string(b), nil
 }
 
 func truncateSearchLine(line string, max int) string {
@@ -488,30 +820,58 @@ func (r *LocalRunner) runSearchFile(argsJSON string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	ext := strings.ToLower(filepath.Ext(args.Path))
+	sample, err := readAtMost(f, 0, minInt64(8*1024, info.Size()))
+	if err != nil {
+		return "", err
+	}
+	if msg, blocked := blockTextToolUse(args.Path, ext, sample); blocked {
+		return msg, nil
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
 
 	matches, err := searchFileChunks(f, args.Query, args.MaxMatches, args.ContextBytes, args.CaseSensitive)
 	if err != nil {
 		return "", err
 	}
-	var sb strings.Builder
-	sb.WriteString("[file search]\n")
-	sb.WriteString(fmt.Sprintf("path: %s\n", args.Path))
-	sb.WriteString(fmt.Sprintf("size: %d bytes\n", info.Size()))
-	sb.WriteString(fmt.Sprintf("query: %q\n", args.Query))
-	sb.WriteString(fmt.Sprintf("matches: %d\n", len(matches)))
-	if len(matches) == 0 {
-		sb.WriteString("note: no matches found.\n")
-		return sb.String(), nil
+	type searchMatch struct {
+		Offset  int64  `json:"offset"`
+		Snippet string `json:"snippet"`
 	}
-	for i, m := range matches {
-		sb.WriteString(fmt.Sprintf("\n[%d] offset=%d\n", i+1, m.offset))
-		sb.WriteString(m.snippet)
-		sb.WriteString("\n")
+	type searchReport struct {
+		Type          string        `json:"type"`
+		Path          string        `json:"path"`
+		Size          int64         `json:"size"`
+		Query         string        `json:"query"`
+		CaseSensitive bool          `json:"case_sensitive"`
+		Matches       []searchMatch `json:"matches"`
+		Truncated     bool          `json:"truncated"`
+		Note          string        `json:"note,omitempty"`
+	}
+	report := searchReport{
+		Type:          "file_search",
+		Path:          args.Path,
+		Size:          info.Size(),
+		Query:         args.Query,
+		CaseSensitive: args.CaseSensitive,
+	}
+	for _, m := range matches {
+		report.Matches = append(report.Matches, searchMatch{Offset: m.offset, Snippet: m.snippet})
+	}
+	if len(matches) == 0 {
+		report.Note = "no matches found"
 	}
 	if len(matches) == args.MaxMatches {
-		sb.WriteString("\n[note] match limit reached; refine query or increase max_matches if needed.\n")
+		report.Truncated = true
+		report.Note = "match limit reached; refine query or increase max_matches if needed"
 	}
-	return sb.String(), nil
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("search_file: marshal report: %w", err)
+	}
+	return string(b), nil
 }
 
 type fileMatch struct {
