@@ -37,7 +37,7 @@ func (f *FallbackProvider) CompleteWithTools(ctx context.Context, messages []Mes
 	if err == nil {
 		return result, nil
 	}
-	if !shouldFallback(err) {
+	if noFallbackFromContext(ctx) || !shouldFallback(err) {
 		return CompleteResult{}, err
 	}
 	return f.fallback.CompleteWithTools(ctx, messages, tools)

@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"log/slog"
 )
 
 // RouterProviderConfig describes a single tier within a RouterProvider.
@@ -24,49 +25,58 @@ type RouterProviderConfig struct {
 //   - summary  (Tier 2): long-context summariser — distillation, log triage
 //   - thinking (Tier 3): deep-reasoning model — complex coding, architecture
 //
-// Any optional tier that is nil falls back silently to task.
+// Optional tiers (routing, summary, thinking) may be nil; when a call arrives
+// with a hint for an unconfigured tier, RouterProvider falls back to task and
+// emits a WARN log so the degradation is visible in the daemon output.
 type RouterProvider struct {
-	routing  Provider // Tier 1 — nil → task
+	routing  Provider // Tier 1 — nil → task (with warn)
 	task     Provider // Tier 2 (required)
-	summary  Provider // Tier 2b — nil → task
-	thinking Provider // Tier 3 — nil → task
+	summary  Provider // Tier 2b — nil → task (with warn)
+	thinking Provider // Tier 3 — nil → task (with warn)
 }
 
 // NewRouterProvider builds a RouterProvider from pre-constructed Provider
 // instances.  Only task is required; pass nil for optional tiers to use task
-// as a fallback.
+// as a fallback (a WARN is logged at call time when fallback is used).
 func NewRouterProvider(task, routing, summary, thinking Provider) (*RouterProvider, error) {
 	if task == nil {
 		return nil, fmt.Errorf("provider.router: task provider is required")
 	}
-	r := &RouterProvider{task: task}
-	if routing != nil {
-		r.routing = routing
-	} else {
-		r.routing = task
-	}
-	if summary != nil {
-		r.summary = summary
-	} else {
-		r.summary = task
-	}
-	if thinking != nil {
-		r.thinking = thinking
-	} else {
-		r.thinking = task
-	}
-	return r, nil
+	return &RouterProvider{
+		task:     task,
+		routing:  routing,  // nil → fallback to task at resolve time
+		summary:  summary,  // nil → fallback to task at resolve time
+		thinking: thinking, // nil → fallback to task at resolve time
+	}, nil
 }
 
 // resolve picks the Provider tier that matches the hint in ctx.
+// When the requested tier is not configured it falls back to task and emits a
+// WARN so that silent degradation (especially thinking→task) is observable.
 func (r *RouterProvider) resolve(ctx context.Context) Provider {
+	warnFallback := func(hint ModelHint) Provider {
+		slog.WarnContext(ctx, "router: requested tier not configured, falling back to task",
+			"requested_hint", hint,
+			"source", SourceFromContext(ctx),
+		)
+		return r.task
+	}
 	switch HintFromContext(ctx) {
 	case ModelHintRouter:
-		return r.routing
+		if r.routing != nil {
+			return r.routing
+		}
+		return warnFallback(ModelHintRouter)
 	case ModelHintSummary:
-		return r.summary
+		if r.summary != nil {
+			return r.summary
+		}
+		return warnFallback(ModelHintSummary)
 	case ModelHintThinking:
-		return r.thinking
+		if r.thinking != nil {
+			return r.thinking
+		}
+		return warnFallback(ModelHintThinking)
 	default:
 		return r.task
 	}

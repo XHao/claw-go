@@ -264,7 +264,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 	if strings.HasPrefix(text, "/think ") || text == "/think" {
 		text = strings.TrimSpace(strings.TrimPrefix(text, "/think"))
 		ctx = provider.WithModelHint(ctx, provider.ModelHintThinking)
-		ctx = provider.WithHintSource(ctx, "agent/think")
+		ctx = provider.WithHintSource(ctx, provider.HintSourceAgentThink)
 		if text == "" {
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
@@ -303,7 +303,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		start := time.Now()
 
 		// Tag every call with its loop iteration so metrics/debug show "agent/loop[i=N]".
-		loopCtx := provider.WithHintSource(ctx, fmt.Sprintf("agent/loop[i=%d]", i))
+		loopCtx := provider.WithHintSource(ctx, provider.HintSourceAgentLoop(i))
 
 		// Build the effective tool list: client-side tools + skill defs.
 		// Skill defs are always included (they execute server-side regardless
@@ -504,7 +504,7 @@ func toIPCUsageEvent(ev provider.UsageEvent) *ipc.LLMUsageEvent {
 func (a *Agent) InjectMessage(ctx context.Context, sessionKey, text string) (string, error) {
 	sess := a.sessions.Get(sessionKey)
 	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
-	injectCtx := provider.WithHintSource(ctx, "agent/inject")
+	injectCtx := provider.WithHintSource(ctx, provider.HintSourceAgentInject)
 	messages := sess.HistoryForLLM(provider.HintFromContext(injectCtx))
 	result, err := a.provider.CompleteWithTools(injectCtx, messages, nil)
 	if err != nil {

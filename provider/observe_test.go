@@ -27,7 +27,7 @@ func TestWrapObserveEmitsUsageEvent(t *testing.T) {
 	obs := WrapObserve(inner)
 
 	var got UsageEvent
-	ctx := WithUsageObserver(WithHintSource(WithModelHint(context.Background(), ModelHintTask), "agent/loop[i=0]"), func(ev UsageEvent) {
+	ctx := WithUsageObserver(WithHintSource(WithModelHint(context.Background(), ModelHintTask), HintSourceAgentLoop(0)), func(ev UsageEvent) {
 		got = ev
 	})
 

@@ -4,8 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
+
+// defaultClassifyTimeout caps the time Phase 2 (LLM classification) may spend
+// before gracefully degrading to the task tier.  This bounds the worst-case
+// first-token latency added by the auto-router when the routing model is slow.
+const defaultClassifyTimeout = 5 * time.Second
 
 // RouteDecision is the output of AutoRouter.Classify.
 type RouteDecision struct {
@@ -33,6 +39,7 @@ type RouteDecision struct {
 type AutoRouter struct {
 	provider         Provider
 	thinkingKeywords []string
+	classifyTimeout  time.Duration
 }
 
 // DefaultThinkingKeywords are built-in fast-path triggers for complex requests.
@@ -74,6 +81,7 @@ func NewAutoRouter(p Provider, extraThinkingKeywords []string) *AutoRouter {
 	return &AutoRouter{
 		provider:         p,
 		thinkingKeywords: mergeKeywords(DefaultThinkingKeywords, extraThinkingKeywords),
+		classifyTimeout:  defaultClassifyTimeout,
 	}
 }
 
@@ -127,8 +135,13 @@ func (a *AutoRouter) llmClassify(ctx context.Context, history []Message) RouteDe
 	msgs = append(msgs, recent...)
 
 	// Route the classifier call through the routing tier (cheapest model).
-	classifyCtx := WithModelHint(ctx, ModelHintRouter)
-	classifyCtx = WithHintSource(classifyCtx, "autoroute/classify")
+	// withNoFallback prevents a 429 or transient error on the routing model from
+	// silently escalating to the expensive task model via FallbackProvider.
+	// The short deadline bounds the worst-case TTFT impact of Phase 2.
+	classifyCtx := withNoFallback(WithModelHint(ctx, ModelHintRouter))
+	classifyCtx = WithHintSource(classifyCtx, HintSourceAutorouteClassify)
+	classifyCtx, cancel := context.WithTimeout(classifyCtx, a.classifyTimeout)
+	defer cancel()
 
 	reply, err := a.provider.Complete(classifyCtx, msgs)
 	if err != nil {
