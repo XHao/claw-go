@@ -43,17 +43,17 @@ type normalizedToolMessage struct {
 
 // Agent ties together provider, session store, and channels.
 type Agent struct {
-	provider      provider.Provider
-	sessions      *session.Store
-	channels      map[string]channel.Channel
-	tools         []provider.ToolDef
-	maxIterations int
-	memory        *memory.Manager            // optional; nil = memory disabled
-	skillRouter   *skill.Router              // optional; nil = skills disabled
-	expStore      *knowledge.ExperienceStore // optional; nil = auto-inject disabled
-	autoRouter    *provider.AutoRouter       // optional; nil = manual /think only
-	autoInjected  sync.Map                   // tracks "sessionKey:topic" → true
-	log           *slog.Logger
+	provider          provider.Provider
+	sessions          *session.Store
+	channels          map[string]channel.Channel
+	tools             []provider.ToolDef
+	maxIterations     int
+	memory            *memory.Manager            // optional; nil = memory disabled
+	skillRouter       *skill.Router              // optional; nil = skills disabled
+	expStore          *knowledge.ExperienceStore // optional; nil = auto-inject disabled
+	autoInjected      sync.Map                   // tracks "sessionKey:topic" → true
+	continueRequested bool                       // set when user sends /continue after hitting iteration limit
+	log               *slog.Logger
 }
 
 // New creates an Agent.
@@ -95,14 +95,6 @@ func (a *Agent) SetSkillRouter(r *skill.Router) {
 // Calling with nil disables auto-injection.
 func (a *Agent) SetExperienceStore(s *knowledge.ExperienceStore) {
 	a.expStore = s
-}
-
-// SetAutoRouter attaches an AutoRouter so that each incoming message is
-// automatically routed to the appropriate model tier (task vs. thinking)
-// without requiring the user to prefix messages with /think.
-// Calling with nil disables automatic routing.
-func (a *Agent) SetAutoRouter(ar *provider.AutoRouter) {
-	a.autoRouter = ar
 }
 
 // RegisterChannel adds a channel so the agent can dispatch replies through it.
@@ -227,6 +219,19 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		})
 	}
 
+	if text == "/continue" {
+		if !a.continueRequested {
+			// No pending task — fall through to normal LLM dispatch.
+			// The user message "/continue" will be sent to the LLM as-is.
+		} else {
+			a.continueRequested = false
+			// Skip appending user message; jump straight to the
+			// tool loop using existing session history as context.
+			a.runToolLoop(ctx, log, msg, ch, exchange)
+			return
+		}
+	}
+
 	if text == "/reset" || text == "/start" {
 		if msg.SessionKey == session.MainSessionKey {
 			// Main session is protected: clear history but keep the session alive.
@@ -284,18 +289,6 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 	// Auto-inject relevant experience libraries before the first LLM call.
 	a.autoInjectExperiences(ctx, msg, ch)
 
-	// Auto-route: classify message complexity and select a model tier automatically.
-	// Only fires when no explicit hint is already set (e.g. via /think).
-	if a.autoRouter != nil && provider.HintFromContext(ctx) == provider.ModelHintDefault {
-		skillNames := []string{}
-		if a.skillRouter != nil {
-			skillNames = a.skillRouter.Names()
-		}
-		decision := a.autoRouter.Classify(ctx, text, sess.HistoryForLLM(provider.ModelHintRouter), skillNames)
-		ctx = provider.WithModelHint(ctx, decision.Hint)
-		log.Info("auto-routed", "hint", decision.Hint, "reason", decision.Reason, "reason_code", decision.ReasonCode, "confidence", decision.Confidence)
-	}
-
 	// Accumulate tool actions for the memory summary.
 	var turnActions []memory.Action
 	for i := 0; i < a.maxIterations; i++ {
@@ -318,6 +311,19 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		}
 
 		messages := prepareMessagesForLLM(sess.HistoryForLLM(provider.HintFromContext(loopCtx)), tools)
+
+		// Attach a streaming callback so text deltas reach the client in
+		// real-time.  Tool-call iterations don't produce text deltas, so the
+		// callback naturally stays idle during those rounds.
+		if ch != nil {
+			loopCtx = provider.WithStreamFunc(loopCtx, func(delta string) {
+				_ = ch.Send(ctx, channel.OutboundMessage{
+					ChatID: msg.ChatID,
+					Delta:  delta,
+				})
+			})
+		}
+
 		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
 			log.Error("LLM completion failed", "err", err)
@@ -440,10 +446,166 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 	// Safety: exhausted iterations without a final reply.
 	log.Warn("max tool iterations reached", "max", a.maxIterations)
 	a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, a.maxIterations, true)
+	a.continueRequested = true
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
 			ChatID: msg.ChatID,
-			Text:   fmt.Sprintf("已达到最大工具调用次数（%d），最终状态可能不完整。", a.maxIterations),
+			Text:   fmt.Sprintf("已完成 %d 轮工具调用，任务可能尚未结束。回复 /continue 继续执行下一轮。", a.maxIterations),
+		})
+	}
+}
+
+// runToolLoop runs the tool-call / LLM loop for the current session without
+// prepending a new user message.  It is called by /continue so that execution
+// resumes from the existing session history.
+func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.InboundMessage, ch channel.Channel, exchange ipc.ToolExchangeFn) {
+	sess := a.sessions.Get(msg.SessionKey)
+	turnN := sess.TurnCount()
+
+	var turnActions []memory.Action
+	for i := 0; i < a.maxIterations; i++ {
+		log.Info("calling LLM", "iteration", i)
+		start := time.Now()
+
+		loopCtx := provider.WithHintSource(ctx, provider.HintSourceAgentLoop(i))
+
+		var tools []provider.ToolDef
+		if a.skillRouter != nil {
+			tools = append(tools, a.skillRouter.AsToolDefs()...)
+		}
+		if exchange != nil {
+			tools = append(tools, a.tools...)
+		}
+
+		messages := prepareMessagesForLLM(sess.HistoryForLLM(provider.HintFromContext(loopCtx)), tools)
+
+		if ch != nil {
+			loopCtx = provider.WithStreamFunc(loopCtx, func(delta string) {
+				_ = ch.Send(ctx, channel.OutboundMessage{
+					ChatID: msg.ChatID,
+					Delta:  delta,
+				})
+			})
+		}
+
+		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
+		if err != nil {
+			log.Error("LLM completion failed", "err", err)
+			a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
+			if ch != nil {
+				_ = ch.Send(ctx, channel.OutboundMessage{
+					ChatID: msg.ChatID,
+					Text:   "抱歉，遇到了错误，请重试。",
+				})
+			}
+			return
+		}
+		a.sessions.ObservePromptUsage(messages, result.Usage.PromptTokens)
+		log.Info("LLM response", "elapsed_ms", time.Since(start).Milliseconds(), "stop_reason", result.StopReason)
+
+		if len(result.ToolCalls) > 0 {
+			sess.Append(provider.Message{
+				Role:      "assistant",
+				ToolCalls: result.ToolCalls,
+			}, a.sessions.MaxTurns())
+
+			var allResults []ipc.ToolResult
+			var clientCalls []ipc.ToolCall
+
+			for _, tc := range result.ToolCalls {
+				log.Info("tool call requested", "tool", tc.Function.Name, "call_id", tc.ID)
+
+				if a.skillRouter != nil && a.skillRouter.Has(tc.Function.Name) {
+					progress := func(m string) {
+						log.Info("skill progress", "skill", tc.Function.Name, "msg", m)
+					}
+					output, sErr := a.skillRouter.Execute(
+						ctx, tc.Function.Name, tc.Function.Arguments, msg.SessionKey, progress,
+					)
+					isErr := sErr != nil
+					if isErr {
+						output = sErr.Error()
+						log.Warn("skill error", "skill", tc.Function.Name, "err", sErr)
+					} else {
+						log.Info("skill result", "skill", tc.Function.Name)
+					}
+					allResults = append(allResults, ipc.ToolResult{
+						CallID:  tc.ID,
+						Name:    tc.Function.Name,
+						Output:  output,
+						IsError: isErr,
+					})
+				} else {
+					clientCalls = append(clientCalls, ipc.ToolCall{
+						ID:   tc.ID,
+						Name: tc.Function.Name,
+						Args: json.RawMessage(tc.Function.Arguments),
+					})
+				}
+			}
+
+			if len(clientCalls) > 0 {
+				if exchange != nil {
+					clientResults, err := exchange(clientCalls)
+					if err != nil {
+						log.Error("tool exchange failed", "err", err)
+						a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
+						return
+					}
+					allResults = append(allResults, clientResults...)
+				} else {
+					for _, call := range clientCalls {
+						allResults = append(allResults, ipc.ToolResult{
+							CallID:  call.ID,
+							Name:    call.Name,
+							Output:  "工具不可用：当前上下文无法执行工具调用",
+							IsError: true,
+						})
+					}
+				}
+			}
+
+			for _, res := range allResults {
+				content := normalizeToolResultContent(res)
+				log.Info("tool result", "tool", res.Name, "call_id", res.CallID, "is_error", res.IsError)
+				sess.Append(provider.Message{
+					Role:       "tool",
+					Content:    content,
+					ToolCallID: res.CallID,
+					Name:       res.Name,
+				}, a.sessions.MaxTurns())
+			}
+			turnActions = append(turnActions, memory.ExtractActions(result.ToolCalls, allResults)...)
+			continue
+		}
+
+		// LLM returned a text reply (done).
+		if result.Content == "" {
+			log.Warn("LLM returned empty content", "stop_reason", result.StopReason, "iteration", i)
+		}
+		sess.Append(provider.Message{Role: "assistant", Content: result.Content}, a.sessions.MaxTurns())
+		a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", result.Content, turnActions, i, false)
+		if ch == nil {
+			log.Error("channel not registered", "channel_id", msg.ChannelType+":"+msg.ChannelName)
+			return
+		}
+		if err := ch.Send(ctx, channel.OutboundMessage{
+			ChatID: msg.ChatID,
+			Text:   result.Content,
+		}); err != nil {
+			log.Error("send reply failed", "err", err)
+		}
+		return
+	}
+
+	// Exhausted iterations again.
+	log.Warn("max tool iterations reached again", "max", a.maxIterations)
+	a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, a.maxIterations, true)
+	a.continueRequested = true
+	if ch != nil {
+		_ = ch.Send(ctx, channel.OutboundMessage{
+			ChatID: msg.ChatID,
+			Text:   fmt.Sprintf("已完成 %d 轮工具调用，任务可能尚未结束。回复 /continue 继续执行下一轮。", a.maxIterations),
 		})
 	}
 }

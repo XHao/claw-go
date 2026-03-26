@@ -162,7 +162,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		"primary_model", cfg.PrimaryModel,
 	)
 
-	llm := buildLLM(cfg)
+	llm, probeTargets := buildLLM(cfg)
 	if cfg.Log.DebugLLM {
 		llm = provider.WrapDebug(llm, cfg.Log.DebugFile)
 		log.Info("已启用 LLM 调试日志", "file", cfg.Log.DebugFile)
@@ -171,7 +171,27 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		llm = provider.WrapMetrics(llm, cfg.Log.MetricsFile)
 		log.Info("已启用 LLM 指标收集", "file", cfg.Log.MetricsFile)
 	}
+	var autoRouteP *provider.AutoRouteProvider
+	if cfg.RoutingPolicy.IsEnabled() && cfg.RoutingPolicy.RoutingModel != "" {
+		if pc, ok := cfg.Models[cfg.RoutingPolicy.RoutingModel]; ok {
+			ar := provider.NewAutoRouter(llm, cfg.RoutingPolicy.ThinkingKeywords)
+			autoRouteP = provider.WrapAutoRoute(llm, ar, log)
+			llm = autoRouteP
+			log.Info("自动路由已启用", "classifier_model", pc.Model)
+		}
+	}
 	llm = provider.WrapObserve(llm)
+
+	// Probe model capabilities in the background so the first user request
+	// doesn't pay the negotiation/retry cost.
+	go func() {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, oai := range probeTargets {
+			oai.ProbeCapabilities(probeCtx)
+		}
+		log.Info("capability probes complete", "providers", len(probeTargets))
+	}()
 
 	sessions := session.NewStore(cfg.MaxHistoryTurns, config.ExpandPrompt(cfg.Provider.SystemPrompt), dirs.Sessions())
 	if cfg.MaxHistoryTokens > 0 {
@@ -211,14 +231,8 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	ag.SetSkillRouter(skill.NewRouter(skillReg))
 	ag.SetExperienceStore(expStore)
 	log.Info("skill router ready", "skills", len(skillReg.AsToolDefs()))
-
-	// Wire auto-router: automatically selects task vs. thinking tier per message.
-	// Only enabled when a cheap routing-tier model is configured.
-	if cfg.RoutingPolicy.IsEnabled() && cfg.RoutingPolicy.RoutingModel != "" {
-		if pc, ok := cfg.Models[cfg.RoutingPolicy.RoutingModel]; ok {
-			ag.SetAutoRouter(provider.NewAutoRouter(llm, cfg.RoutingPolicy.ThinkingKeywords))
-			log.Info("自动路由已启用", "classifier_model", pc.Model)
-		}
+	if autoRouteP != nil {
+		autoRouteP.SetSkillNames(skillReg.Names())
 	}
 
 	sock := channel.NewSocketChannel("default", socketPath, sessions)
@@ -247,7 +261,7 @@ func runConnect(cfg *config.Config, socketPath string) {
 	defer stop()
 
 	cli := cfg.CLI
-	llm := buildLLM(cfg)
+	llm, _ := buildLLM(cfg)
 	if cfg.Log.DebugLLM {
 		llm = provider.WrapDebug(llm, cfg.Log.DebugFile)
 	}
@@ -274,7 +288,13 @@ func runConnect(cfg *config.Config, socketPath string) {
 // buildLLM constructs the Provider from config.
 // When routing_policy is configured, a RouterProvider is returned.
 // Otherwise the single-model provider is used.
-func buildLLM(cfg *config.Config) provider.Provider {
+//
+// It also returns the raw OpenAI providers so that the caller can run
+// startup probes before any user request arrives.
+func buildLLM(cfg *config.Config) (provider.Provider, []*provider.OpenAIProvider) {
+	var probeTargets []*provider.OpenAIProvider
+	seen := map[string]bool{} // deduplicate by model key
+
 	getByName := func(name string) *config.ProviderConfig {
 		if name == "" {
 			return nil
@@ -286,35 +306,48 @@ func buildLLM(cfg *config.Config) provider.Provider {
 		v := pc
 		return &v
 	}
-	newOAI := func(modelKey string, pc *config.ProviderConfig) provider.Provider {
+	newProvider := func(modelKey string, pc *config.ProviderConfig) provider.Provider {
 		if pc == nil {
 			return nil
 		}
-		inner := provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds)
+		var inner provider.Provider
+		switch pc.Type {
+		case "anthropic":
+			// TODO: implement native Anthropic provider (provider/anthropic.go)
+			panic("anthropic native provider not yet implemented; use OpenAI-compat endpoint or set type: openai")
+		default: // "openai" or empty string
+			streamEnabled := pc.Stream == nil || *pc.Stream // default true
+			oai := provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled)
+			if !seen[modelKey] {
+				seen[modelKey] = true
+				probeTargets = append(probeTargets, oai)
+			}
+			inner = oai
+		}
 		return provider.WrapIdentity(inner, modelKey)
 	}
-	newOAIByName := func(modelKey string) provider.Provider {
-		return newOAI(modelKey, getByName(modelKey))
+	newProviderByName := func(modelKey string) provider.Provider {
+		return newProvider(modelKey, getByName(modelKey))
 	}
 
-	defaultProvider := newOAIByName(cfg.PrimaryModel)
+	defaultProvider := newProviderByName(cfg.PrimaryModel)
 
 	if cfg.RoutingPolicy.IsEnabled() {
 		rp, err := provider.NewRouterProvider(
-			newOAIByName(cfg.RoutingPolicy.TaskModel),
-			newOAIByName(cfg.RoutingPolicy.RoutingModel),
-			newOAIByName(cfg.RoutingPolicy.SummaryModel),
-			newOAIByName(cfg.RoutingPolicy.ThinkingModel),
+			newProviderByName(cfg.RoutingPolicy.TaskModel),
+			newProviderByName(cfg.RoutingPolicy.RoutingModel),
+			newProviderByName(cfg.RoutingPolicy.SummaryModel),
+			newProviderByName(cfg.RoutingPolicy.ThinkingModel),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: build router provider: %v\n", err)
 			os.Exit(1)
 		}
-		return provider.WrapFallback(rp, defaultProvider)
+		return provider.WrapFallback(rp, defaultProvider), probeTargets
 	}
 
 	// No routing policy: use default model directly.
-	return defaultProvider
+	return defaultProvider, probeTargets
 }
 
 func setupLogger(level, logFile string) *slog.Logger {

@@ -25,6 +25,7 @@ type InboundMessage struct {
 type OutboundMessage struct {
 	ChatID           string
 	Text             string
+	Delta            string // streaming: incremental text chunk
 	ReplyToMessageID string
 	Usage            *ipc.LLMUsageEvent
 }

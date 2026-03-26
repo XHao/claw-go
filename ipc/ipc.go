@@ -84,6 +84,7 @@ type ToolExchangeFn func(calls []ToolCall) ([]ToolResult, error)
 //	                 {"cmd":"reset"} | {"cmd":"ping"}
 //	                 {"cmd":"tool_results","tool_results":[...]}
 //	Server → client: {"reply":"..."}
+//	                 {"delta":"..."}    (streaming: incremental text chunk)
 //	                 {"tool_calls":[...]}   (requires client to execute + reply)
 //	                 {"info":"..."} | {"error":"..."}
 //	                 {"cmd":"inject_ctx","text":"..."}  (experience context injection) - client→server
@@ -93,6 +94,7 @@ type Msg struct {
 	Text  string `json:"text,omitempty"`
 	Cmd   string `json:"cmd,omitempty"`
 	Reply string `json:"reply,omitempty"`
+	Delta string `json:"delta,omitempty"` // streaming: incremental text chunk
 	Info  string `json:"info,omitempty"`
 	Error string `json:"error,omitempty"`
 	// session management

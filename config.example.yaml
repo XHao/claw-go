@@ -1,44 +1,26 @@
-# claw-go config (simplified)
+# claw-go config
 #
-# Start with this file in ~/.claw/config.yaml.
-# Required: models + primary_model (+ api_key via env or file).
-
-# socket_path: "~/.claw/claw-go.sock"
-
-# ---- Conversation Memory (recommended defaults) ----
-max_history_turns: 20
-# max_history_tokens: 0          # 0 = auto from max_history_turns
-# recent_raw_turns: 0            # 0 = auto (default 4)
-# history_chars_per_token: 0     # 0 = auto adaptive
-# history_budget_scale:          # optional: hint-specific history budgets
-#   router: 0.35
-#   task: 1.0
-#   summary: 0.85
-#   thinking: 1.5
+# Copy to ~/.claw/config.yaml and fill in your api_key.
+# Required: models + primary_model.
 
 # ---- Models (required) ----
 models:
   default_task:
-    type: openai
     base_url: "https://api.openai.com/v1"
-    # api_key: "sk-..."         # or export OPENAI_API_KEY
+    api_key: "${OPENAI_API_KEY}"
     model: "gpt-4o-mini"
     system_prompt: |
       You are a helpful assistant running on {os} ({arch}).
-      User: {user}  Home: {home}
-      Working directory: {cwd}
-      Shell: {shell}
-      Date: {date}
+      User: {user}  Home: {home}  Cwd: {cwd}  Shell: {shell}  Date: {date}
       Be concise and prefer concrete steps.
     max_tokens: 4096
-    timeout_seconds: 120
 
 primary_model: "default_task"
 
-# ---- Optional auto routing (router/task/summary/thinking) ----
+# ---- Optional auto routing ----
 # routing_policy:
 #   routing_model: "default_task"
-#   task_model: "default_task"
+#   task_model:    "default_task"
 #   summary_model: "default_task"
 #   thinking_model: "default_task"
 #   thinking_keywords:
@@ -46,37 +28,30 @@ primary_model: "default_task"
 #     - "架构"
 #     - "trade-off"
 
+# Example: add a Claude thinking tier
+# models:
+#   claude_think:
+#     base_url: "https://your-proxy/v1"
+#     api_key: "${ANTHROPIC_API_KEY}"
+#     model: "aws.claude-sonnet-4.6"
+#     max_tokens: 16000
+#     thinking_budget: 10240   # enables extended thinking
+#     timeout_seconds: 180
+# routing_policy:
+#   thinking_model: "claude_think"
+
 # ---- CLI ----
 cli:
   prompt: "You ❯ "
   shell_enabled: true
   shell_timeout_seconds: 300
-  # history_file: "~/.claw/history"
-  # allowed_commands:
-  #   - git
-  #   - ls
 
 # ---- Tools ----
 tools:
   enabled: false
-  max_iterations: 10
-  bash_timeout_seconds: 30
-  # allowed:
-  #   - bash
-  #   - inspect_file
-  #   - grep_file
-  #   - search_file
-  #   - read_file
-  #   - write_file
-  #   - list_files
-
-# ---- Theme ----
-theme:
-  preset: "default"
+  max_iterations: 20
 
 # ---- Logs ----
 log:
   debug_llm: false
   metrics_enabled: false
-  # debug_file: "~/.claw/logs/llm_debug.log"
-  # metrics_file: "~/.claw/logs/llm_metrics.jsonl"

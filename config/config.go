@@ -136,6 +136,15 @@ type ProviderConfig struct {
 	SystemPrompt   string `yaml:"system_prompt"`
 	MaxTokens      int    `yaml:"max_tokens"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	// ThinkingBudget enables extended thinking (Anthropic-style) and sets the
+	// budget_tokens value sent in the request body.  0 means thinking is disabled.
+	// When set, the API receives {"thinking":{"type":"enabled","budget_tokens":N}}.
+	// Must be less than MaxTokens.
+	ThinkingBudget int `yaml:"thinking_budget"`
+	// Stream enables SSE streaming for real-time token output.
+	// Defaults to true when omitted.  Set to false for providers that don't
+	// support the OpenAI streaming format (e.g. some Ollama versions).
+	Stream *bool `yaml:"stream"`
 }
 
 // Load reads and parses a config file. The format is selected by file
@@ -281,7 +290,7 @@ func applyDefaults(cfg *Config) {
 		cfg.Tools.Enabled = false
 	}
 	if cfg.Tools.MaxIterations == 0 {
-		cfg.Tools.MaxIterations = 10
+		cfg.Tools.MaxIterations = 20
 	}
 	if cfg.Tools.BashTimeoutSeconds == 0 {
 		cfg.Tools.BashTimeoutSeconds = 30

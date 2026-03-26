@@ -3,7 +3,9 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -240,4 +242,68 @@ func canHandleBySkill(text string, skillNames []string) bool {
 		}
 	}
 	return false
+}
+
+// AutoRouteProvider wraps an inner Provider and automatically classifies each
+// CompleteWithTools call, setting a ModelHint on the context before delegating.
+// Complete() passes through without classification to avoid recursive calls
+// (AutoRouter's internal llmClassify uses Complete()).
+type AutoRouteProvider struct {
+	inner      Provider
+	autoRouter *AutoRouter
+	skillNames []string
+	mu         sync.RWMutex
+	log        *slog.Logger
+}
+
+// WrapAutoRoute wraps inner with automatic routing classification.
+// Pass a *slog.Logger for decision logging; nil disables logging.
+func WrapAutoRoute(inner Provider, ar *AutoRouter, log *slog.Logger) *AutoRouteProvider {
+	return &AutoRouteProvider{inner: inner, autoRouter: ar, log: log}
+}
+
+// SetSkillNames updates the skill name list used by heuristic classification.
+// Safe to call concurrently.
+func (p *AutoRouteProvider) SetSkillNames(names []string) {
+	p.mu.Lock()
+	p.skillNames = names
+	p.mu.Unlock()
+}
+
+// Complete passes through to the inner provider without classification.
+func (p *AutoRouteProvider) Complete(ctx context.Context, msgs []Message) (string, error) {
+	return p.inner.Complete(ctx, msgs)
+}
+
+// CompleteWithTools classifies the request and sets a ModelHint before
+// delegating to the inner provider. Skips classification when a hint is
+// already present on ctx (e.g. set by /think).
+func (p *AutoRouteProvider) CompleteWithTools(ctx context.Context, msgs []Message, tools []ToolDef) (CompleteResult, error) {
+	if HintFromContext(ctx) == ModelHintDefault {
+		text := lastUserText(msgs)
+		p.mu.RLock()
+		skillNames := p.skillNames
+		p.mu.RUnlock()
+		decision := p.autoRouter.Classify(ctx, text, msgs, skillNames)
+		if p.log != nil {
+			p.log.InfoContext(ctx, "auto-routed",
+				"hint", decision.Hint,
+				"reason", decision.Reason,
+				"reason_code", decision.ReasonCode,
+				"confidence", decision.Confidence,
+			)
+		}
+		ctx = WithModelHint(ctx, decision.Hint)
+	}
+	return p.inner.CompleteWithTools(ctx, msgs, tools)
+}
+
+// lastUserText returns the Content of the last user-role message in msgs.
+func lastUserText(msgs []Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" && msgs[i].Content != "" {
+			return msgs[i].Content
+		}
+	}
+	return ""
 }

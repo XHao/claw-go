@@ -259,6 +259,7 @@ drained:
 	defer cancelTurn()
 
 	var interrupted atomic.Bool
+	var streamedAny atomic.Bool // true once at least one delta frame arrived
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
 	go func() {
@@ -365,6 +366,19 @@ drained:
 			return err
 		}
 
+		// ── Streaming deltas: print text incrementally ───────────────────────
+		if msg.Delta != "" {
+			if interrupted.Load() {
+				continue
+			}
+			if !streamedAny.Load() {
+				sp.Stop()
+				streamedAny.Store(true)
+			}
+			fmt.Print(msg.Delta)
+			continue
+		}
+
 		// ── Usage telemetry: update live throughput label and keep waiting ─────
 		if msg.Usage != nil {
 			if usageTracker != nil {
@@ -385,7 +399,13 @@ drained:
 				fmt.Println(S.Dim("[已中断] 本轮回复已取消。"))
 				return nil
 			}
-			renderMarkdown(msg.Reply)
+			if streamedAny.Load() {
+				// Content was already printed via delta frames;
+				// just close the line and show metrics.
+				fmt.Println()
+			} else {
+				renderMarkdown(msg.Reply)
+			}
 			if usageTracker != nil {
 				if line := usageTracker.TurnSummaryLine(); line != "" {
 					style := S.Dim

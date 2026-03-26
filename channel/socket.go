@@ -386,7 +386,8 @@ func (s *SocketChannel) Send(_ context.Context, msg OutboundMessage) error {
 	if state == nil {
 		return nil
 	}
-	return state.encoder.Encode(ipc.Msg{Reply: msg.Text, Usage: msg.Usage})
+	frame := ipc.Msg{Reply: msg.Text, Delta: msg.Delta, Usage: msg.Usage}
+	return state.encoder.Encode(frame)
 }
 
 // Status returns the channel health.
