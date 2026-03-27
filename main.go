@@ -237,6 +237,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	if cfg.Tools.Enabled {
 		tool.RegisterDaemonTools(toolRunner, llm, memMgr, expStore, sessions)
 		tool.RegisterWebSearch(toolRunner, cfg.Search)
+		tool.RegisterFetchURL(toolRunner)
 	}
 	ag.SetExperienceStore(expStore)
 	log.Info("tools ready", "registered", len(toolRunner.RegisteredDefs()))
