@@ -23,7 +23,7 @@ func TestPrepareMessagesForLLMInjectsFileGuidanceAfterSystem(t *testing.T) {
 	tools := []provider.ToolDef{
 		{Name: "inspect_file"},
 		{Name: "read_file"},
-		{Name: "grep_file"},
+		{Name: "search_file"},
 	}
 
 	prepared := prepareMessagesForLLM(history, tools)

@@ -89,17 +89,17 @@ func NewAutoRouter(p Provider, extraThinkingKeywords []string) *AutoRouter {
 
 // Classify determines the appropriate model tier for the current turn.
 // text is the latest user message; history is the full session history
-// (already including text as the last user message); skillNames is the list
-// of available server-side skills/tools.
-func (a *AutoRouter) Classify(ctx context.Context, text string, history []Message, skillNames []string) RouteDecision {
+// (already including text as the last user message); toolNames is the list
+// of registered tool names available in this session.
+func (a *AutoRouter) Classify(ctx context.Context, text string, history []Message, toolNames []string) RouteDecision {
 	if matchThinkingKeyword(text, a.thinkingKeywords) {
 		return RouteDecision{Hint: ModelHintThinking, Reason: "heuristic:keyword", ReasonCode: "keyword_match", Confidence: 0.99}
 	}
 	if heuristicSimple(text) {
 		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:simple", ReasonCode: "simple_message", Confidence: 0.95}
 	}
-	if canHandleBySkill(text, skillNames) {
-		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:skill", ReasonCode: "skill_match", Confidence: 0.95}
+	if canHandleByTool(text, toolNames) {
+		return RouteDecision{Hint: ModelHintTask, Reason: "heuristic:tool", ReasonCode: "tool_match", Confidence: 0.95}
 	}
 	return a.llmClassify(ctx, history)
 }
@@ -228,15 +228,15 @@ func mergeKeywords(base, extra []string) []string {
 	return out
 }
 
-// canHandleBySkill returns true if the message matches any available skill name.
-// This routes skill/tool-invocation messages to the fast path (task tier)
+// canHandleByTool returns true if the message matches any registered tool name.
+// This routes tool-invocation messages to the fast path (task tier)
 // without classifier overhead.
-func canHandleBySkill(text string, skillNames []string) bool {
-	if len(skillNames) == 0 {
+func canHandleByTool(text string, toolNames []string) bool {
+	if len(toolNames) == 0 {
 		return false
 	}
 	lower := strings.ToLower(text)
-	for _, name := range skillNames {
+	for _, name := range toolNames {
 		if strings.Contains(lower, strings.ToLower(name)) {
 			return true
 		}
@@ -251,7 +251,7 @@ func canHandleBySkill(text string, skillNames []string) bool {
 type AutoRouteProvider struct {
 	inner      Provider
 	autoRouter *AutoRouter
-	skillNames []string
+	toolNames  []string
 	mu         sync.RWMutex
 	log        *slog.Logger
 }
@@ -262,11 +262,11 @@ func WrapAutoRoute(inner Provider, ar *AutoRouter, log *slog.Logger) *AutoRouteP
 	return &AutoRouteProvider{inner: inner, autoRouter: ar, log: log}
 }
 
-// SetSkillNames updates the skill name list used by heuristic classification.
-// Safe to call concurrently.
-func (p *AutoRouteProvider) SetSkillNames(names []string) {
+// SetToolNames updates the registered tool name list used by heuristic
+// classification. Safe to call concurrently.
+func (p *AutoRouteProvider) SetToolNames(names []string) {
 	p.mu.Lock()
-	p.skillNames = names
+	p.toolNames = names
 	p.mu.Unlock()
 }
 
@@ -282,9 +282,9 @@ func (p *AutoRouteProvider) CompleteWithTools(ctx context.Context, msgs []Messag
 	if HintFromContext(ctx) == ModelHintDefault {
 		text := lastUserText(msgs)
 		p.mu.RLock()
-		skillNames := p.skillNames
+		toolNames := p.toolNames
 		p.mu.RUnlock()
-		decision := p.autoRouter.Classify(ctx, text, msgs, skillNames)
+		decision := p.autoRouter.Classify(ctx, text, msgs, toolNames)
 		if p.log != nil {
 			p.log.InfoContext(ctx, "auto-routed",
 				"hint", decision.Hint,

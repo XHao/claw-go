@@ -33,6 +33,7 @@ type Config struct {
 	RoutingPolicy RoutingPolicyConfig `yaml:"routing_policy"`
 	CLI           CLIConfig           `yaml:"cli"`
 	Tools         ToolsConfig         `yaml:"tools"`
+	Search        SearchConfig        `yaml:"search"`
 	Theme         ThemeConfig         `yaml:"theme"`
 	Log           LogConfig           `yaml:"log"`
 }
@@ -106,10 +107,24 @@ type ToolsConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// MaxIterations caps the number of tool-call/LLM-reply rounds per message.
 	MaxIterations int `yaml:"max_iterations"`
-	// Allowed restricts which tools the LLM may use. nil/empty = all built-in tools.
+	// Allowed restricts which built-in tools the LLM may use. nil/empty = all built-in tools.
 	Allowed []string `yaml:"allowed"`
 	// BashTimeoutSeconds is the per-command timeout for bash tool calls.
 	BashTimeoutSeconds int `yaml:"bash_timeout_seconds"`
+	// BashAllowedCommands restricts which shell commands the bash tool may execute.
+	// nil/empty = all commands are permitted.
+	BashAllowedCommands []string `yaml:"bash_allowed_commands"`
+}
+
+// SearchConfig configures the web search skill backed by Tavily.
+type SearchConfig struct {
+	// TavilyAPIKey is the Tavily REST API key (https://app.tavily.com).
+	// When empty, the web_search skill is not registered.
+	TavilyAPIKey string `yaml:"tavily_api_key"`
+	// MaxResults controls how many results are returned (default 5).
+	MaxResults int `yaml:"max_results"`
+	// TimeoutSeconds is the per-request HTTP timeout (default 15).
+	TimeoutSeconds int `yaml:"timeout_seconds"`
 }
 
 // CLIConfig holds settings for the interactive terminal client.

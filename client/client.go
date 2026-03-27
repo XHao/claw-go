@@ -38,8 +38,6 @@ func Run(
 	shellEnabled bool,
 	shellTimeoutSeconds int,
 	allowedCommands []string,
-	toolsEnabled bool,
-	bashTimeoutSeconds int,
 	theme config.ThemeConfig,
 	llmProvider provider.Provider,
 	memoryDir string,
@@ -48,13 +46,9 @@ func Run(
 	// Apply colour theme before any terminal output.
 	ApplyTheme(theme)
 
-	// Build the local tool runner (used for LLM-requested tool calls).
-	var localRunner *tool.LocalRunner
-	if toolsEnabled {
-		localRunner = &tool.LocalRunner{
-			BashTimeoutSeconds: bashTimeoutSeconds,
-		}
-	}
+	// Capture the client's working directory to send with each message
+	// so the daemon can execute tools (e.g. bash) in the right directory.
+	cwd, _ := os.Getwd()
 	// Build knowledge components (distiller + experience store).
 	var distiller *knowledge.Distiller
 	var expStore *knowledge.ExperienceStore
@@ -116,7 +110,6 @@ func Run(
 	if shellEnabled {
 		runner = tool.NewShellExecutor("", shellTimeoutSeconds, allowedCommands)
 	}
-	_ = localRunner // used in printNextReply below
 	interruptCh := make(chan os.Signal, 1)
 	signal.Notify(interruptCh, os.Interrupt)
 	defer signal.Stop(interruptCh)
@@ -165,7 +158,7 @@ func Run(
 				return fmt.Errorf("write: %w", err)
 			}
 			sp := NewSpinner("正在清空对话…")
-			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker, interruptCh)
+			err := printNextReply(ctx, scanner, enc, sp, usageTracker, interruptCh)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -182,11 +175,11 @@ func Run(
 				continue
 			}
 			usageTracker.BeginTurn()
-			if err := enc.Encode(ipc.Msg{Text: msg}); err != nil {
+			if err := enc.Encode(ipc.Msg{Text: msg, Cwd: cwd}); err != nil {
 				return fmt.Errorf("write: %w", err)
 			}
 			sp := NewSpinner("思考中…")
-			err = printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker, interruptCh)
+			err = printNextReply(ctx, scanner, enc, sp, usageTracker, interruptCh)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -220,12 +213,12 @@ func Run(
 			}
 		default:
 			usageTracker.BeginTurn()
-			if err := enc.Encode(ipc.Msg{Text: line}); err != nil {
+			if err := enc.Encode(ipc.Msg{Text: line, Cwd: cwd}); err != nil {
 				return fmt.Errorf("write: %w", err)
 			}
 			// Show spinner while waiting; stop it before rendering the reply.
 			sp := NewSpinner("思考中…")
-			err := printNextReply(ctx, scanner, enc, localRunner, sp, usageTracker, interruptCh)
+			err := printNextReply(ctx, scanner, enc, sp, usageTracker, interruptCh)
 			sp.Stop()
 			if err != nil {
 				return err
@@ -235,10 +228,8 @@ func Run(
 }
 
 // printNextReply reads messages from the daemon until a final reply, info, or
-// error is received. sp is the active spinner; it is stopped before any output
-// so the line is clean. If the daemon sends tool_calls, they are executed
-// locally, results sent back, and the spinner resumes waiting.
-func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, localRunner *tool.LocalRunner, sp *Spinner, usageTracker *UsageTracker, interruptCh <-chan os.Signal) error {
+// error is received. sp is the active spinner; it is stopped before any output.
+func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encoder, sp *Spinner, usageTracker *UsageTracker, interruptCh <-chan os.Signal) error {
 	var encMu sync.Mutex
 	sendFrame := func(msg ipc.Msg) {
 		encMu.Lock()
@@ -255,7 +246,9 @@ func printNextReply(ctx context.Context, scanner *bufio.Scanner, enc *json.Encod
 	}
 
 drained:
-	turnCtx, cancelTurn := context.WithCancel(ctx)
+	// cancelTurn is called on Ctrl-C to signal the interrupt handling goroutine.
+	// The daemon is notified via a "cancel" IPC frame; no local context needed.
+	cancelTurn := func() {}
 	defer cancelTurn()
 
 	var interrupted atomic.Bool
@@ -303,67 +296,6 @@ drained:
 			sp.Stop()
 			fmt.Fprintf(os.Stderr, "%s 收到格式错误的消息，已跳过。\n", S.Warn("[警告]"))
 			return nil
-		}
-
-		// ── Tool calls: execute locally and send results back ─────────────────
-		if len(msg.ToolCalls) > 0 {
-			if interrupted.Load() {
-				continue
-			}
-			sp.Stop()
-			if localRunner == nil {
-				// Tools disabled on the client — send empty results so daemon continues.
-				sendFrame(ipc.Msg{
-					Cmd:         "tool_results",
-					ToolResults: []ipc.ToolResult{},
-				})
-				newSp := NewSpinner("思考中…")
-				err := printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker, interruptCh)
-				newSp.Stop()
-				return err
-			}
-			fmt.Printf("%s 调用 %d 个工具\n", S.Dim("[工具]"), len(msg.ToolCalls))
-			results := make([]ipc.ToolResult, len(msg.ToolCalls))
-			for i, tc := range msg.ToolCalls {
-				if interrupted.Load() {
-					break
-				}
-				argsJSON := ""
-				if tc.Args != nil {
-					argsJSON = string(tc.Args)
-				}
-				toolSp := NewSpinner(fmt.Sprintf("  ↳ %s", S.ToolName(tc.Name)))
-				output, isErr := localRunner.Run(turnCtx, tc.Name, argsJSON)
-				toolSp.Stop()
-				if interrupted.Load() {
-					break
-				}
-				statusIcon := S.Success("✓")
-				if isErr {
-					statusIcon = S.Err("✗")
-				}
-				fmt.Printf("  %s %s\n", statusIcon, S.ToolName(tc.Name))
-				results[i] = ipc.ToolResult{
-					CallID:  tc.ID,
-					Name:    tc.Name,
-					Output:  output,
-					IsError: isErr,
-				}
-			}
-			if interrupted.Load() {
-				continue
-			}
-			encMu.Lock()
-			err := enc.Encode(ipc.Msg{Cmd: "tool_results", ToolResults: results})
-			encMu.Unlock()
-			if err != nil {
-				return fmt.Errorf("发送工具结果失败：%w", err)
-			}
-			// Restart spinner while daemon processes results with LLM.
-			newSp := NewSpinner("处理结果中…")
-			err = printNextReply(ctx, scanner, enc, localRunner, newSp, usageTracker, interruptCh)
-			newSp.Stop()
-			return err
 		}
 
 		// ── Streaming deltas: print text incrementally ───────────────────────

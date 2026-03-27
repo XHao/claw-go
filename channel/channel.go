@@ -17,6 +17,7 @@ type InboundMessage struct {
 	UserID      string
 	Username    string
 	Text        string
+	Cwd         string // working directory reported by the client
 	MessageID   string
 	Timestamp   time.Time
 }
@@ -31,8 +32,9 @@ type OutboundMessage struct {
 }
 
 // DispatchFunc is called by the channel for each inbound user message.
-// exchange may be nil when the channel or session doesn't support tool calls.
-type DispatchFunc func(msg InboundMessage, exchange ipc.ToolExchangeFn)
+// ctx is derived from the channel's run context and may be cancelled by a
+// client "cancel" command, allowing the agent to abort in-flight LLM calls.
+type DispatchFunc func(ctx context.Context, msg InboundMessage)
 
 // Channel is the interface every messaging integration must implement.
 type Channel interface {

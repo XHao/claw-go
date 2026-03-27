@@ -24,12 +24,10 @@ import (
 	"github.com/XHao/claw-go/client"
 	"github.com/XHao/claw-go/config"
 	"github.com/XHao/claw-go/dirs"
-	"github.com/XHao/claw-go/ipc"
 	"github.com/XHao/claw-go/knowledge"
 	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
 	"github.com/XHao/claw-go/session"
-	"github.com/XHao/claw-go/skill"
 	"github.com/XHao/claw-go/startup"
 	"github.com/XHao/claw-go/tool"
 )
@@ -213,26 +211,41 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	sessions.Get(session.MainSessionKey)
 	log.Info("main session ready", "key", session.MainSessionKey)
 
-	// Build tool definitions for the agentic loop.
-	var tools []provider.ToolDef
+	// Build tool runner.  AllowedTools and AllowedCommands come directly from
+	// config; BuiltinDefs() on the runner will honour them at call time.
+	toolRunner := &tool.LocalRunner{
+		BashTimeoutSeconds: cfg.Tools.BashTimeoutSeconds,
+		AllowedCommands:    cfg.Tools.BashAllowedCommands,
+		AllowedTools:       cfg.Tools.Allowed,
+	}
 	if cfg.Tools.Enabled {
-		tools = tool.AllDefs(cfg.Tools.Allowed)
-		log.Info("tool calling enabled", "tools", len(tools), "max_iterations", cfg.Tools.MaxIterations)
+		log.Info("tool calling enabled",
+			"tools", len(toolRunner.BuiltinDefs()),
+			"max_iterations", cfg.Tools.MaxIterations,
+		)
 	}
 
-	ag := agent.New(llm, sessions, tools, log)
+	ag := agent.New(llm, sessions, log)
 	ag.SetMaxIterations(cfg.Tools.MaxIterations)
+	if cfg.Tools.Enabled {
+		ag.SetToolRunner(toolRunner)
+	}
 	memMgr := memory.NewManager(dirs.MemoryDir())
 	ag.SetMemory(memMgr)
 
-	// Wire skill router — skills run server-side via natural language.
 	expStore := knowledge.NewExperienceStore(dirs.ExperiencesDir())
-	skillReg := skill.BuildRegistry(llm, memMgr, expStore, sessions)
-	ag.SetSkillRouter(skill.NewRouter(skillReg))
+	if cfg.Tools.Enabled {
+		tool.RegisterDaemonTools(toolRunner, llm, memMgr, expStore, sessions)
+		tool.RegisterWebSearch(toolRunner, cfg.Search)
+	}
 	ag.SetExperienceStore(expStore)
-	log.Info("skill router ready", "skills", len(skillReg.AsToolDefs()))
+	log.Info("tools ready", "registered", len(toolRunner.RegisteredDefs()))
 	if autoRouteP != nil {
-		autoRouteP.SetSkillNames(skillReg.Names())
+		names := make([]string, 0, len(toolRunner.RegisteredDefs()))
+		for _, d := range toolRunner.RegisteredDefs() {
+			names = append(names, d.Name)
+		}
+		autoRouteP.SetToolNames(names)
 	}
 
 	sock := channel.NewSocketChannel("default", socketPath, sessions)
@@ -241,10 +254,10 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	dispatch := func(msg channel.InboundMessage, exchange ipc.ToolExchangeFn) {
+	dispatch := func(ctx context.Context, msg channel.InboundMessage) {
 		dctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancel()
-		ag.Dispatch(dctx, msg, exchange)
+		ag.Dispatch(dctx, msg)
 	}
 
 	log.Info("daemon ready", "socket", socketPath)
@@ -273,8 +286,6 @@ func runConnect(cfg *config.Config, socketPath string) {
 		cli.ShellEnabled,
 		cli.ShellTimeoutSeconds,
 		cli.AllowedCommands,
-		cfg.Tools.Enabled,
-		cfg.Tools.BashTimeoutSeconds,
 		cfg.Theme,
 		llm,
 		dirs.MemoryDir(),

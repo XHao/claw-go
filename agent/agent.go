@@ -16,7 +16,7 @@ import (
 	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
 	"github.com/XHao/claw-go/session"
-	"github.com/XHao/claw-go/skill"
+	"github.com/XHao/claw-go/tool"
 )
 
 const defaultMaxToolIterations = 10
@@ -24,10 +24,10 @@ const defaultMaxToolIterations = 10
 const fileToolSelectionPrompt = `When analyzing files, prefer a staged workflow instead of reading blindly.
 
 - For unknown, large, binary-like, Office, HTML, flamegraph, minified, or generated files: call inspect_file first.
-- Treat inspect_file, tool_guard, large_file_preview, grep_file, search_file, and read_file outputs as machine-readable JSON. Use recommended_strategy, risk_level, structure, is_binary, matches, truncated, content, range_start, and range_end as primary decision fields.
+- Treat inspect_file, tool_guard, large_file_preview, search_file, and read_file outputs as machine-readable JSON. Use recommended_strategy, risk_level, structure, is_binary, matches, truncated, content, range_start, and range_end as primary decision fields.
 - Tool messages are normalized as a tool_result JSON envelope. Read ok/is_json first, then consume payload for structured tool outputs, text for plain outputs, and error for failures.
-- For line-oriented text such as source code, logs, configs, and stack traces: prefer grep_file before read_file.
-- For HTML, flamegraphs, minified text, dense traces, or content without meaningful line structure: prefer search_file before read_file.
+- For line-oriented text such as source code, logs, configs, and stack traces: prefer search_file(mode="line") before read_file.
+- For HTML, flamegraphs, minified text, dense traces, or content without meaningful line structure: prefer search_file(mode="byte") before read_file.
 - Use read_file only after you know the file type or have narrowed to a relevant segment.
 - Avoid direct text reads of binary-like or Office container files unless a prior inspection says it is safe.`
 
@@ -46,10 +46,9 @@ type Agent struct {
 	provider          provider.Provider
 	sessions          *session.Store
 	channels          map[string]channel.Channel
-	tools             []provider.ToolDef
 	maxIterations     int
 	memory            *memory.Manager            // optional; nil = memory disabled
-	skillRouter       *skill.Router              // optional; nil = skills disabled
+	toolRunner        *tool.LocalRunner          // optional; nil = tool calling disabled
 	expStore          *knowledge.ExperienceStore // optional; nil = auto-inject disabled
 	autoInjected      sync.Map                   // tracks "sessionKey:topic" → true
 	continueRequested bool                       // set when user sends /continue after hitting iteration limit
@@ -57,13 +56,12 @@ type Agent struct {
 }
 
 // New creates an Agent.
-func New(p provider.Provider, sessions *session.Store, tools []provider.ToolDef, log *slog.Logger) *Agent {
+func New(p provider.Provider, sessions *session.Store, log *slog.Logger) *Agent {
 	maxIter := defaultMaxToolIterations
 	return &Agent{
 		provider:      p,
 		sessions:      sessions,
 		channels:      make(map[string]channel.Channel),
-		tools:         tools,
 		maxIterations: maxIter,
 		log:           log,
 	}
@@ -83,11 +81,10 @@ func (a *Agent) SetMemory(m *memory.Manager) {
 	a.memory = m
 }
 
-// SetSkillRouter attaches a skill.Router so that skill tool calls are
-// executed server-side without a client round-trip. When nil (default)
-// all tool calls are forwarded to the client via the exchange function.
-func (a *Agent) SetSkillRouter(r *skill.Router) {
-	a.skillRouter = r
+// SetToolRunner attaches a tool.LocalRunner so the daemon can execute all
+// LLM-requested tool calls directly. When nil, tool calls return an error.
+func (a *Agent) SetToolRunner(r *tool.LocalRunner) {
+	a.toolRunner = r
 }
 
 // SetExperienceStore attaches an ExperienceStore so that relevant experience
@@ -180,26 +177,38 @@ func sanitizeHistoryForToolProtocol(history []provider.Message) []provider.Messa
 }
 
 func hasFileToolWorkflow(tools []provider.ToolDef) bool {
-	var hasInspect, hasRead, hasGrep, hasSearch bool
+	var hasInspect, hasRead, hasSearch bool
 	for _, tool := range tools {
 		switch tool.Name {
 		case "inspect_file":
 			hasInspect = true
 		case "read_file":
 			hasRead = true
-		case "grep_file":
-			hasGrep = true
 		case "search_file":
 			hasSearch = true
 		}
 	}
-	return hasInspect && hasRead && (hasGrep || hasSearch)
+	return hasInspect && hasRead && hasSearch
+}
+
+// hasKnowledgeIntent reports whether the user message suggests a knowledge
+// management operation such as distilling, saving, listing, or injecting experiences.
+func hasKnowledgeIntent(text string) bool {
+	lower := strings.ToLower(text)
+	for _, kw := range []string{
+		"经验库", "知识库", "经验", "知识", "提炼", "整理知识", "总结知识",
+		"distill", "experience", "knowledge base", "inject knowledge",
+		"/exp", "/learn",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // Dispatch handles a single inbound user message end-to-end.
-// exchange is called when the LLM requests tool execution; it may be nil if
-// the channel or caller doesn't support tool calls.
-func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchange ipc.ToolExchangeFn) {
+func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 	log := a.log.With(
 		"session_key", msg.SessionKey,
 		"channel", msg.ChannelType+":"+msg.ChannelName,
@@ -227,7 +236,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			a.continueRequested = false
 			// Skip appending user message; jump straight to the
 			// tool loop using existing session history as context.
-			a.runToolLoop(ctx, log, msg, ch, exchange)
+			a.runToolLoop(ctx, log, msg, ch)
 			return
 		}
 	}
@@ -281,6 +290,33 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		}
 	}
 
+	// /exp delete <topic> — delete a saved experience library without LLM involvement.
+	if strings.HasPrefix(text, "/exp delete ") {
+		topic := strings.TrimSpace(strings.TrimPrefix(text, "/exp delete "))
+		if topic == "" {
+			if ch != nil {
+				_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Text: "用法：/exp delete <主题>"})
+			}
+			return
+		}
+		if a.expStore == nil {
+			if ch != nil {
+				_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Text: "经验库未启用。"})
+			}
+			return
+		}
+		if err := a.expStore.Delete(topic); err != nil {
+			if ch != nil {
+				_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Text: fmt.Sprintf("删除失败：%v", err)})
+			}
+			return
+		}
+		if ch != nil {
+			_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Text: fmt.Sprintf("经验库 %q 已删除。", topic)})
+		}
+		return
+	}
+
 	sess := a.sessions.Get(msg.SessionKey)
 	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
 	// Capture turn index right after the user message is appended.
@@ -288,6 +324,11 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 
 	// Auto-inject relevant experience libraries before the first LLM call.
 	a.autoInjectExperiences(ctx, msg, ch)
+
+	// Knowledge tools (distill_knowledge, inject_experience, etc.) are excluded
+	// from the default tool set to reduce context size. They are only added when
+	// the user message indicates a knowledge management intent.
+	wantKnowledge := hasKnowledgeIntent(text)
 
 	// Accumulate tool actions for the memory summary.
 	var turnActions []memory.Action
@@ -298,16 +339,16 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		// Tag every call with its loop iteration so metrics/debug show "agent/loop[i=N]".
 		loopCtx := provider.WithHintSource(ctx, provider.HintSourceAgentLoop(i))
 
-		// Build the effective tool list: client-side tools + skill defs.
-		// Skill defs are always included (they execute server-side regardless
-		// of whether a client exchange is available).
+		// Build the effective tool list: builtin defs + registered extensions.
+		// Core tools (bash, file tools, web_search) are always included.
+		// Knowledge tools are included only when knowledge intent is detected.
 		var tools []provider.ToolDef
-		if a.skillRouter != nil {
-			tools = append(tools, a.skillRouter.AsToolDefs()...)
-		}
-		if exchange != nil {
-			// Only expose client-side tools when there is an exchange.
-			tools = append(tools, a.tools...)
+		if a.toolRunner != nil {
+			tools = append(tools, a.toolRunner.BuiltinDefs()...)
+			tools = append(tools, a.toolRunner.RegisteredDefsByGroup("core")...)
+			if wantKnowledge {
+				tools = append(tools, a.toolRunner.RegisteredDefsByGroup("knowledge")...)
+			}
 		}
 
 		messages := prepareMessagesForLLM(sess.HistoryForLLM(provider.HintFromContext(loopCtx)), tools)
@@ -339,7 +380,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 		a.sessions.ObservePromptUsage(messages, result.Usage.PromptTokens)
 		log.Info("LLM response", "elapsed_ms", time.Since(start).Milliseconds(), "stop_reason", result.StopReason)
 
-		// Case 1: LLM wants to call tools (may include server-side skills).
+		// Case 1: LLM wants to call tools.
 		if len(result.ToolCalls) > 0 {
 			// Persist the assistant's tool-call request into history.
 			sess.Append(provider.Message{
@@ -348,63 +389,38 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 			}, a.sessions.MaxTurns())
 
 			var allResults []ipc.ToolResult
-			var clientCalls []ipc.ToolCall
 
 			for _, tc := range result.ToolCalls {
 				log.Info("tool call requested", "tool", tc.Function.Name, "call_id", tc.ID)
 
-				if a.skillRouter != nil && a.skillRouter.Has(tc.Function.Name) {
-					// ── Server-side skill: execute inline, no client round-trip.
-					progress := func(m string) {
-						log.Info("skill progress", "skill", tc.Function.Name, "msg", m)
-					}
-					output, sErr := a.skillRouter.Execute(
-						ctx, tc.Function.Name, tc.Function.Arguments, msg.SessionKey, progress,
-					)
-					isErr := sErr != nil
-					if isErr {
-						output = sErr.Error()
-						log.Warn("skill error", "skill", tc.Function.Name, "err", sErr)
-					} else {
-						log.Info("skill result", "skill", tc.Function.Name)
-					}
-					allResults = append(allResults, ipc.ToolResult{
-						CallID:  tc.ID,
-						Name:    tc.Function.Name,
-						Output:  output,
-						IsError: isErr,
-					})
-				} else {
-					// ── Client-side tool: batch for exchange.
-					clientCalls = append(clientCalls, ipc.ToolCall{
-						ID:   tc.ID,
-						Name: tc.Function.Name,
-						Args: json.RawMessage(tc.Function.Arguments),
-					})
-				}
-			}
+				var output string
+				var isErr bool
 
-			// Execute client-side tool calls via exchange.
-			if len(clientCalls) > 0 {
-				if exchange != nil {
-					clientResults, err := exchange(clientCalls)
-					if err != nil {
-						log.Error("tool exchange failed", "err", err)
-						a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, i, true)
-						return
+				if a.toolRunner != nil {
+					toolProgress := func(m string) {
+						log.Info("tool progress", "tool", tc.Function.Name, "msg", m)
+						if ch != nil {
+							_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Delta: m + "\n"})
+						}
 					}
-					allResults = append(allResults, clientResults...)
+					rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
+					output, isErr = a.toolRunner.Run(ctx, tc.Function.Name, tc.Function.Arguments, rctx, toolProgress)
+					if isErr {
+						log.Warn("tool error", "tool", tc.Function.Name)
+					} else {
+						log.Info("tool result", "tool", tc.Function.Name)
+					}
 				} else {
-					// No exchange available — report tools as unavailable.
-					for _, call := range clientCalls {
-						allResults = append(allResults, ipc.ToolResult{
-							CallID:  call.ID,
-							Name:    call.Name,
-							Output:  "工具不可用：当前上下文无法执行工具调用",
-							IsError: true,
-						})
-					}
+					output = "工具不可用：守护进程未配置工具执行器"
+					isErr = true
 				}
+
+				allResults = append(allResults, ipc.ToolResult{
+					CallID:  tc.ID,
+					Name:    tc.Function.Name,
+					Output:  output,
+					IsError: isErr,
+				})
 			}
 
 			// Append all tool results as "tool" role messages.
@@ -458,7 +474,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage, exchan
 // runToolLoop runs the tool-call / LLM loop for the current session without
 // prepending a new user message.  It is called by /continue so that execution
 // resumes from the existing session history.
-func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.InboundMessage, ch channel.Channel, exchange ipc.ToolExchangeFn) {
+func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.InboundMessage, ch channel.Channel) {
 	sess := a.sessions.Get(msg.SessionKey)
 	turnN := sess.TurnCount()
 
@@ -470,11 +486,9 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 		loopCtx := provider.WithHintSource(ctx, provider.HintSourceAgentLoop(i))
 
 		var tools []provider.ToolDef
-		if a.skillRouter != nil {
-			tools = append(tools, a.skillRouter.AsToolDefs()...)
-		}
-		if exchange != nil {
-			tools = append(tools, a.tools...)
+		if a.toolRunner != nil {
+			tools = append(tools, a.toolRunner.BuiltinDefs()...)
+			tools = append(tools, a.toolRunner.RegisteredDefs()...)
 		}
 
 		messages := prepareMessagesForLLM(sess.HistoryForLLM(provider.HintFromContext(loopCtx)), tools)
@@ -510,59 +524,38 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 			}, a.sessions.MaxTurns())
 
 			var allResults []ipc.ToolResult
-			var clientCalls []ipc.ToolCall
 
 			for _, tc := range result.ToolCalls {
 				log.Info("tool call requested", "tool", tc.Function.Name, "call_id", tc.ID)
 
-				if a.skillRouter != nil && a.skillRouter.Has(tc.Function.Name) {
-					progress := func(m string) {
-						log.Info("skill progress", "skill", tc.Function.Name, "msg", m)
-					}
-					output, sErr := a.skillRouter.Execute(
-						ctx, tc.Function.Name, tc.Function.Arguments, msg.SessionKey, progress,
-					)
-					isErr := sErr != nil
-					if isErr {
-						output = sErr.Error()
-						log.Warn("skill error", "skill", tc.Function.Name, "err", sErr)
-					} else {
-						log.Info("skill result", "skill", tc.Function.Name)
-					}
-					allResults = append(allResults, ipc.ToolResult{
-						CallID:  tc.ID,
-						Name:    tc.Function.Name,
-						Output:  output,
-						IsError: isErr,
-					})
-				} else {
-					clientCalls = append(clientCalls, ipc.ToolCall{
-						ID:   tc.ID,
-						Name: tc.Function.Name,
-						Args: json.RawMessage(tc.Function.Arguments),
-					})
-				}
-			}
+				var output string
+				var isErr bool
 
-			if len(clientCalls) > 0 {
-				if exchange != nil {
-					clientResults, err := exchange(clientCalls)
-					if err != nil {
-						log.Error("tool exchange failed", "err", err)
-						a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
-						return
+				if a.toolRunner != nil {
+					toolProgress := func(m string) {
+						log.Info("tool progress", "tool", tc.Function.Name, "msg", m)
+						if ch != nil {
+							_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Delta: m + "\n"})
+						}
 					}
-					allResults = append(allResults, clientResults...)
+					rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
+					output, isErr = a.toolRunner.Run(ctx, tc.Function.Name, tc.Function.Arguments, rctx, toolProgress)
+					if isErr {
+						log.Warn("tool error", "tool", tc.Function.Name)
+					} else {
+						log.Info("tool result", "tool", tc.Function.Name)
+					}
 				} else {
-					for _, call := range clientCalls {
-						allResults = append(allResults, ipc.ToolResult{
-							CallID:  call.ID,
-							Name:    call.Name,
-							Output:  "工具不可用：当前上下文无法执行工具调用",
-							IsError: true,
-						})
-					}
+					output = "工具不可用：守护进程未配置工具执行器"
+					isErr = true
 				}
+
+				allResults = append(allResults, ipc.ToolResult{
+					CallID:  tc.ID,
+					Name:    tc.Function.Name,
+					Output:  output,
+					IsError: isErr,
+				})
 			}
 
 			for _, res := range allResults {

@@ -21,7 +21,7 @@ import (
 // AllDefs returns the ToolDef list for every built-in tool that is enabled.
 // Pass the names you wish to expose (nil = all built-ins).
 func AllDefs(allowed []string) []provider.ToolDef {
-	all := []provider.ToolDef{BashDef, InspectFileDef, ReadFileDef, GrepFileDef, SearchFileDef, WriteFileDef, ListFilesDef}
+	all := []provider.ToolDef{BashDef, InspectFileDef, ReadFileDef, SearchFileDef, WriteFileDef, ListFilesDef}
 	if len(allowed) == 0 {
 		return all
 	}
@@ -54,20 +54,14 @@ var InspectFileDef = provider.ToolDef{
 
 var ReadFileDef = provider.ToolDef{
 	Name:        "read_file",
-	Description: "Read a file as text. Supports optional offset/max_bytes for segmented reads. Do not use this as the first step for unknown or large files: inspect_file first, then grep_file or search_file to locate relevant regions, and finally use read_file for targeted segments.",
+	Description: "Read a file as text. Supports optional offset/max_bytes for segmented reads. Do not use this as the first step for unknown or large files: inspect_file first, then search_file to locate relevant regions, and finally use read_file for targeted segments.",
 	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"offset":{"type":"integer","description":"Optional byte offset to start reading from. Defaults to 0."},"max_bytes":{"type":"integer","description":"Optional maximum bytes to read for this call. Useful for large-file segmented inspection."}},"required":["path"]}`),
 }
 
 var SearchFileDef = provider.ToolDef{
 	Name:        "search_file",
-	Description: "Search within a file without loading the whole file into the model context. Returns byte offsets and short snippets around each match. Prefer this for flamegraphs, HTML, minified assets, dense traces, and other non-line-oriented large text before using read_file segments.",
-	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"query":{"type":"string","description":"Text to search for inside the file."},"max_matches":{"type":"integer","description":"Maximum number of matches to return. Defaults to 5."},"context_bytes":{"type":"integer","description":"Bytes of surrounding context to include around each match. Defaults to 96."},"case_sensitive":{"type":"boolean","description":"Whether the search is case-sensitive. Defaults to false."}},"required":["path","query"]}`),
-}
-
-var GrepFileDef = provider.ToolDef{
-	Name:        "grep_file",
-	Description: "Search a text file line by line and return matching line numbers. Supports plain substring or regular expression matching. Prefer this for logs, source code, configs, stack traces, and other line-oriented text files after inspect_file confirms the file is text-like.",
-	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"query":{"type":"string","description":"Substring or regular expression to search for."},"is_regexp":{"type":"boolean","description":"Interpret query as a regular expression. Defaults to false."},"case_sensitive":{"type":"boolean","description":"Whether the search is case-sensitive. Defaults to false."},"max_matches":{"type":"integer","description":"Maximum number of matching lines to return. Defaults to 20."}},"required":["path","query"]}`),
+	Description: `Search within a file. mode="line" (default): line-by-line scan returning matching line numbers and content snippets — best for source code, logs, configs, stack traces; supports is_regexp. mode="byte": byte-offset scan returning snippets with byte positions — best for HTML, flamegraphs, minified assets, dense traces. Run inspect_file first for unknown or binary-like files.`,
+	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file."},"query":{"type":"string","description":"Text or pattern to search for."},"mode":{"type":"string","enum":["line","byte"],"description":"Search mode: \"line\" for line-by-line match (default), \"byte\" for byte-offset match."},"is_regexp":{"type":"boolean","description":"Treat query as a regular expression (line mode only). Defaults to false."},"case_sensitive":{"type":"boolean","description":"Case-sensitive search. Defaults to false."},"max_matches":{"type":"integer","description":"Maximum matches to return. Defaults to 20 (line mode) or 5 (byte mode)."},"context_bytes":{"type":"integer","description":"Bytes of surrounding context per match (byte mode only). Defaults to 96."}},"required":["path","query"]}`),
 }
 
 var WriteFileDef = provider.ToolDef{
@@ -84,65 +78,157 @@ var ListFilesDef = provider.ToolDef{
 
 // ─── Local executor ──────────────────────────────────────────────────────────
 
-// LocalRunner executes built-in tools in the client's process environment.
+// RunContext carries per-invocation metadata that extensible tool handlers may
+// need: the client's working directory (for shell/file tools) and the session
+// key (for tools that operate on daemon-internal state such as memory).
+type RunContext struct {
+	Cwd        string
+	SessionKey string
+}
+
+type toolExec func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error)
+
+// ExtHandler is the function signature for all registered (non-builtin) tools.
+// argsJSON is the raw JSON argument object from the LLM; handlers should
+// unmarshal it into a typed struct to preserve all parameter types (strings,
+// integers, booleans, etc.).
+// rctx carries the calling context (cwd, sessionKey).
+// progress delivers live status lines to the caller.
+type ExtHandler func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error)
+
+type extEntry struct {
+	def     provider.ToolDef
+	exec    toolExec
+	group   string // tool group: "core" (always included) or "knowledge" (on-demand)
+	builtin bool
+}
+
+// LocalRunner executes built-in tools in the daemon process.
 type LocalRunner struct {
 	BashTimeoutSeconds int
-	AllowedCommands    []string // empty = all allowed
+	AllowedCommands    []string // empty = all shell commands allowed (bash tool)
+	AllowedTools       []string // empty = all built-in tools exposed to LLM
 	MaxFileBytes       int64    // 0 = default (100KB)
+
+	handlers map[string]extEntry // registered extension tools
+}
+
+// BuiltinDefs returns the ToolDef slice for the built-in tools that are
+// enabled for this runner, honoring the AllowedTools allowlist.
+func (r *LocalRunner) BuiltinDefs() []provider.ToolDef {
+	return AllDefs(r.AllowedTools)
+}
+
+// Register adds an extensible tool to the runner under the "core" group.
+// Registered tools cannot override builtins. Safe to call before or after
+// SetToolRunner in agent.
+func (r *LocalRunner) Register(def provider.ToolDef, fn ExtHandler) {
+	r.RegisterGroup("core", def, fn)
+}
+
+// RegisterGroup adds an extensible tool with an explicit group tag.
+// "core" tools are always included in the LLM tool list; other groups (e.g.
+// "knowledge") are included on demand based on the agent's intent detection.
+func (r *LocalRunner) RegisterGroup(group string, def provider.ToolDef, fn ExtHandler) {
+	r.ensureBuiltinHandlers()
+	if group == "" {
+		group = "core"
+	}
+	if existing, ok := r.handlers[def.Name]; ok && existing.builtin {
+		return
+	}
+	r.handlers[def.Name] = extEntry{
+		def:   def,
+		group: group,
+		exec:  toolExec(fn),
+	}
+}
+
+// RegisteredDefs returns the ToolDef slice for all registered (non-builtin)
+// tools, across all groups.
+func (r *LocalRunner) RegisteredDefs() []provider.ToolDef {
+	return r.RegisteredDefsByGroup()
+}
+
+// RegisteredDefsByGroup returns the ToolDef slice for registered tools that
+// belong to any of the specified groups. If no groups are given, all registered
+// tools are returned.
+func (r *LocalRunner) RegisteredDefsByGroup(groups ...string) []provider.ToolDef {
+	r.ensureBuiltinHandlers()
+	if len(r.handlers) == 0 {
+		return nil
+	}
+	var filter map[string]bool
+	if len(groups) > 0 {
+		filter = make(map[string]bool, len(groups))
+		for _, g := range groups {
+			filter[g] = true
+		}
+	}
+	out := make([]provider.ToolDef, 0, len(r.handlers))
+	for _, e := range r.handlers {
+		if e.builtin {
+			continue
+		}
+		if filter == nil || filter[e.group] {
+			out = append(out, e.def)
+		}
+	}
+	return out
+}
+
+func (r *LocalRunner) ensureBuiltinHandlers() {
+	if r.handlers == nil {
+		r.handlers = make(map[string]extEntry)
+	}
+	r.registerBuiltin(BashDef, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return r.runBash(ctx, argsJSON, rctx.Cwd)
+	})
+	r.registerBuiltin(InspectFileDef, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return r.runInspectFile(argsJSON)
+	})
+	r.registerBuiltin(ReadFileDef, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return r.runReadFile(argsJSON)
+	})
+	r.registerBuiltin(SearchFileDef, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return r.runSearchFile(argsJSON)
+	})
+	r.registerBuiltin(WriteFileDef, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return r.runWriteFile(argsJSON)
+	})
+	r.registerBuiltin(ListFilesDef, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return r.runListFiles(argsJSON)
+	})
+}
+
+func (r *LocalRunner) registerBuiltin(def provider.ToolDef, exec toolExec) {
+	if _, exists := r.handlers[def.Name]; exists {
+		return
+	}
+	r.handlers[def.Name] = extEntry{def: def, exec: exec, group: "core", builtin: true}
 }
 
 // Run dispatches a tool call to the appropriate implementation.
 // argsJSON is the raw JSON argument object from the LLM.
-func (r *LocalRunner) Run(ctx context.Context, name, argsJSON string) (output string, isErr bool) {
-	switch name {
-	case "bash":
-		out, err := r.runBash(ctx, argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	case "inspect_file":
-		out, err := r.runInspectFile(argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	case "read_file":
-		out, err := r.runReadFile(argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	case "grep_file":
-		out, err := r.runGrepFile(argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	case "search_file":
-		out, err := r.runSearchFile(argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	case "write_file":
-		out, err := r.runWriteFile(argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	case "list_files":
-		out, err := r.runListFiles(argsJSON)
-		if err != nil {
-			return err.Error(), true
-		}
-		return out, false
-	default:
+// rctx carries the client's working directory and session key.
+// progress delivers live status updates to the caller; may be nil.
+func (r *LocalRunner) Run(ctx context.Context, name, argsJSON string, rctx RunContext, progress func(string)) (output string, isErr bool) {
+	r.ensureBuiltinHandlers()
+	if progress == nil {
+		progress = func(string) {}
+	}
+	e, ok := r.handlers[name]
+	if !ok {
 		return fmt.Sprintf("unknown tool: %q", name), true
 	}
+	out, err := e.exec(ctx, argsJSON, rctx, progress)
+	if err != nil {
+		return err.Error(), true
+	}
+	return out, false
 }
 
-func (r *LocalRunner) runBash(ctx context.Context, argsJSON string) (string, error) {
+func (r *LocalRunner) runBash(ctx context.Context, argsJSON, cwd string) (string, error) {
 	var args struct {
 		Command string `json:"command"`
 	}
@@ -183,6 +269,9 @@ func (r *LocalRunner) runBash(ctx context.Context, argsJSON string) (string, err
 		shell = "/bin/sh"
 	}
 	cmd := exec.CommandContext(runCtx, shell, "-c", args.Command)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -297,7 +386,7 @@ func previewLargeFile(f *os.File, path string, size, limit int64) (string, error
 		HeadPreview      string   `json:"head_preview"`
 		TailPreview      string   `json:"tail_preview,omitempty"`
 	}
-	hints := []string{"Use inspect_file first when the format is unclear", "For text files, use grep_file or search_file before read_file segments"}
+	hints := []string{"Use inspect_file first when the format is unclear", "For text files, use search_file before read_file segments"}
 	if looksLikeFlamegraph(path, head) {
 		hints = append(hints, "Flamegraph/HTML trace detected: search for translog, fsync, flush, write, sync before reading segments")
 	}
@@ -306,7 +395,7 @@ func previewLargeFile(f *os.File, path string, size, limit int64) (string, error
 		Path:             path,
 		Size:             size,
 		DefaultReadLimit: limit,
-		RecommendedNext:  "inspect_file -> grep_file/search_file -> read_file(segment)",
+		RecommendedNext:  "inspect_file -> search_file -> read_file(segment)",
 		RiskLevel:        "medium",
 		Hints:            hints,
 		HeadPreview:      head,
@@ -615,9 +704,9 @@ func recommendStrategy(ext, mimeType string, binary bool, structure string, lang
 		return "search_file -> read_file(segment)", "large or minified markup is better searched by byte offset before targeted reads", "medium"
 	}
 	if lang != "unknown" && lang != "plain_text" && lang != "html" && lang != "json" && lang != "yaml" {
-		return "grep_file -> read_file(segment)", "source code is line-oriented and usually best explored via line matches first", "low"
+		return "search_file -> read_file(segment)", "source code is line-oriented and usually best explored via line matches first", "low"
 	}
-	return "grep_file -> read_file(segment)", "line-oriented text is best narrowed by matching lines before detailed reads", "low"
+	return "search_file -> read_file(segment)", "line-oriented text is best narrowed by matching lines before detailed reads", "low"
 }
 
 func isOfficeContainer(ext string) bool {
@@ -645,13 +734,13 @@ func (r *LocalRunner) runGrepFile(argsJSON string) (string, error) {
 		MaxMatches    int    `json:"max_matches"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", fmt.Errorf("grep_file: parse args: %w", err)
+		return "", fmt.Errorf("search_file: parse args: %w", err)
 	}
 	if args.Path == "" {
-		return "", fmt.Errorf("grep_file: path is empty")
+		return "", fmt.Errorf("search_file: path is empty")
 	}
 	if strings.TrimSpace(args.Query) == "" {
-		return "", fmt.Errorf("grep_file: query is empty")
+		return "", fmt.Errorf("search_file: query is empty")
 	}
 	if args.MaxMatches <= 0 {
 		args.MaxMatches = 20
@@ -665,7 +754,7 @@ func (r *LocalRunner) runGrepFile(argsJSON string) (string, error) {
 		return "", err
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("grep_file: path is a directory")
+		return "", fmt.Errorf("search_file: path is a directory")
 	}
 	f, err := os.Open(args.Path)
 	if err != nil {
@@ -704,7 +793,7 @@ func compileLineMatcher(query string, isRegexp, caseSensitive bool) (func(string
 	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return nil, fmt.Errorf("grep_file: invalid regexp: %w", err)
+		return nil, fmt.Errorf("search_file: invalid regexp: %w", err)
 	}
 	return re.MatchString, nil
 }
@@ -734,7 +823,7 @@ func grepFileLines(r io.Reader, size int64, path, query string, isRegexp, caseSe
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	lineNo := 1
 	report := grepReport{
-		Type:          "file_grep",
+		Type:          "file_search",
 		Path:          path,
 		Size:          size,
 		Query:         query,
@@ -763,7 +852,7 @@ func grepFileLines(r io.Reader, size int64, path, query string, isRegexp, caseSe
 	}
 	b, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("grep_file: marshal report: %w", err)
+		return "", fmt.Errorf("search_file: marshal report: %w", err)
 	}
 	return string(b), nil
 }
@@ -778,7 +867,20 @@ func truncateSearchLine(line string, max int) string {
 	return line[:max-3] + "..."
 }
 
+// runSearchFile dispatches to line-mode (grep-style) or byte-offset search based
+// on the mode parameter. mode="byte" → runSearchFileByte; anything else → runGrepFile.
 func (r *LocalRunner) runSearchFile(argsJSON string) (string, error) {
+	var modeOnly struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.Unmarshal([]byte(argsJSON), &modeOnly)
+	if modeOnly.Mode == "byte" {
+		return r.runSearchFileByte(argsJSON)
+	}
+	return r.runGrepFile(argsJSON)
+}
+
+func (r *LocalRunner) runSearchFileByte(argsJSON string) (string, error) {
 	var args struct {
 		Path          string `json:"path"`
 		Query         string `json:"query"`

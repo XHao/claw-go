@@ -138,18 +138,16 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 	}()
 
 	var (
-		running      bool
-		cancelRun    context.CancelFunc
-		runDoneCh    chan struct{}
-		toolResultCh chan ipc.Msg
+		running   bool
+		cancelRun context.CancelFunc
+		runDoneCh chan struct{}
 	)
 
-	startDispatch := func(text string, withExchange bool) {
+	startDispatch := func(text, cwd string) {
 		runCtx, cancel := context.WithCancel(ctx)
 		cancelRun = cancel
 		running = true
 		runDoneCh = make(chan struct{}, 1)
-		toolResultCh = make(chan ipc.Msg, 4)
 
 		inbound := InboundMessage{
 			ChannelName: s.name,
@@ -158,34 +156,13 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 			ChatID:      sessionName,
 			UserID:      "local",
 			Text:        text,
+			Cwd:         cwd,
 			Timestamp:   time.Now(),
 		}
 
 		go func() {
 			defer func() { runDoneCh <- struct{}{} }()
-			var exchange ipc.ToolExchangeFn
-			if withExchange {
-				exchange = func(calls []ipc.ToolCall) ([]ipc.ToolResult, error) {
-					if err := sendFrame(ipc.Msg{ToolCalls: calls}); err != nil {
-						return nil, fmt.Errorf("tool_calls send: %w", err)
-					}
-					for {
-						select {
-						case <-runCtx.Done():
-							return nil, fmt.Errorf("tool exchange canceled")
-						case res, ok := <-toolResultCh:
-							if !ok {
-								return nil, fmt.Errorf("tool result channel closed")
-							}
-							if res.Cmd != "tool_results" {
-								continue
-							}
-							return res.ToolResults, nil
-						}
-					}
-				}
-			}
-			dispatch(inbound, exchange)
+			dispatch(runCtx, inbound)
 		}()
 	}
 
@@ -205,8 +182,6 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 		case <-runDoneCh:
 			running = false
 			cancelRun = nil
-			close(toolResultCh)
-			toolResultCh = nil
 			runDoneCh = nil
 		case err := <-scanErrCh:
 			if cancelRun != nil {
@@ -241,11 +216,8 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 				}
 				continue
 			case "tool_results":
-				if !running || toolResultCh == nil {
-					_ = sendFrame(ipc.Msg{Error: "unexpected tool_results"})
-					continue
-				}
-				toolResultCh <- msg
+				// Tool calls are now executed by the daemon; client no longer sends results.
+				_ = sendFrame(ipc.Msg{Error: "tool_results is no longer supported"})
 				continue
 			case "inject_ctx":
 				if running {
@@ -264,7 +236,7 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 					_ = sendFrame(ipc.Msg{Error: "当前请求处理中，可发送 cancel 中断"})
 					continue
 				}
-				startDispatch("/reset", false)
+				startDispatch("/reset", "")
 				continue
 			}
 
@@ -275,7 +247,7 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 				_ = sendFrame(ipc.Msg{Error: "当前请求处理中，可发送 cancel 中断"})
 				continue
 			}
-			startDispatch(msg.Text, true)
+			startDispatch(msg.Text, msg.Cwd)
 		}
 	}
 }

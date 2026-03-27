@@ -1,11 +1,14 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/XHao/claw-go/provider"
 )
 
 func decodeInspectReport(t *testing.T, out string) map[string]any {
@@ -52,6 +55,22 @@ func TestRunReadFileLargeFileReturnsPreview(t *testing.T) {
 	}
 }
 
+func TestRegisterCannotOverrideBuiltin(t *testing.T) {
+	r := &LocalRunner{}
+	r.Register(provider.ToolDef{Name: "list_files"}, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return "overridden", nil
+	})
+
+	args, _ := json.Marshal(map[string]any{"path": t.TempDir()})
+	out, isErr := r.Run(context.Background(), "list_files", string(args), RunContext{}, nil)
+	if isErr {
+		t.Fatalf("expected builtin list_files to run successfully, got error: %s", out)
+	}
+	if out == "overridden" {
+		t.Fatalf("expected builtin tool to remain active, got registered override output")
+	}
+}
+
 func TestRunReadFileSegment(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "sample.txt")
@@ -90,7 +109,7 @@ func TestRunSearchFileFindsMatches(t *testing.T) {
 	}
 
 	r := &LocalRunner{}
-	args, _ := json.Marshal(map[string]any{"path": path, "query": "translog", "max_matches": 2})
+	args, _ := json.Marshal(map[string]any{"path": path, "query": "translog", "max_matches": 2, "mode": "byte"})
 	out, err := r.runSearchFile(string(args))
 	if err != nil {
 		t.Fatalf("runSearchFile error: %v", err)
@@ -157,7 +176,7 @@ func TestRunGrepFileSubstring(t *testing.T) {
 		t.Fatalf("runGrepFile error: %v", err)
 	}
 	report := decodeJSONReport(t, out)
-	if report["type"] != "file_grep" || report["mode"] != "substring" {
+	if report["type"] != "file_search" || report["mode"] != "substring" {
 		t.Fatalf("expected grep report, got: %+v", report)
 	}
 	matches, _ := report["matches"].([]any)
@@ -227,7 +246,7 @@ func TestRunInspectFileForLogText(t *testing.T) {
 	if report["is_binary"] != false {
 		t.Fatalf("expected text classification, got: %+v", report)
 	}
-	if report["recommended_strategy"] != "grep_file -> read_file(segment)" {
+	if report["recommended_strategy"] != "search_file -> read_file(segment)" {
 		t.Fatalf("expected grep strategy, got: %+v", report)
 	}
 }

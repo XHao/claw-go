@@ -61,12 +61,6 @@ type LLMUsageEvent struct {
 	IsError          bool   `json:"is_error,omitempty"`
 }
 
-// ToolExchangeFn is implemented by the channel layer and allows the agent
-// to synchronously request tool execution from the connected client.
-// The function sends tool calls to the client, blocks until results arrive,
-// and returns them. Returns an error if the connection is broken.
-type ToolExchangeFn func(calls []ToolCall) ([]ToolResult, error)
-
 // Msg is the newline-delimited JSON frame exchanged over the socket.
 //
 // Server → client (connection phase):
@@ -80,12 +74,10 @@ type ToolExchangeFn func(calls []ToolCall) ([]ToolResult, error)
 //
 // Regular chat phase:
 //
-//	Client → server: {"text":"..."}
+//	Client → server: {"text":"...","cwd":"/path/to/dir"}
 //	                 {"cmd":"reset"} | {"cmd":"ping"}
-//	                 {"cmd":"tool_results","tool_results":[...]}
 //	Server → client: {"reply":"..."}
 //	                 {"delta":"..."}    (streaming: incremental text chunk)
-//	                 {"tool_calls":[...]}   (requires client to execute + reply)
 //	                 {"info":"..."} | {"error":"..."}
 //	                 {"cmd":"inject_ctx","text":"..."}  (experience context injection) - client→server
 
@@ -97,13 +89,12 @@ type Msg struct {
 	Delta string `json:"delta,omitempty"` // streaming: incremental text chunk
 	Info  string `json:"info,omitempty"`
 	Error string `json:"error,omitempty"`
+	// client environment context
+	Cwd string `json:"cwd,omitempty"` // client working directory, sent with each text message
 	// session management
-	Session  string        `json:"session,omitempty"`
-	Sessions []SessionInfo `json:"sessions,omitempty"`
-	// tool calling
-	ToolCalls   []ToolCall     `json:"tool_calls,omitempty"`   // server → client
-	ToolResults []ToolResult   `json:"tool_results,omitempty"` // client → server
-	Usage       *LLMUsageEvent `json:"usage,omitempty"`
+	Session  string         `json:"session,omitempty"`
+	Sessions []SessionInfo  `json:"sessions,omitempty"`
+	Usage    *LLMUsageEvent `json:"usage,omitempty"`
 	// recent history sent with select-ack
 	History []HistoryEntry `json:"history,omitempty"`
 }
