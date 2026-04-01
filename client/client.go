@@ -93,12 +93,25 @@ func Run(
 	DrawHistory(recentHist)
 
 	// ── Phase 3: set up readline + optional shell executor ───────────────────
+	// Wrap stdin with a bracketed-paste interceptor so that multi-line pastes
+	// are buffered and confirmed before being sent, rather than each pasted
+	// line firing a separate request.
+	pasteStdin, pasteErr := newPasteInterceptStdin(os.Stdin)
+	var rlStdin io.ReadCloser
+	if pasteErr == nil {
+		rlStdin = pasteStdin
+		defer pasteStdin.Close()
+	} else {
+		rlStdin = os.Stdin
+	}
+
 	rlCfg := &readline.Config{
 		Prompt:          prompt,
 		HistoryFile:     historyFile,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
 		AutoComplete:    newCompleter(shellEnabled),
+		Stdin:           rlStdin,
 	}
 	rl, err := readline.NewEx(rlCfg)
 	if err != nil {
@@ -118,8 +131,8 @@ func Run(
 	usageTracker := NewUsageTracker()
 
 	// ── Phase 4: chat loop (synchronous: send → wait for reply → repeat) ─────
-	// Using a synchronous model avoids all readline/goroutine concurrency issues:
-	// after each user message we block until the daemon responds exactly once.
+	// Multi-line paste handling is done transparently inside pasteInterceptStdin;
+	// readline sees the pasted content as a single confirmed line.
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -140,6 +153,17 @@ func Run(
 		}
 
 		line = strings.TrimSpace(line)
+		// If the line is empty, check whether a multi-line paste was confirmed.
+		// pasteInterceptStdin stores the joined paste text in pendingPaste and
+		// injects a bare '\r' so readline returns "". We retrieve the real
+		// content here. The paste text bypasses readLineWithContinuation, so
+		// trailing '\' characters in the pasted content are treated as literals
+		// and do NOT trigger the line-continuation logic.
+		if line == "" && pasteStdin != nil {
+			if pasted := pasteStdin.TakePaste(); pasted != "" {
+				line = pasted
+			}
+		}
 		if line == "" {
 			continue
 		}
@@ -722,6 +746,7 @@ func printHelp() {
 	}
 	// Extra non-slash entries shown at the bottom.
 	extras := [][2]string{
+		{"粘贴多行", "自动缓冲为一条消息，按 Enter 确认发送"},
 		{"!<命令>", "直接运行本地 Shell 命令（需开启 shell_enabled）"},
 		{"<消息>", "发送消息给 AI 助手"},
 	}
