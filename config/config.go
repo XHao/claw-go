@@ -12,6 +12,22 @@ import (
 	"github.com/XHao/claw-go/dirs"
 )
 
+// DingTalkConfig holds settings for the DingTalk (钉钉) bot channel.
+// The channel uses DingTalk's Stream API (WebSocket long connection) — no public
+// HTTP server is required. The bot connects outbound to DingTalk's gateway and
+// receives messages in real time.
+//
+// Credentials: find ClientID (AppKey) and ClientSecret (AppSecret) in the
+// DingTalk developer console under your application → "AppKey and AppSecret".
+type DingTalkConfig struct {
+	// Enabled turns the DingTalk channel on/off.
+	Enabled bool `yaml:"enabled"`
+	// ClientID is the DingTalk AppKey.
+	ClientID string `yaml:"client_id"`
+	// ClientSecret is the DingTalk AppSecret.
+	ClientSecret string `yaml:"client_secret"`
+}
+
 // Config is the top-level configuration structure.
 type Config struct {
 	// SocketPath is the Unix Domain Socket path used by the daemon and client.
@@ -32,6 +48,7 @@ type Config struct {
 	// RoutingPolicy maps each logical tier to a model name in Models.
 	RoutingPolicy RoutingPolicyConfig `yaml:"routing_policy"`
 	CLI           CLIConfig           `yaml:"cli"`
+	DingTalk      DingTalkConfig      `yaml:"dingtalk"`
 	Tools         ToolsConfig         `yaml:"tools"`
 	Search        SearchConfig        `yaml:"search"`
 	Theme         ThemeConfig         `yaml:"theme"`

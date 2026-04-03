@@ -50,8 +50,8 @@ type Agent struct {
 	memory            *memory.Manager            // optional; nil = memory disabled
 	toolRunner        *tool.LocalRunner          // optional; nil = tool calling disabled
 	expStore          *knowledge.ExperienceStore // optional; nil = auto-inject disabled
-	autoInjected      sync.Map                   // tracks "sessionKey:topic" → true
-	continueRequested bool                       // set when user sends /continue after hitting iteration limit
+	autoInjected      sync.Map // tracks "sessionKey:topic" → true
+	continueRequested sync.Map // tracks sessionKey → true when iteration limit hit
 	log               *slog.Logger
 }
 
@@ -229,16 +229,14 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 	}
 
 	if text == "/continue" {
-		if !a.continueRequested {
-			// No pending task — fall through to normal LLM dispatch.
-			// The user message "/continue" will be sent to the LLM as-is.
-		} else {
-			a.continueRequested = false
+		if _, pending := a.continueRequested.LoadAndDelete(msg.SessionKey); pending {
 			// Skip appending user message; jump straight to the
 			// tool loop using existing session history as context.
 			a.runToolLoop(ctx, log, msg, ch)
 			return
 		}
+		// No pending task — fall through to normal LLM dispatch.
+		// The user message "/continue" will be sent to the LLM as-is.
 	}
 
 	if text == "/reset" || text == "/start" {
@@ -462,7 +460,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 	// Safety: exhausted iterations without a final reply.
 	log.Warn("max tool iterations reached", "max", a.maxIterations)
 	a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, a.maxIterations, true)
-	a.continueRequested = true
+	a.continueRequested.Store(msg.SessionKey, true)
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
 			ChatID: msg.ChatID,
@@ -594,7 +592,7 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 	// Exhausted iterations again.
 	log.Warn("max tool iterations reached again", "max", a.maxIterations)
 	a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, a.maxIterations, true)
-	a.continueRequested = true
+	a.continueRequested.Store(msg.SessionKey, true)
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
 			ChatID: msg.ChatID,

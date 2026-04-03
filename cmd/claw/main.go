@@ -261,6 +261,18 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		ag.Dispatch(dctx, msg)
 	}
 
+	// Start DingTalk channel if configured.
+	if cfg.DingTalk.Enabled {
+		dt := channel.NewDingTalkChannel("default", cfg.DingTalk.ClientID, cfg.DingTalk.ClientSecret, log)
+		ag.RegisterChannel(dt)
+		go func() {
+			if err := dt.Start(ctx, dispatch); err != nil && ctx.Err() == nil {
+				log.Error("dingtalk channel error", "err", err)
+			}
+		}()
+		log.Info("dingtalk channel enabled (stream mode)")
+	}
+
 	log.Info("daemon ready", "socket", socketPath)
 	if err := sock.Start(ctx, dispatch); err != nil && ctx.Err() == nil {
 		log.Error("socket channel error", "err", err)

@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/glamour v0.10.0
 	github.com/chzyer/readline v1.5.1
 	github.com/mattn/go-runewidth v0.0.16
+	golang.org/x/net v0.41.0
 	golang.org/x/term v0.32.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -33,7 +34,6 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/goldmark v1.7.8 // indirect
 	github.com/yuin/goldmark-emoji v1.0.5 // indirect
-	golang.org/x/net v0.41.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
 )

@@ -130,6 +130,7 @@ func Run(
 	fmt.Printf("「%s」对话  （输入 /help 查看命令）\n", S.Bold(displaySessionName(sessionName)))
 	usageTracker := NewUsageTracker()
 
+
 	// ── Phase 4: chat loop (synchronous: send → wait for reply → repeat) ─────
 	// Multi-line paste handling is done transparently inside pasteInterceptStdin;
 	// readline sees the pasted content as a single confirmed line.

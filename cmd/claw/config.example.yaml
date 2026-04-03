@@ -70,6 +70,16 @@ tools:
 #  max_results: 5        # number of results returned per query (default 5)
 #  timeout_seconds: 15   # HTTP request timeout in seconds (default 15)
 
+# ---- DingTalk Channel (钉钉) ----
+# Uses DingTalk Stream API (WebSocket) — no public HTTP server required.
+# 1. Create an app at https://open.dingtalk.com/
+# 2. Enable "Robot" capability and configure message receive mode as "Stream"
+# 3. Copy AppKey → client_id, AppSecret → client_secret
+#dingtalk:
+#  enabled: true
+#  client_id: "dingxxxxxxxxxxxxxxxx"      # AppKey
+#  client_secret: "xxxxxxxxxxxxxxxx"      # AppSecret
+
 # ---- Logs ----
 log:
   debug_llm: false
