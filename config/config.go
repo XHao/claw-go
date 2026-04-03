@@ -28,6 +28,21 @@ type DingTalkConfig struct {
 	ClientSecret string `yaml:"client_secret"`
 }
 
+// WeixinConfig holds settings for the WeChat iLink Bot channel.
+// The channel uses WeChat's iLink Bot API with QR-code login — no public
+// HTTP server is required. On first start, a QR code is printed to the
+// terminal; after the user scans it, the bot_token is saved to TokenFile
+// and reused on subsequent starts.
+//
+// Credentials: obtained automatically via QR-code scan. No manual setup needed.
+type WeixinConfig struct {
+	// Enabled turns the WeChat channel on/off.
+	Enabled bool `yaml:"enabled"`
+	// TokenFile is the path where the bot_token is persisted after login.
+	// Defaults to ~/.claw/weixin-token.json when empty.
+	TokenFile string `yaml:"token_file"`
+}
+
 // Config is the top-level configuration structure.
 type Config struct {
 	// SocketPath is the Unix Domain Socket path used by the daemon and client.
@@ -49,6 +64,7 @@ type Config struct {
 	RoutingPolicy RoutingPolicyConfig `yaml:"routing_policy"`
 	CLI           CLIConfig           `yaml:"cli"`
 	DingTalk      DingTalkConfig      `yaml:"dingtalk"`
+	Weixin        WeixinConfig        `yaml:"weixin"`
 	Tools         ToolsConfig         `yaml:"tools"`
 	Search        SearchConfig        `yaml:"search"`
 	Theme         ThemeConfig         `yaml:"theme"`

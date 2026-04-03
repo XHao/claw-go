@@ -110,7 +110,7 @@ func Run(
 		HistoryFile:     historyFile,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
-		AutoComplete:    newCompleter(shellEnabled),
+		AutoComplete:    newCompleter(shellEnabled, cwd),
 		Stdin:           rlStdin,
 	}
 	rl, err := readline.NewEx(rlCfg)

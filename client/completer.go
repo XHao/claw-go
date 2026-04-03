@@ -1,7 +1,10 @@
 package client
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/chzyer/readline"
@@ -35,11 +38,12 @@ var commands = []cmdEntry{
 // clawCompleter implements readline.AutoCompleter.
 type clawCompleter struct {
 	shellEnabled bool
+	cwd          string
 }
 
 // newCompleter returns a completer wired to the current shell-enabled setting.
-func newCompleter(shellEnabled bool) readline.AutoCompleter {
-	return &clawCompleter{shellEnabled: shellEnabled}
+func newCompleter(shellEnabled bool, cwd string) readline.AutoCompleter {
+	return &clawCompleter{shellEnabled: shellEnabled, cwd: cwd}
 }
 
 // Do is called by readline on every Tab keypress.
@@ -57,6 +61,10 @@ func (c *clawCompleter) Do(line []rune, pos int) (newLine [][]rune, length int) 
 	// ── Shell passthrough (!cmd) ──────────────────────────────────────────
 	case strings.HasPrefix(input, "!") && c.shellEnabled:
 		return c.completeShell(input)
+
+	// ── @ file path completion ────────────────────────────────────────────
+	case strings.ContainsRune(input, '@'):
+		return c.completeAt(input)
 	}
 
 	return nil, 0
@@ -95,6 +103,106 @@ func (c *clawCompleter) completeSlash(input string) ([][]rune, int) {
 		}
 	}
 	return cands, 0
+}
+
+// atMaxDisplayChars caps the total rune count of all candidate names shown in
+// the completion popup. This prevents the list from flooding the terminal when
+// a directory contains many files with long names. Once the running total would
+// exceed the threshold, remaining entries are collapsed into a single hint.
+const atMaxDisplayChars = 200
+
+// completeAt handles Tab completion for "@<path>" file references.
+// It finds the last '@' in input and completes the path that follows it.
+func (c *clawCompleter) completeAt(input string) ([][]rune, int) {
+	atIdx := strings.LastIndex(input, "@")
+	if atIdx < 0 {
+		return nil, 0
+	}
+	pathPrefix := input[atIdx+1:]
+
+	// Determine the directory to scan and the base name prefix to match.
+	var scanDir, basePrefix string
+	if strings.HasSuffix(pathPrefix, "/") {
+		// e.g. "@src/" — list everything inside src/
+		scanDir = pathPrefix
+		basePrefix = ""
+	} else {
+		scanDir = filepath.Dir(pathPrefix)
+		if scanDir == "." {
+			scanDir = ""
+		}
+		basePrefix = filepath.Base(pathPrefix)
+		if basePrefix == "." {
+			basePrefix = ""
+		}
+	}
+
+	// Resolve to an absolute directory.
+	var absDir string
+	if filepath.IsAbs(pathPrefix) {
+		absDir = scanDir
+		if absDir == "" {
+			absDir = "/"
+		}
+	} else {
+		base := c.cwd
+		if base == "" {
+			base = "."
+		}
+		if scanDir == "" {
+			absDir = base
+		} else {
+			absDir = filepath.Join(base, scanDir)
+		}
+	}
+
+	entries, err := os.ReadDir(absDir)
+	if err != nil {
+		return nil, 0
+	}
+
+	// Filter entries by basePrefix.
+	var matched []os.DirEntry
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), basePrefix) {
+			matched = append(matched, e)
+		}
+	}
+
+	total := len(matched)
+
+	// Accumulate candidates until the total display width would exceed the
+	// threshold. Using rune count (not bytes) gives a better screen-width
+	// estimate for both ASCII and CJK filenames.
+	var shown []os.DirEntry
+	charCount := 0
+	for _, e := range matched {
+		w := len([]rune(e.Name())) + 1 // +1 for trailing "/" or " "
+		if charCount > 0 && charCount+w > atMaxDisplayChars {
+			break
+		}
+		shown = append(shown, e)
+		charCount += w
+	}
+
+	truncated := len(shown) < total
+
+	cands := make([][]rune, 0, len(shown)+1)
+	for _, e := range shown {
+		suffix := e.Name()[len(basePrefix):]
+		if e.IsDir() {
+			suffix += "/"
+		} else {
+			suffix += " "
+		}
+		cands = append(cands, []rune(suffix))
+	}
+	if truncated {
+		hint := fmt.Sprintf("… (还有 %d 项，请继续输入过滤)", total-len(shown))
+		cands = append(cands, []rune(hint))
+	}
+
+	return cands, len(pathPrefix)
 }
 
 // completeShell handles Tab completion for "!<cmd>" shell passthrough.

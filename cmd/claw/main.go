@@ -273,6 +273,22 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		log.Info("dingtalk channel enabled (stream mode)")
 	}
 
+	// Start WeChat channel if configured.
+	if cfg.Weixin.Enabled {
+		tokenFile := cfg.Weixin.TokenFile
+		if tokenFile == "" {
+			tokenFile = dirs.WeixinTokenFile()
+		}
+		wx := channel.NewWeixinChannel("default", tokenFile, log)
+		ag.RegisterChannel(wx)
+		go func() {
+			if err := wx.Start(ctx, dispatch); err != nil && ctx.Err() == nil {
+				log.Error("weixin channel error", "err", err)
+			}
+		}()
+		log.Info("weixin channel enabled")
+	}
+
 	log.Info("daemon ready", "socket", socketPath)
 	if err := sock.Start(ctx, dispatch); err != nil && ctx.Err() == nil {
 		log.Error("socket channel error", "err", err)
