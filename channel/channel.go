@@ -3,6 +3,7 @@ package channel
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/XHao/claw-go/ipc"
@@ -42,6 +43,22 @@ type Channel interface {
 	Start(ctx context.Context, dispatch DispatchFunc) error
 	Send(ctx context.Context, msg OutboundMessage) error
 	Status() Status
+}
+
+// maxSessions is the maximum number of entries kept in per-channel session/webhook
+// maps. When the limit is reached, the oldest half is evicted to bound memory use.
+const maxSessions = 10_000
+
+// mustMarshal encodes v to JSON and panics if encoding fails.
+// Use only for values whose types guarantee successful marshalling (structs,
+// maps with string keys, slices). Never pass channels, functions, or complex
+// interface values.
+func mustMarshal(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic("channel: mustMarshal: " + err.Error())
+	}
+	return b
 }
 
 // Status represents the runtime health of a channel.

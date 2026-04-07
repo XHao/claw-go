@@ -18,14 +18,18 @@ package channel
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,10 +43,17 @@ const (
 	weixinQRStatusURL = weixinDefaultBase + "/ilink/bot/get_qrcode_status"
 )
 
+// errWeixinTokenExpired is returned by getUpdates when the server signals that
+// the bot_token is no longer valid (ret=-14). The caller must delete the token
+// file and re-run QR login.
+var errWeixinTokenExpired = fmt.Errorf("weixin: token expired (ret=-14), re-login required")
+
 // weixinTokenData is persisted to disk after a successful QR login.
 type weixinTokenData struct {
-	BotToken string `json:"bot_token"`
-	BaseURL  string `json:"baseurl"`
+	BotToken   string `json:"bot_token"`
+	BaseURL    string `json:"baseurl"`
+	BotID      string `json:"ilink_bot_id,omitempty"`
+	UserID     string `json:"ilink_user_id,omitempty"`
 }
 
 // weixinSession holds the reply context for a single WeChat user.
@@ -51,11 +62,18 @@ type weixinSession struct {
 	contextToken string
 }
 
+// weixinTypingEntry caches the typing_ticket for one user.
+type weixinTypingEntry struct {
+	ticket    string
+	fetchedAt time.Time
+}
+
 // WeixinChannel implements Channel using WeChat's iLink Bot API.
 type WeixinChannel struct {
-	id        string
-	tokenFile string
-	log       *slog.Logger
+	id         string
+	tokenFile  string
+	log        *slog.Logger
+	httpClient *http.Client // used for QR login and outbound replies
 
 	running atomic.Bool
 
@@ -65,6 +83,11 @@ type WeixinChannel struct {
 
 	mu       sync.RWMutex
 	sessions map[string]weixinSession // key = from_user_id
+
+	// typingMu guards typingTickets and typingActive.
+	typingMu      sync.Mutex
+	typingTickets map[string]*weixinTypingEntry // key = fromUserID, TTL 24h
+	typingActive  map[string]string             // key = fromUserID, value = ticket
 }
 
 // NewWeixinChannel creates a WeixinChannel.
@@ -74,10 +97,13 @@ func NewWeixinChannel(id, tokenFile string, log *slog.Logger) *WeixinChannel {
 		log = slog.Default()
 	}
 	return &WeixinChannel{
-		id:        id,
-		tokenFile: tokenFile,
-		log:       log,
-		sessions:  make(map[string]weixinSession),
+		id:         id,
+		tokenFile:  tokenFile,
+		log:        log,
+		httpClient:    &http.Client{Timeout: 15 * time.Second},
+		sessions:      make(map[string]weixinSession),
+		typingTickets: make(map[string]*weixinTypingEntry),
+		typingActive:  make(map[string]string),
 	}
 }
 
@@ -114,6 +140,14 @@ func (w *WeixinChannel) Start(ctx context.Context, dispatch DispatchFunc) error 
 			if ctx.Err() != nil {
 				return nil
 			}
+			if err == errWeixinTokenExpired {
+				w.log.Warn("weixin: token expired, re-running QR login")
+				if loginErr := w.ensureToken(ctx); loginErr != nil {
+					return fmt.Errorf("weixin: re-login failed: %w", loginErr)
+				}
+				backoff = time.Second
+				continue
+			}
 			w.log.Warn("weixin: poll error, reconnecting", "err", err, "backoff", backoff)
 			select {
 			case <-ctx.Done():
@@ -131,6 +165,7 @@ func (w *WeixinChannel) Start(ctx context.Context, dispatch DispatchFunc) error 
 
 // Send posts a text reply to the WeChat user.
 // Streaming deltas are ignored; only the final reply is sent.
+// After sending, cancels any active typing indicator for this chat.
 func (w *WeixinChannel) Send(ctx context.Context, msg OutboundMessage) error {
 	if msg.Delta != "" {
 		return nil
@@ -146,7 +181,20 @@ func (w *WeixinChannel) Send(ctx context.Context, msg OutboundMessage) error {
 		return fmt.Errorf("weixin: no session for chat %q", msg.ChatID)
 	}
 
-	return w.sendMessage(ctx, sess.fromUserID, sess.contextToken, msg.Text)
+	if err := w.sendMessage(ctx, sess.fromUserID, sess.contextToken, msg.Text); err != nil {
+		return err
+	}
+
+	// Cancel typing indicator now that the reply has been sent.
+	w.typingMu.Lock()
+	ticket := w.typingActive[msg.ChatID]
+	delete(w.typingActive, msg.ChatID)
+	w.typingMu.Unlock()
+	if ticket != "" {
+		go w.sendTyping(ctx, msg.ChatID, ticket, 2)
+	}
+
+	return nil
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
@@ -172,40 +220,44 @@ func (w *WeixinChannel) ensureToken(ctx context.Context) error {
 	return w.qrLogin(ctx)
 }
 
-// qrLogin fetches a QR code, displays it, and polls until the user scans it.
-func (w *WeixinChannel) qrLogin(ctx context.Context) error {
-	w.log.Info("weixin: no token found, starting QR login")
-
-	// Fetch QR code.
+// fetchQRCode requests a fresh QR code from the iLink server.
+func (w *WeixinChannel) fetchQRCode(ctx context.Context) (qrcode string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, weixinQRCodeURL, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := w.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("get QR code: %w", err)
+		return "", fmt.Errorf("get QR code: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 
 	var qrResp struct {
-		QRCode           string `json:"qrcode"`
-		QRCodeImgContent string `json:"qrcode_img_content"` // base64 PNG, unused
+		QRCode string `json:"qrcode"`
 	}
-	if err := json.Unmarshal(body, &qrResp); err != nil || qrResp.QRCode == "" {
-		return fmt.Errorf("parse QR response: %w (body: %s)", err, body)
+	if err := json.Unmarshal(body, &qrResp); err != nil {
+		return "", fmt.Errorf("parse QR response: %w (body: %s)", err, body)
 	}
+	if qrResp.QRCode == "" {
+		return "", fmt.Errorf("parse QR response: empty qrcode (body: %s)", body)
+	}
+	return qrResp.QRCode, nil
+}
 
-	// Display QR code in terminal.
-	fmt.Println("\n请用微信扫描以下二维码登录 WeChat Bot:")
-	qrterminal.GenerateWithConfig(qrResp.QRCode, qrterminal.Config{
-		Level:     qrterminal.L,
-		Writer:    os.Stdout,
-		BlackChar: qrterminal.BLACK,
-		WhiteChar: qrterminal.WHITE,
-		QuietZone: 1,
-	})
-	fmt.Println()
+// qrLogin fetches a QR code, displays it, and polls until the user scans it.
+// Handles qrcode expiry by fetching a fresh one (up to 3 times).
+func (w *WeixinChannel) qrLogin(ctx context.Context) error {
+	w.log.Info("weixin: no token found, starting QR login")
+
+	const maxRefresh = 3
+	refreshes := 0
+
+	qrcode, err := w.fetchQRCode(ctx)
+	if err != nil {
+		return err
+	}
+	w.printQRCode(qrcode)
 
 	// Poll for scan confirmation.
 	for {
@@ -215,12 +267,12 @@ func (w *WeixinChannel) qrLogin(ctx context.Context) error {
 		case <-time.After(2 * time.Second):
 		}
 
-		statusURL := weixinQRStatusURL + "?qrcode=" + qrResp.QRCode
+		statusURL := weixinQRStatusURL + "?qrcode=" + url.QueryEscape(qrcode)
 		sreq, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
 		if err != nil {
 			continue
 		}
-		sresp, err := http.DefaultClient.Do(sreq)
+		sresp, err := w.httpClient.Do(sreq)
 		if err != nil {
 			continue
 		}
@@ -228,35 +280,150 @@ func (w *WeixinChannel) qrLogin(ctx context.Context) error {
 		sresp.Body.Close()
 
 		var statusResp struct {
-			Status   string `json:"status"`
-			BotToken string `json:"bot_token"`
-			BaseURL  string `json:"baseurl"`
+			Status     string `json:"status"`
+			BotToken   string `json:"bot_token"`
+			BaseURL    string `json:"baseurl"`
+			ILinkBotID string `json:"ilink_bot_id"`
+			ILinkUserID string `json:"ilink_user_id"`
 		}
 		if err := json.Unmarshal(sbody, &statusResp); err != nil {
 			continue
 		}
-		if statusResp.Status != "confirmed" {
-			continue
-		}
 
-		// Confirmed — save token.
-		w.botToken = statusResp.BotToken
-		w.baseURL = statusResp.BaseURL
-		if w.baseURL == "" {
-			w.baseURL = weixinDefaultBase
-		}
+		switch statusResp.Status {
+		case "wait":
+			// still waiting — do nothing
+		case "scaned":
+			fmt.Println("已扫码，请在微信端确认...")
+		case "expired":
+			refreshes++
+			if refreshes > maxRefresh {
+				return fmt.Errorf("weixin: QR code expired %d times, giving up", maxRefresh)
+			}
+			w.log.Info("weixin: QR code expired, fetching new one", "attempt", refreshes)
+			qrcode, err = w.fetchQRCode(ctx)
+			if err != nil {
+				return err
+			}
+			w.printQRCode(qrcode)
+		case "confirmed":
+			// Confirmed — save token.
+			w.botToken = statusResp.BotToken
+			w.baseURL = statusResp.BaseURL
+			if w.baseURL == "" {
+				w.baseURL = weixinDefaultBase
+			}
 
-		td := weixinTokenData{BotToken: w.botToken, BaseURL: w.baseURL}
-		tdJSON, _ := json.Marshal(td)
-		if err := os.WriteFile(w.tokenFile, tdJSON, 0o600); err != nil {
-			w.log.Warn("weixin: could not save token", "err", err)
-		} else {
-			w.log.Info("weixin: token saved", "file", w.tokenFile)
-		}
+			td := weixinTokenData{
+				BotToken: w.botToken,
+				BaseURL:  w.baseURL,
+				BotID:    statusResp.ILinkBotID,
+				UserID:   statusResp.ILinkUserID,
+			}
+			tdJSON, _ := json.Marshal(td)
+			if err := os.WriteFile(w.tokenFile, tdJSON, 0o600); err != nil {
+				w.log.Warn("weixin: could not save token", "err", err)
+			} else {
+				w.log.Info("weixin: token saved", "file", w.tokenFile,
+					"bot_id", statusResp.ILinkBotID)
+			}
 
-		fmt.Println("✓ 微信登录成功！")
-		return nil
+			fmt.Println("✓ 微信登录成功！")
+			return nil
+		}
 	}
+}
+
+// printQRCode renders the QR code string in the terminal.
+func (w *WeixinChannel) printQRCode(qrcode string) {
+	fmt.Println("\n请用微信扫描以下二维码登录 WeChat Bot:")
+	qrterminal.GenerateWithConfig(qrcode, qrterminal.Config{
+		Level:     qrterminal.L,
+		Writer:    os.Stdout,
+		BlackChar: qrterminal.BLACK,
+		WhiteChar: qrterminal.WHITE,
+		QuietZone: 1,
+	})
+	fmt.Println()
+}
+
+const weixinTypingTicketTTL = 24 * time.Hour
+
+// getTypingTicket returns the cached typing_ticket for a user, fetching it
+// from /ilink/bot/getconfig if the cache is empty or expired.
+// Returns ("", nil) on any error — callers must treat empty ticket as "skip typing".
+// The typingMu lock is NOT held across the HTTP call to avoid blocking other
+// users while one user's ticket fetch is in-flight.
+func (w *WeixinChannel) getTypingTicket(ctx context.Context, fromUserID, contextToken string) (string, error) {
+	w.typingMu.Lock()
+	entry := w.typingTickets[fromUserID]
+	if entry != nil && time.Since(entry.fetchedAt) < weixinTypingTicketTTL {
+		ticket := entry.ticket
+		w.typingMu.Unlock()
+		return ticket, nil
+	}
+	w.typingMu.Unlock()
+
+	// Fetch outside the lock so concurrent users are not serialized.
+	body := mustMarshal(map[string]any{
+		"ilink_user_id": fromUserID,
+		"context_token": contextToken,
+		"base_info":     map[string]string{"channel_version": "1.0.2"},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/ilink/bot/getconfig", bytes.NewReader(body))
+	if err != nil {
+		return "", nil
+	}
+	w.setHeaders(req)
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		return "", nil
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	var result struct {
+		Ret          int    `json:"ret"`
+		TypingTicket string `json:"typing_ticket"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil || result.Ret != 0 {
+		return "", nil
+	}
+
+	w.typingMu.Lock()
+	w.typingTickets[fromUserID] = &weixinTypingEntry{
+		ticket:    result.TypingTicket,
+		fetchedAt: time.Now(),
+	}
+	w.typingMu.Unlock()
+	return result.TypingTicket, nil
+}
+
+// sendTyping sends a typing indicator to a user.
+// status: 1 = start typing, 2 = cancel typing.
+// Errors are non-fatal and only logged.
+func (w *WeixinChannel) sendTyping(ctx context.Context, fromUserID, ticket string, status int) {
+	if ticket == "" {
+		return
+	}
+	body := mustMarshal(map[string]any{
+		"ilink_user_id": fromUserID,
+		"typing_ticket": ticket,
+		"status":        status,
+		"base_info":     map[string]string{"channel_version": "1.0.2"},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/ilink/bot/sendtyping", bytes.NewReader(body))
+	if err != nil {
+		w.log.Warn("weixin: sendtyping request build failed", "err", err)
+		return
+	}
+	w.setHeaders(req)
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		w.log.Warn("weixin: sendtyping failed", "err", err)
+		return
+	}
+	resp.Body.Close()
 }
 
 // ── Long-poll loop ─────────────────────────────────────────────────────────────
@@ -303,7 +470,7 @@ type weixinInboundMsg struct {
 
 // getUpdates calls /ilink/bot/getupdates and returns parsed messages and the new cursor.
 func (w *WeixinChannel) getUpdates(ctx context.Context, client *http.Client, cursor string) ([]weixinInboundMsg, string, error) {
-	body, _ := json.Marshal(map[string]any{
+	body := mustMarshal(map[string]any{
 		"get_updates_buf": cursor,
 		"base_info":       map[string]string{"channel_version": "1.0.2"},
 	})
@@ -333,6 +500,13 @@ func (w *WeixinChannel) getUpdates(ctx context.Context, client *http.Client, cur
 		return nil, "", fmt.Errorf("parse getupdates response: %w", err)
 	}
 	if result.Ret != 0 {
+		if result.Ret == -14 {
+			// Token expired — delete the token file so ensureToken triggers QR login.
+			if w.tokenFile != "" {
+				_ = os.Remove(w.tokenFile)
+			}
+			return nil, "", errWeixinTokenExpired
+		}
 		return nil, "", fmt.Errorf("getupdates ret=%d body=%s", result.Ret, respBody)
 	}
 
@@ -350,7 +524,7 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 	var text string
 	for _, item := range msg.ItemList {
 		if item.Type == 1 && item.TextItem.Text != "" {
-			text = item.TextItem.Text
+			text = strings.TrimSpace(item.TextItem.Text)
 			break
 		}
 	}
@@ -360,6 +534,17 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 
 	// Store session for reply.
 	w.mu.Lock()
+	if len(w.sessions) >= maxSessions {
+		// Evict half the map to amortise the cost of eviction.
+		n := len(w.sessions) / 2
+		for k := range w.sessions {
+			delete(w.sessions, k)
+			n--
+			if n == 0 {
+				break
+			}
+		}
+	}
 	w.sessions[msg.FromUserID] = weixinSession{
 		fromUserID:   msg.FromUserID,
 		contextToken: msg.ContextToken,
@@ -382,17 +567,34 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 		Timestamp:   time.Now(),
 	}
 
+	ticket, _ := w.getTypingTicket(ctx, msg.FromUserID, msg.ContextToken)
+	if ticket != "" {
+		w.typingMu.Lock()
+		w.typingActive[msg.FromUserID] = ticket
+		w.typingMu.Unlock()
+		w.sendTyping(ctx, msg.FromUserID, ticket, 1)
+	}
+
 	go dispatch(ctx, inbound)
 	return nil
 }
 
 // ── Outbound reply ────────────────────────────────────────────────────────────
 
+// randomClientID returns a short random hex string used as client_id in sendmessage.
+func randomClientID() string {
+	b := make([]byte, 8)
+	rand.Read(b) //nolint:errcheck // crypto/rand.Read never returns an error on supported platforms
+	return hex.EncodeToString(b)
+}
+
 // sendMessage posts a text reply to a WeChat user.
 func (w *WeixinChannel) sendMessage(ctx context.Context, toUserID, contextToken, text string) error {
-	body, _ := json.Marshal(map[string]any{
+	body := mustMarshal(map[string]any{
 		"msg": map[string]any{
+			"from_user_id":  "",
 			"to_user_id":    toUserID,
+			"client_id":     randomClientID(),
 			"message_type":  2,
 			"message_state": 2,
 			"context_token": contextToken,
@@ -411,8 +613,7 @@ func (w *WeixinChannel) sendMessage(ctx context.Context, toUserID, contextToken,
 	}
 	w.setHeaders(req)
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := w.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("sendmessage: %w", err)
 	}
@@ -425,9 +626,11 @@ func (w *WeixinChannel) sendMessage(ctx context.Context, toUserID, contextToken,
 }
 
 // setHeaders adds the required WeChat iLink Bot headers to a request.
-// X-WECHAT-UIN must be a fresh random value per request.
+// X-WECHAT-UIN: random uint32 → decimal string → base64, fresh per request.
 func (w *WeixinChannel) setHeaders(req *http.Request) {
-	uin := rand.Uint32()
+	var b [4]byte
+	rand.Read(b[:]) //nolint:errcheck
+	uin := binary.BigEndian.Uint32(b[:])
 	uinStr := fmt.Sprintf("%d", uin)
 	uinB64 := base64.StdEncoding.EncodeToString([]byte(uinStr))
 
