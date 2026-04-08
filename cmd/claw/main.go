@@ -353,8 +353,8 @@ func buildLLM(cfg *config.Config) (provider.Provider, []*provider.OpenAIProvider
 		var inner provider.Provider
 		switch pc.Type {
 		case "anthropic":
-			// TODO: implement native Anthropic provider (provider/anthropic.go)
-			panic("anthropic native provider not yet implemented; use OpenAI-compat endpoint or set type: openai")
+			streamEnabled := pc.Stream == nil || *pc.Stream
+			inner = provider.NewAnthropic(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled, pc.Headers)
 		default: // "openai" or empty string
 			streamEnabled := pc.Stream == nil || *pc.Stream // default true
 			oai := provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled)

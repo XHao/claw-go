@@ -193,6 +193,10 @@ type ProviderConfig struct {
 	// Defaults to true when omitted.  Set to false for providers that don't
 	// support the OpenAI streaming format (e.g. some Ollama versions).
 	Stream *bool `yaml:"stream"`
+	// Headers are extra HTTP headers sent with every request to this provider.
+	// Useful for internal proxies that require custom authentication headers
+	// (e.g. X-Working-Dir for mcli).
+	Headers map[string]string `yaml:"headers"`
 }
 
 // Load reads and parses a config file. The format is selected by file
@@ -247,11 +251,13 @@ func ResolveConfigPath(path string) string {
 }
 
 // loadYAML parses a YAML config file.
+// Environment variables in the form $VAR or ${VAR} are expanded before parsing.
 func loadYAML(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read %q: %w", path, err)
 	}
+	data = []byte(os.ExpandEnv(string(data)))
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("config: parse YAML: %w", err)
@@ -357,14 +363,25 @@ func applyDefaults(cfg *Config) {
 }
 
 func applyEnvOverrides(cfg *Config) {
-	// OPENAI_API_KEY always wins — this lets users override any key loaded from
-	// openclaw.json (e.g. an OAuth placeholder like "qwen-oauth") without having
-	// to edit the shared config file.
+	// OPENAI_API_KEY overrides api_key for all models. When ANTHROPIC_API_KEY is
+	// also set, it takes precedence for anthropic-type models (applied below).
 	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
 		cfg.Provider.APIKey = v
 		for name, pc := range cfg.Models {
 			pc.APIKey = v
 			cfg.Models[name] = pc
+		}
+	}
+	// ANTHROPIC_API_KEY overrides api_key for all anthropic-type models.
+	if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" {
+		for name, pc := range cfg.Models {
+			if pc.Type == "anthropic" {
+				pc.APIKey = v
+				cfg.Models[name] = pc
+			}
+		}
+		if cfg.Provider.Type == "anthropic" {
+			cfg.Provider.APIKey = v
 		}
 	}
 }

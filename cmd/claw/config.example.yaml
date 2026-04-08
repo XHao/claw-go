@@ -40,6 +40,18 @@ primary_model: "default_task"
 # routing_policy:
 #   thinking_model: "claude_think"
 
+  # Anthropic Claude — native provider (full tool use + extended thinking)
+  # claude-opus:
+  #   type: anthropic
+  #   base_url: "https://api.anthropic.com/v1"  # optional; omit for default
+  #   api_key: sk-ant-...          # or export ANTHROPIC_API_KEY
+  #   model: claude-opus-4-5
+  #   max_tokens: 16000
+  #   thinking_budget: 10000       # 0 = disabled; must be < max_tokens
+  #   stream: true
+  #   headers:                     # extra headers for internal proxies
+  #     X-Working-Dir: /your/workspace
+
 # ---- CLI ----
 cli:
   prompt: "You ❯ "
