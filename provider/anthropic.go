@@ -34,6 +34,7 @@ type AnthropicProvider struct {
 	thinkingBudget int // 0 = disabled
 	streamEnabled  bool
 	headers        map[string]string
+	extraBody      map[string]any
 	httpClient     *http.Client
 }
 
@@ -42,7 +43,9 @@ type AnthropicProvider struct {
 // headers are extra HTTP headers sent with every request (e.g. X-Working-Dir for mcli).
 // thinkingBudget > 0 enables extended thinking with that token budget.
 // streamEnabled controls whether SSE streaming is used.
-func NewAnthropic(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thinkingBudget int, streamEnabled bool, headers map[string]string) *AnthropicProvider {
+// extraBody keys are merged into the top-level JSON request body, allowing
+// vendor-specific parameters to be passed through without code changes.
+func NewAnthropic(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thinkingBudget int, streamEnabled bool, headers map[string]string, extraBody map[string]any) *AnthropicProvider {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 120
 	}
@@ -57,6 +60,7 @@ func NewAnthropic(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thin
 		thinkingBudget: thinkingBudget,
 		streamEnabled:  streamEnabled,
 		headers:        headers,
+		extraBody:      extraBody,
 		httpClient:     &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second},
 	}
 }
@@ -146,7 +150,7 @@ type antTool struct {
 
 // antThinking is the extended thinking parameter.
 type antThinking struct {
-	Type         string `json:"type"`          // always "enabled"
+	Type         string `json:"type"` // always "enabled"
 	BudgetTokens int    `json:"budget_tokens"`
 }
 
@@ -196,7 +200,7 @@ func (p *AnthropicProvider) buildRequest(messages []Message, tools []ToolDef, wa
 		Stream:    wantStream,
 		Tools:     antTools,
 	}
-	if p.thinkingBudget > 0 {
+	if p.thinkingBudget > 0 && p.extraBody["thinking"] == nil {
 		req.Thinking = &antThinking{
 			Type:         "enabled",
 			BudgetTokens: p.thinkingBudget,
@@ -388,7 +392,7 @@ func (p *AnthropicProvider) readJSON(body io.Reader) (CompleteResult, error) {
 // doHTTP marshals req, sends it to the Anthropic API, and dispatches to
 // readJSON or readSSE depending on whether streaming was requested.
 func (p *AnthropicProvider) doHTTP(ctx context.Context, req antRequest, streamFn StreamFunc) (CompleteResult, error) {
-	body, err := json.Marshal(req)
+	body, err := marshalWithExtra(req, p.extraBody)
 	if err != nil {
 		return CompleteResult{}, fmt.Errorf("anthropic: marshal: %w", err)
 	}

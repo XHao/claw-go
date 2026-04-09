@@ -354,10 +354,10 @@ func buildLLM(cfg *config.Config) (provider.Provider, []*provider.OpenAIProvider
 		switch pc.Type {
 		case "anthropic":
 			streamEnabled := pc.Stream == nil || *pc.Stream
-			inner = provider.NewAnthropic(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled, pc.Headers)
+			inner = provider.NewAnthropic(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled, pc.Headers, pc.ExtraBody)
 		default: // "openai" or empty string
 			streamEnabled := pc.Stream == nil || *pc.Stream // default true
-			oai := provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled)
+			oai := provider.NewOpenAI(pc.BaseURL, pc.APIKey, pc.Model, pc.MaxTokens, pc.TimeoutSeconds, pc.ThinkingBudget, streamEnabled, pc.ExtraBody)
 			if !seen[modelKey] {
 				seen[modelKey] = true
 				probeTargets = append(probeTargets, oai)

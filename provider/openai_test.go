@@ -44,7 +44,7 @@ func TestBuildOAMessages_WithImagePaths(t *testing.T) {
 	f.Write(pngBytes)
 	f.Close()
 
-	p := NewOpenAI("https://api.openai.com/v1", "key", "gpt-4o", 1024, 30, 0, false)
+	p := NewOpenAI("https://api.openai.com/v1", "key", "gpt-4o", 1024, 30, 0, false, nil)
 
 	messages := []Message{
 		{Role: "user", Content: "describe this", ImagePaths: []string{f.Name()}},

@@ -52,6 +52,19 @@ primary_model: "default_task"
   #   headers:                     # extra headers for internal proxies
   #     X-Working-Dir: /your/workspace
 
+  # Vendor-specific proxy — extra_body merges into request JSON
+  # gemini_think:
+  #   base_url: "https://your-proxy/v1"
+  #   api_key: "${API_KEY}"
+  #   model: "gemini-3.1-pro-preview"
+  #   max_tokens: 8192
+  #   extra_body:
+  #     google:
+  #       thinking_config:
+  #         include_thoughts: true
+  #         thinking_budget: 10240
+  #       thought_tag_marker: "think"
+
 # ---- CLI ----
 cli:
   prompt: "You ❯ "

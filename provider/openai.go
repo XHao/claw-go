@@ -27,6 +27,7 @@ type OpenAIProvider struct {
 	maxTokens      int
 	thinkingBudget int
 	streamEnabled  bool
+	extraBody      map[string]any
 	httpClient     *http.Client
 
 	// Negotiated capabilities — learned from API responses at runtime.
@@ -44,7 +45,9 @@ type negotiatedCaps struct {
 }
 
 // NewOpenAI creates an OpenAIProvider.
-func NewOpenAI(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thinkingBudget int, streamEnabled bool) *OpenAIProvider {
+// extraBody keys are merged into the top-level JSON request body, allowing
+// vendor-specific parameters to be passed through without code changes.
+func NewOpenAI(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thinkingBudget int, streamEnabled bool, extraBody map[string]any) *OpenAIProvider {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 120
 	}
@@ -55,6 +58,7 @@ func NewOpenAI(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thinkin
 		maxTokens:      maxTokens,
 		thinkingBudget: thinkingBudget,
 		streamEnabled:  streamEnabled,
+		extraBody:      extraBody,
 		httpClient: &http.Client{
 			Timeout: time.Duration(timeoutSeconds) * time.Second,
 		},
@@ -74,9 +78,9 @@ type oaMessage struct {
 // oaContentBlock is a single element in a multi-part message content array.
 // Used for user messages that contain images alongside text.
 type oaContentBlock struct {
-	Type     string        `json:"type"`               // "text" | "image_url"
-	Text     string        `json:"text,omitempty"`     // type=text
-	ImageURL *oaImageURL   `json:"image_url,omitempty"` // type=image_url
+	Type     string      `json:"type"`                // "text" | "image_url"
+	Text     string      `json:"text,omitempty"`      // type=text
+	ImageURL *oaImageURL `json:"image_url,omitempty"` // type=image_url
 }
 
 // oaImageURL carries a base64-encoded image for the OpenAI vision API.
@@ -280,7 +284,8 @@ func (p *OpenAIProvider) buildRequest(msgs []oaMessage, tools []oaTool, wantStre
 	}
 
 	// Thinking: send if configured and not known-unsupported.
-	if p.thinkingBudget > 0 && (caps.thinking == nil || *caps.thinking) {
+	// Skip when extraBody already carries a "thinking" key (let the caller override).
+	if p.thinkingBudget > 0 && (caps.thinking == nil || *caps.thinking) && p.extraBody["thinking"] == nil {
 		req.Thinking = &oaThinking{
 			Type:         "enabled",
 			BudgetTokens: p.thinkingBudget,
@@ -324,7 +329,7 @@ func (p *OpenAIProvider) doWithNegotiation(ctx context.Context, req oaRequest, s
 // doHTTP marshals the request, sends it, and parses the response.
 // Stream vs non-stream is decided by Content-Type auto-detection.
 func (p *OpenAIProvider) doHTTP(ctx context.Context, req oaRequest, streamFn StreamFunc) (CompleteResult, error) {
-	body, err := json.Marshal(req)
+	body, err := marshalWithExtra(req, p.extraBody)
 	if err != nil {
 		return CompleteResult{}, fmt.Errorf("openai: marshal: %w", err)
 	}

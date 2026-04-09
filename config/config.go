@@ -197,6 +197,12 @@ type ProviderConfig struct {
 	// Useful for internal proxies that require custom authentication headers
 	// (e.g. X-Working-Dir for mcli).
 	Headers map[string]string `yaml:"headers"`
+	// ExtraBody holds arbitrary key-value pairs that are merged into the
+	// top-level JSON request body sent to the LLM API.  This allows passing
+	// vendor-specific parameters (e.g. Google thinking_config, Anthropic
+	// metadata) without hard-coding each field in the provider implementation.
+	// Keys in ExtraBody override any struct-generated fields with the same name.
+	ExtraBody map[string]any `yaml:"extra_body"`
 }
 
 // Load reads and parses a config file. The format is selected by file

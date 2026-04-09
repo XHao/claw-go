@@ -9,7 +9,7 @@ import (
 )
 
 func TestNewAnthropic_defaults(t *testing.T) {
-	p := NewAnthropic("", "sk-ant-test", "claude-opus-4-5", 4096, 120, 0, true, nil)
+	p := NewAnthropic("", "sk-ant-test", "claude-opus-4-5", 4096, 120, 0, true, nil, nil)
 	if p.apiKey != "sk-ant-test" {
 		t.Fatalf("apiKey: got %q", p.apiKey)
 	}
@@ -25,7 +25,7 @@ func TestNewAnthropic_defaults(t *testing.T) {
 }
 
 func TestNewAnthropic_timeoutDefault(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 0, 0, true, nil)
+	p := NewAnthropic("", "key", "model", 1024, 0, 0, true, nil, nil)
 	if p.httpClient.Timeout.Seconds() != 120 {
 		t.Fatalf("expected 120s timeout, got %v", p.httpClient.Timeout)
 	}
@@ -176,7 +176,7 @@ func TestConvertTools_nilParameters(t *testing.T) {
 }
 
 func TestReadJSON_textReply(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 0, false, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 0, false, nil, nil)
 	body := `{
 		"content": [{"type":"text","text":"Hello world"}],
 		"stop_reason": "end_turn",
@@ -198,7 +198,7 @@ func TestReadJSON_textReply(t *testing.T) {
 }
 
 func TestReadJSON_toolUse(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 0, false, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 0, false, nil, nil)
 	body := `{
 		"content": [
 			{"type":"tool_use","id":"toolu_01","name":"bash","input":{"command":"ls"}}
@@ -226,7 +226,7 @@ func TestReadJSON_toolUse(t *testing.T) {
 }
 
 func TestReadJSON_thinking_filtered(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 10000, false, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 10000, false, nil, nil)
 	body := `{
 		"content": [
 			{"type":"thinking","thinking":"Let me reason..."},
@@ -245,7 +245,7 @@ func TestReadJSON_thinking_filtered(t *testing.T) {
 }
 
 func TestReadJSON_apiError(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 0, false, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 0, false, nil, nil)
 	body := `{"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}}`
 	_, err := p.readJSON(strings.NewReader(body))
 	if err == nil {
@@ -257,7 +257,7 @@ func TestReadJSON_apiError(t *testing.T) {
 }
 
 func TestReadSSE_text(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 0, true, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 0, true, nil, nil)
 	sse := "event: message_start\n" +
 		`data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}` + "\n\n" +
 		"event: content_block_start\n" +
@@ -297,7 +297,7 @@ func TestReadSSE_text(t *testing.T) {
 }
 
 func TestReadSSE_thinking_filtered(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 10000, true, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 10000, true, nil, nil)
 	sse := "event: content_block_start\n" +
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
 		"event: content_block_delta\n" +
@@ -330,7 +330,7 @@ func TestReadSSE_thinking_filtered(t *testing.T) {
 }
 
 func TestReadSSE_toolUse(t *testing.T) {
-	p := NewAnthropic("", "key", "model", 1024, 30, 0, true, nil)
+	p := NewAnthropic("", "key", "model", 1024, 30, 0, true, nil, nil)
 	sse := "event: content_block_start\n" +
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"bash","input":{}}}` + "\n\n" +
 		"event: content_block_delta\n" +
