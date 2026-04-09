@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -213,8 +214,9 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 		"session_key", msg.SessionKey,
 		"channel", msg.ChannelType+":"+msg.ChannelName,
 	)
+	defer cleanupAttachments(msg.Attachments)
 	text := strings.TrimSpace(msg.Text)
-	if text == "" {
+	if text == "" && len(msg.Attachments) == 0 {
 		return
 	}
 
@@ -316,7 +318,15 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 	}
 
 	sess := a.sessions.Get(msg.SessionKey)
-	sess.Append(provider.Message{Role: "user", Content: text}, a.sessions.MaxTurns())
+	userText := text
+	if userText == "" && len(msg.Attachments) > 0 {
+		userText = "[图片]"
+	}
+	sess.Append(provider.Message{
+		Role:       "user",
+		Content:    userText,
+		ImagePaths: attachmentPaths(msg.Attachments),
+	}, a.sessions.MaxTurns())
 	// Capture turn index right after the user message is appended.
 	turnN := sess.TurnCount()
 
@@ -771,4 +781,27 @@ func topicMatchesText(topic, lowerText string) bool {
 		}
 	}
 	return true
+}
+
+// cleanupAttachments removes all temporary files created for inbound media attachments.
+func cleanupAttachments(attachments []channel.Attachment) {
+	for _, a := range attachments {
+		if a.Path != "" {
+			_ = os.Remove(a.Path)
+		}
+	}
+}
+
+// attachmentPaths returns the local file paths from a slice of Attachments.
+func attachmentPaths(attachments []channel.Attachment) []string {
+	if len(attachments) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(attachments))
+	for _, a := range attachments {
+		if a.Path != "" {
+			paths = append(paths, a.Path)
+		}
+	}
+	return paths
 }

@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,7 +114,8 @@ type DingTalkChannel struct {
 	tokenURL   string
 
 	// httpClient is used for all DingTalk REST calls.
-	httpClient *http.Client
+	httpClient      *http.Client
+	mediaHTTPClient *http.Client // used for image downloads (longer timeout)
 
 	running atomic.Bool
 
@@ -140,6 +143,9 @@ type DingTalkChannel struct {
 	cardInstancesURL string
 	cardDeliverURL   string
 	cardStreamingURL string
+
+	// messageFilesDownloadURL is overridable for testing.
+	messageFilesDownloadURL string
 }
 
 // NewDingTalkChannel creates a DingTalkChannel.
@@ -156,11 +162,13 @@ func NewDingTalkChannel(id, clientID, clientSecret string, log *slog.Logger) *Di
 		gatewayURL:        dingtalkGatewayURL,
 		tokenURL:          dingtalkTokenURL,
 		httpClient:        &http.Client{Timeout: 15 * time.Second},
+		mediaHTTPClient:   &http.Client{Timeout: 60 * time.Second}, // image downloads can be large
 		sessions:         make(map[string]dingtalkSession),
 		activeCards:      make(map[string]*dingtalkCard),
-		cardInstancesURL: "https://api.dingtalk.com/v1.0/card/instances",
-		cardDeliverURL:   "https://api.dingtalk.com/v1.0/card/instances/deliver",
-		cardStreamingURL: "https://api.dingtalk.com/v1.0/card/streaming",
+		cardInstancesURL:        "https://api.dingtalk.com/v1.0/card/instances",
+		cardDeliverURL:          "https://api.dingtalk.com/v1.0/card/instances/deliver",
+		cardStreamingURL:        "https://api.dingtalk.com/v1.0/card/streaming",
+		messageFilesDownloadURL: "https://api.dingtalk.com/v1.0/robot/messageFiles/download",
 		seen:              make(map[string]time.Time),
 		heartbeatInterval: defaultHeartbeatInterval,
 		heartbeatTimeout:  defaultHeartbeatTimeout,
@@ -299,6 +307,9 @@ func (d *DingTalkChannel) finishCard(ctx context.Context, chatID, text string, s
 
 	if card == nil {
 		// No active card (streaming was never started, or card creation failed).
+		if looksLikeMarkdown(text) {
+			return d.postMarkdownReply(ctx, sess.webhookURL, token, text)
+		}
 		return d.postReply(ctx, sess.webhookURL, token, text)
 	}
 
@@ -781,8 +792,27 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 		return fmt.Errorf("parse message: %w", err)
 	}
 
-	if msg.MsgType != "text" {
-		return nil // only handle text for now
+	switch msg.MsgType {
+	case "text":
+		// handled below
+	case "picture":
+		// handled below
+	case "richText":
+		// handled below
+	default:
+		if d.log != nil {
+			d.log.Info("dingtalk: unsupported message type, notifying user",
+				"msgtype", msg.MsgType, "msgId", msg.MsgID)
+		}
+		// Notify user instead of silently dropping.
+		if msg.SessionWebhook != "" {
+			token, _ := d.getAccessToken(ctx)
+			if token != "" {
+				_ = d.postReply(ctx, msg.SessionWebhook, token,
+					fmt.Sprintf("收到%s消息，暂不支持处理。", msg.MsgType))
+			}
+		}
+		return nil
 	}
 
 	// Dedup: check both protocol-layer messageId (headers) and business-layer
@@ -832,6 +862,64 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 		d.mu.Unlock()
 	}
 
+	var inboundText string
+	var attachments []Attachment
+
+	switch msg.MsgType {
+	case "text":
+		inboundText = strings.TrimSpace(msg.Text.Content)
+	case "picture":
+		path, err := d.downloadDingTalkImage(ctx, msg.Picture.PictureURL, msg.Picture.DownloadCode)
+		if err != nil {
+			d.log.Warn("dingtalk: picture download failed", "err", err)
+		} else if path != "" {
+			attachments = append(attachments, Attachment{
+				Path:     path,
+				MimeType: mimeFromPath(path),
+				AltText:  "[图片]",
+			})
+		}
+		inboundText = ""
+	case "richText":
+		// Try to parse richTextList from msg.RichText or from msg.Content JSON string.
+		richList := msg.RichText.RichTextList
+		if len(richList) == 0 && msg.Content != "" {
+			var parsed struct {
+				RichText struct {
+					RichTextList []dingTalkRichTextItem `json:"richTextList"`
+				} `json:"richText"`
+			}
+			if json.Unmarshal([]byte(msg.Content), &parsed) == nil {
+				richList = parsed.RichText.RichTextList
+			}
+		}
+		var textParts []string
+		for _, item := range richList {
+			switch item.Type {
+			case "text":
+				if item.Text != "" {
+					textParts = append(textParts, item.Text)
+				}
+			case "picture":
+				path, err := d.downloadDingTalkImage(ctx, item.PictureURL, item.DownloadCode)
+				if err != nil {
+					d.log.Warn("dingtalk: richText picture download failed", "err", err)
+				} else if path != "" {
+					attachments = append(attachments, Attachment{
+						Path:     path,
+						MimeType: mimeFromPath(path),
+						AltText:  "[图片]",
+					})
+				}
+			}
+		}
+		inboundText = strings.TrimSpace(strings.Join(textParts, ""))
+	}
+
+	if inboundText == "" && len(attachments) == 0 {
+		return nil
+	}
+
 	inbound := InboundMessage{
 		ChannelName: d.id,
 		ChannelType: "dingtalk",
@@ -839,15 +927,17 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 		ChatID:      sessionKey,
 		UserID:      userID,
 		Username:    msg.SenderNick,
-		Text:        strings.TrimSpace(msg.Text.Content),
+		Text:        inboundText,
 		MessageID:   msg.MsgID,
 		Timestamp:   time.Now(),
+		Attachments: attachments,
 	}
 
 	d.log.Info("dingtalk: message received",
 		"from", msg.SenderNick,
 		"session", sessionKey,
-		"text", msg.Text.Content,
+		"text", inboundText,
+		"images", len(attachments),
 	)
 
 	go dispatch(ctx, inbound)
@@ -856,18 +946,36 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 
 // dingTalkMessage is the JSON payload inside a robot CALLBACK frame.
 type dingTalkMessage struct {
-	MsgID            string `json:"msgId"`
-	MsgType          string `json:"msgtype"`
-	Text             struct {
+	MsgID   string `json:"msgId"`
+	MsgType string `json:"msgtype"`
+	Text    struct {
 		Content string `json:"content"`
 	} `json:"text"`
+	// picture message
+	Picture struct {
+		PictureURL   string `json:"pictureUrl"`
+		DownloadCode string `json:"downloadCode"`
+	} `json:"picture"`
+	// richText message
+	RichText struct {
+		RichTextList []dingTalkRichTextItem `json:"richTextList"`
+	} `json:"richText"`
+	Content          string `json:"content"` // richText sometimes puts content here as JSON string
 	SenderID         string `json:"senderId"`
 	SenderStaffID    string `json:"senderStaffId"`
 	SenderNick       string `json:"senderNick"`
 	ConversationID   string `json:"conversationId"`
-	ConversationType string `json:"conversationType"` // "1"=DM, "2"=group
-	RobotCode        string `json:"robotCode"`         // bot AppKey; fallback to clientID
+	ConversationType string `json:"conversationType"`
+	RobotCode        string `json:"robotCode"`
 	SessionWebhook   string `json:"sessionWebhook"`
+}
+
+// dingTalkRichTextItem is one element in a richText message.
+type dingTalkRichTextItem struct {
+	Type         string `json:"type"`         // "text" | "picture"
+	Text         string `json:"text"`
+	PictureURL   string `json:"pictureUrl"`
+	DownloadCode string `json:"downloadCode"`
 }
 
 // ── Access Token ──────────────────────────────────────────────────────────────
@@ -942,4 +1050,149 @@ func (d *DingTalkChannel) postReply(ctx context.Context, webhookURL, token, text
 		return fmt.Errorf("reply status %d: %s", resp.StatusCode, respBody)
 	}
 	return nil
+}
+
+// postMarkdownReply sends a markdown-formatted reply via the session webhook.
+func (d *DingTalkChannel) postMarkdownReply(ctx context.Context, webhookURL, token, text string) error {
+	// Use first line (up to 20 chars) as title.
+	title := text
+	if idx := strings.Index(title, "\n"); idx != -1 {
+		title = title[:idx]
+	}
+	if len([]rune(title)) > 20 {
+		title = string([]rune(title)[:20])
+	}
+	body := mustMarshal(map[string]any{
+		"msgtype":  "markdown",
+		"markdown": map[string]string{"title": title, "text": text},
+		"at":       map[string]bool{"isAtAll": false},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("post markdown reply: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("markdown reply status %d: %s", resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+// looksLikeMarkdown reports whether text contains markdown formatting.
+func looksLikeMarkdown(text string) bool {
+	return strings.HasPrefix(text, "#") ||
+		strings.Contains(text, "**") ||
+		strings.Contains(text, "```") ||
+		strings.Contains(text, "\n- ") ||
+		strings.Contains(text, "\n* ") ||
+		strings.Contains(text, "\n1. ")
+}
+
+// downloadImageToTemp downloads an image from url into a temp file.
+// Returns the absolute path of the temp file on success.
+func (d *DingTalkChannel) downloadImageToTemp(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	resp, err := d.mediaHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download image: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download image: status %d", resp.StatusCode)
+	}
+
+	// Detect extension from Content-Type.
+	ext := ".jpg"
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		mt, _, _ := mime.ParseMediaType(ct)
+		switch mt {
+		case "image/png":
+			ext = ".png"
+		case "image/gif":
+			ext = ".gif"
+		case "image/webp":
+			ext = ".webp"
+		}
+	}
+
+	f, err := os.CreateTemp("", "claw-dt-*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, io.LimitReader(resp.Body, 20*1024*1024)); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	return f.Name(), nil
+}
+
+// resolveDownloadCode exchanges a DingTalk downloadCode for a direct download URL.
+// Calls POST /v1.0/robot/messageFiles/download with the bot's access token.
+func (d *DingTalkChannel) resolveDownloadCode(ctx context.Context, downloadCode string) (string, error) {
+	token, err := d.getAccessToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get access token: %w", err)
+	}
+	robotCode := d.clientID
+	body := mustMarshal(map[string]string{
+		"downloadCode": downloadCode,
+		"robotCode":    robotCode,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		d.messageFilesDownloadURL,
+		bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("messageFiles/download: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("messageFiles/download status %d: %s", resp.StatusCode, respBody)
+	}
+	var result struct {
+		DownloadURL string `json:"downloadUrl"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("parse download response: %w", err)
+	}
+	if result.DownloadURL == "" {
+		return "", fmt.Errorf("empty downloadUrl in response: %s", respBody)
+	}
+	return result.DownloadURL, nil
+}
+
+// downloadDingTalkImage downloads a DingTalk image to a local temp file.
+// It tries pictureUrl first; if empty, resolves downloadCode to a URL then downloads.
+// Returns ("", nil) if both are empty (no image to download).
+func (d *DingTalkChannel) downloadDingTalkImage(ctx context.Context, pictureURL, downloadCode string) (string, error) {
+	url := pictureURL
+	if url == "" && downloadCode != "" {
+		var err error
+		url, err = d.resolveDownloadCode(ctx, downloadCode)
+		if err != nil {
+			return "", fmt.Errorf("resolve downloadCode: %w", err)
+		}
+	}
+	if url == "" {
+		return "", nil
+	}
+	return d.downloadImageToTemp(ctx, url)
 }

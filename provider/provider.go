@@ -7,7 +7,6 @@ import (
 )
 
 // Message is a single chat message.
-// Supports plain text messages, assistant tool-call requests, and tool results.
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
@@ -17,7 +16,16 @@ type Message struct {
 
 	// Set on "tool" role messages that carry a function result.
 	ToolCallID string `json:"tool_call_id,omitempty"`
-	Name       string `json:"name,omitempty"` // tool function name
+	Name       string `json:"name,omitempty"`
+
+	// ImagePaths holds absolute paths to local image files attached to this
+	// user message. Provider implementations read these files and convert them
+	// to the appropriate wire format (base64 inline now; Files API in future).
+	// Only meaningful on "user" role messages.
+	// Note: these paths point to temporary files that are deleted after dispatch.
+	// When messages are persisted to session history, the paths become stale;
+	// image content will not be re-sent on session reload.
+	ImagePaths []string `json:"image_paths,omitempty"`
 }
 
 // ToolDef describes a tool that the LLM may call.

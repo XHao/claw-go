@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -61,10 +65,23 @@ func NewOpenAI(baseURL, apiKey, model string, maxTokens, timeoutSeconds, thinkin
 
 type oaMessage struct {
 	Role       string            `json:"role"`
-	Content    string            `json:"content,omitempty"`
+	Content    any               `json:"content,omitempty"` // string | []oaContentBlock
 	ToolCalls  []ToolCallRequest `json:"tool_calls,omitempty"`
 	ToolCallID string            `json:"tool_call_id,omitempty"`
 	Name       string            `json:"name,omitempty"`
+}
+
+// oaContentBlock is a single element in a multi-part message content array.
+// Used for user messages that contain images alongside text.
+type oaContentBlock struct {
+	Type     string        `json:"type"`               // "text" | "image_url"
+	Text     string        `json:"text,omitempty"`     // type=text
+	ImageURL *oaImageURL   `json:"image_url,omitempty"` // type=image_url
+}
+
+// oaImageURL carries a base64-encoded image for the OpenAI vision API.
+type oaImageURL struct {
+	URL string `json:"url"` // "data:<mime>;base64,<data>"
 }
 
 type oaToolFunction struct {
@@ -174,22 +191,48 @@ func (p *OpenAIProvider) Complete(ctx context.Context, messages []Message) (stri
 // thinking) are sent optimistically. If the upstream API rejects them (HTTP 400
 // with a recognisable error), the offending field is stripped and the request is
 // retried automatically. The result is cached so subsequent calls skip the probe.
-func (p *OpenAIProvider) CompleteWithTools(ctx context.Context, messages []Message, tools []ToolDef) (CompleteResult, error) {
-	// Build wire messages.
+// buildOAMessages converts []Message to []oaMessage, handling image attachments.
+func buildOAMessages(messages []Message) []oaMessage {
 	oaMsgs := make([]oaMessage, len(messages))
 	for i, m := range messages {
-		content := m.Content
-		if m.Role == "tool" && content == "" {
-			content = "(no output)"
-		}
-		oaMsgs[i] = oaMessage{
+		msg := oaMessage{
 			Role:       m.Role,
-			Content:    content,
 			ToolCalls:  m.ToolCalls,
 			ToolCallID: m.ToolCallID,
 			Name:       m.Name,
 		}
+		if m.Role == "user" && len(m.ImagePaths) > 0 {
+			// Multi-part content: image blocks followed by text.
+			var blocks []oaContentBlock
+			for _, imgPath := range m.ImagePaths {
+				block, err := oaImageBlockFromFile(imgPath)
+				if err != nil {
+					slog.Warn("openai: failed to encode image, skipping", "path", imgPath, "err", err)
+					continue
+				}
+				blocks = append(blocks, block)
+			}
+			text := m.Content
+			if text == "" {
+				text = "[图片]"
+			}
+			blocks = append(blocks, oaContentBlock{Type: "text", Text: text})
+			msg.Content = blocks
+		} else {
+			content := m.Content
+			if m.Role == "tool" && content == "" {
+				content = "(no output)"
+			}
+			msg.Content = content
+		}
+		oaMsgs[i] = msg
 	}
+	return oaMsgs
+}
+
+func (p *OpenAIProvider) CompleteWithTools(ctx context.Context, messages []Message, tools []ToolDef) (CompleteResult, error) {
+	// Build wire messages.
+	oaMsgs := buildOAMessages(messages)
 
 	// Build tool list.
 	var oaTools []oaTool
@@ -583,6 +626,28 @@ func (p *OpenAIProvider) ProbeCapabilities(ctx context.Context) {
 		}
 		// Loop: maybe a second feature also needs stripping.
 	}
+}
+
+// oaImageBlockFromFile reads a local image file and returns an OpenAI image_url
+// content block with a base64 data URI.
+// This is the current implementation; swap to Files API upload here in future.
+func oaImageBlockFromFile(path string) (oaContentBlock, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return oaContentBlock{}, fmt.Errorf("read image %q: %w", path, err)
+	}
+	mediaType := mime.TypeByExtension(filepath.Ext(path))
+	if mediaType == "" {
+		mediaType = "image/jpeg"
+	}
+	if idx := strings.Index(mediaType, ";"); idx != -1 {
+		mediaType = strings.TrimSpace(mediaType[:idx])
+	}
+	dataURI := "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return oaContentBlock{
+		Type:     "image_url",
+		ImageURL: &oaImageURL{URL: dataURI},
+	}, nil
 }
 
 func capStr(b *bool) string {

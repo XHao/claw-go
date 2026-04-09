@@ -18,6 +18,7 @@ package channel
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -70,10 +71,11 @@ type weixinTypingEntry struct {
 
 // WeixinChannel implements Channel using WeChat's iLink Bot API.
 type WeixinChannel struct {
-	id         string
-	tokenFile  string
-	log        *slog.Logger
-	httpClient *http.Client // used for QR login and outbound replies
+	id              string
+	tokenFile       string
+	log             *slog.Logger
+	httpClient      *http.Client // used for QR login and outbound replies
+	mediaHTTPClient *http.Client // used for CDN image downloads (longer timeout)
 
 	running atomic.Bool
 
@@ -97,13 +99,14 @@ func NewWeixinChannel(id, tokenFile string, log *slog.Logger) *WeixinChannel {
 		log = slog.Default()
 	}
 	return &WeixinChannel{
-		id:         id,
-		tokenFile:  tokenFile,
-		log:        log,
-		httpClient:    &http.Client{Timeout: 15 * time.Second},
-		sessions:      make(map[string]weixinSession),
-		typingTickets: make(map[string]*weixinTypingEntry),
-		typingActive:  make(map[string]string),
+		id:              id,
+		tokenFile:       tokenFile,
+		log:             log,
+		httpClient:      &http.Client{Timeout: 15 * time.Second},
+		mediaHTTPClient: &http.Client{Timeout: 60 * time.Second}, // CDN image downloads can be large
+		sessions:        make(map[string]weixinSession),
+		typingTickets:   make(map[string]*weixinTypingEntry),
+		typingActive:    make(map[string]string),
 	}
 }
 
@@ -181,7 +184,7 @@ func (w *WeixinChannel) Send(ctx context.Context, msg OutboundMessage) error {
 		return fmt.Errorf("weixin: no session for chat %q", msg.ChatID)
 	}
 
-	if err := w.sendMessage(ctx, sess.fromUserID, sess.contextToken, msg.Text); err != nil {
+	if err := w.sendMessage(ctx, sess.fromUserID, sess.contextToken, stripMarkdown(msg.Text)); err != nil {
 		return err
 	}
 
@@ -456,16 +459,164 @@ func (w *WeixinChannel) pollLoop(ctx context.Context, dispatch DispatchFunc) err
 
 // weixinInboundMsg is the JSON structure of a message from getupdates.
 type weixinInboundMsg struct {
-	FromUserID   string `json:"from_user_id"`
-	ToUserID     string `json:"to_user_id"`
-	MessageType  int    `json:"message_type"`
-	ContextToken string `json:"context_token"`
-	ItemList     []struct {
-		Type     int `json:"type"`
-		TextItem struct {
-			Text string `json:"text"`
-		} `json:"text_item"`
-	} `json:"item_list"`
+	FromUserID   string              `json:"from_user_id"`
+	ToUserID     string              `json:"to_user_id"`
+	MessageType  int                 `json:"message_type"`
+	ContextToken string              `json:"context_token"`
+	ItemList     []weixinMessageItem `json:"item_list"`
+}
+
+// weixinMessageItem is a single item in the item_list of a WeChat message.
+type weixinMessageItem struct {
+	Type     int `json:"type"` // 1=text, 2=image, 4=voice, 6=file
+	TextItem struct {
+		Text string `json:"text"`
+	} `json:"text_item"`
+	ImageItem *weixinImageItem `json:"image_item"`
+}
+
+// weixinImageItem holds CDN reference and AES key for a WeChat image.
+type weixinImageItem struct {
+	Media *weixinCDNMedia `json:"media"`
+	// AESKey is the raw AES-128 key as a hex string (32 chars = 16 bytes).
+	// Preferred over Media.AESKey for inbound decryption when present.
+	AESKey string `json:"aeskey"`
+}
+
+// weixinCDNMedia is a CDN media reference from WeChat.
+type weixinCDNMedia struct {
+	EncryptQueryParam string `json:"encrypt_query_param"`
+	AESKey            string `json:"aes_key"` // base64-encoded; see parseWeixinAESKey
+}
+
+// parseWeixinAESKey parses a WeChat CDN AES key from two possible encodings:
+//   - base64(raw 16 bytes)         → images (aes_key field)
+//   - hex string (32 chars)        → from image_item.aeskey field
+//   - base64(hex string 32 chars)  → voice/file/video
+func parseWeixinAESKey(s string) ([]byte, error) {
+	// Try hex first (image_item.aeskey is a raw hex string).
+	if len(s) == 32 {
+		if b, err := hex.DecodeString(s); err == nil && len(b) == 16 {
+			return b, nil
+		}
+	}
+	// Try base64.
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("parseWeixinAESKey: base64 decode: %w", err)
+	}
+	if len(decoded) == 16 {
+		return decoded, nil // base64(raw 16 bytes)
+	}
+	// base64(hex string of 16 bytes) → 32 ASCII hex chars.
+	if len(decoded) == 32 {
+		b, err := hex.DecodeString(string(decoded))
+		if err == nil && len(b) == 16 {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("parseWeixinAESKey: unexpected decoded length %d", len(decoded))
+}
+
+// decryptAES128ECB decrypts AES-128-ECB ciphertext and removes PKCS7 padding.
+func decryptAES128ECB(ciphertext, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("aes.NewCipher: %w", err)
+	}
+	bs := block.BlockSize() // 16
+	if len(ciphertext) == 0 || len(ciphertext)%bs != 0 {
+		return nil, fmt.Errorf("ciphertext length %d is not a multiple of block size", len(ciphertext))
+	}
+	plaintext := make([]byte, len(ciphertext))
+	for i := 0; i < len(ciphertext); i += bs {
+		block.Decrypt(plaintext[i:i+bs], ciphertext[i:i+bs])
+	}
+	// PKCS7 unpad.
+	padLen := int(plaintext[len(plaintext)-1])
+	if padLen == 0 || padLen > bs {
+		return nil, fmt.Errorf("invalid PKCS7 padding byte %d", padLen)
+	}
+	for i := len(plaintext) - padLen; i < len(plaintext); i++ {
+		if plaintext[i] != byte(padLen) {
+			return nil, fmt.Errorf("invalid PKCS7 padding content at byte %d", i)
+		}
+	}
+	return plaintext[:len(plaintext)-padLen], nil
+}
+
+// downloadWeixinCDNImage downloads and decrypts a WeChat CDN image to a temp file.
+func (w *WeixinChannel) downloadWeixinCDNImage(ctx context.Context, item *weixinImageItem) (string, error) {
+	if item == nil || item.Media == nil || item.Media.EncryptQueryParam == "" {
+		return "", nil
+	}
+
+	// Resolve AES key: prefer item.AESKey (hex), fall back to media.AESKey (base64).
+	aesKeyStr := item.AESKey
+	if aesKeyStr == "" {
+		aesKeyStr = item.Media.AESKey
+	}
+	if aesKeyStr == "" {
+		return "", fmt.Errorf("no AES key for image")
+	}
+	key, err := parseWeixinAESKey(aesKeyStr)
+	if err != nil {
+		return "", fmt.Errorf("parse AES key: %w", err)
+	}
+
+	// Build CDN download URL.
+	cdnURL := w.baseURL + "/cgi-bin/mmbiz_getcdndata?encrypt_fileid=" + item.Media.EncryptQueryParam
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cdnURL, nil)
+	if err != nil {
+		return "", err
+	}
+	w.setHeaders(req)
+	resp, err := w.mediaHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("cdn download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("cdn download status %d", resp.StatusCode)
+	}
+	encrypted, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("read cdn body: %w", err)
+	}
+
+	plaintext, err := decryptAES128ECB(encrypted, key)
+	if err != nil {
+		return "", fmt.Errorf("decrypt: %w", err)
+	}
+
+	// Detect image format from magic bytes to use the correct extension.
+	ext := ".jpg"
+	if len(plaintext) >= 8 {
+		switch {
+		case len(plaintext) >= 8 &&
+			plaintext[0] == 0x89 && plaintext[1] == 0x50 && plaintext[2] == 0x4e && plaintext[3] == 0x47:
+			ext = ".png"
+		case len(plaintext) >= 6 &&
+			plaintext[0] == 0x47 && plaintext[1] == 0x49 && plaintext[2] == 0x46:
+			ext = ".gif"
+		case len(plaintext) >= 12 &&
+			plaintext[0] == 0x52 && plaintext[1] == 0x49 && plaintext[2] == 0x46 && plaintext[3] == 0x46 &&
+			plaintext[8] == 0x57 && plaintext[9] == 0x45 && plaintext[10] == 0x42 && plaintext[11] == 0x50:
+			ext = ".webp"
+		}
+	}
+
+	f, err := os.CreateTemp("", "claw-wx-*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(plaintext); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	return f.Name(), nil
 }
 
 // getUpdates calls /ilink/bot/getupdates and returns parsed messages and the new cursor.
@@ -513,29 +664,65 @@ func (w *WeixinChannel) getUpdates(ctx context.Context, client *http.Client, cur
 	return result.Msgs, result.GetUpdatesBuf, nil
 }
 
+// stripMarkdown converts common markdown to plain text suitable for WeChat.
+// WeChat does not render markdown, so we strip formatting characters.
+func stripMarkdown(text string) string {
+	// Remove code fences.
+	text = strings.ReplaceAll(text, "```", "")
+	// Remove bold/italic markers.
+	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "__", "")
+	// Remove inline code.
+	text = strings.ReplaceAll(text, "`", "")
+	// Convert ATX headings (# Foo → Foo).
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, "#")
+		if len(trimmed) < len(line) && (len(trimmed) == 0 || trimmed[0] == ' ') {
+			lines[i] = strings.TrimSpace(trimmed)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // handleMessage processes a single inbound message.
 func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg, dispatch DispatchFunc) error {
-	// Only handle user messages (message_type=1).
+	// message_type=1: user message (text or mixed with images)
+	// message_type=2: bot-sent message — ignore
 	if msg.MessageType != 1 {
 		return nil
 	}
 
-	// Extract text from item_list.
 	var text string
+	var attachments []Attachment
+
 	for _, item := range msg.ItemList {
-		if item.Type == 1 && item.TextItem.Text != "" {
-			text = strings.TrimSpace(item.TextItem.Text)
-			break
+		switch item.Type {
+		case 1: // text
+			if item.TextItem.Text != "" && text == "" {
+				text = strings.TrimSpace(item.TextItem.Text)
+			}
+		case 2: // image
+			path, err := w.downloadWeixinCDNImage(ctx, item.ImageItem)
+			if err != nil {
+				w.log.Warn("weixin: image download/decrypt failed", "err", err)
+			} else if path != "" {
+				attachments = append(attachments, Attachment{
+					Path:     path,
+					MimeType: mimeFromPath(path),
+					AltText:  "[图片]",
+				})
+			}
 		}
 	}
-	if text == "" {
+
+	if text == "" && len(attachments) == 0 {
 		return nil
 	}
 
 	// Store session for reply.
 	w.mu.Lock()
 	if len(w.sessions) >= maxSessions {
-		// Evict half the map to amortise the cost of eviction.
 		n := len(w.sessions) / 2
 		for k := range w.sessions {
 			delete(w.sessions, k)
@@ -554,6 +741,7 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 	w.log.Info("weixin: message received",
 		"from", msg.FromUserID,
 		"text", text,
+		"images", len(attachments),
 	)
 
 	inbound := InboundMessage{
@@ -565,6 +753,7 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 		Username:    msg.FromUserID,
 		Text:        text,
 		Timestamp:   time.Now(),
+		Attachments: attachments,
 	}
 
 	ticket, _ := w.getTypingTicket(ctx, msg.FromUserID, msg.ContextToken)

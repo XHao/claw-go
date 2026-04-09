@@ -4,10 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -102,7 +107,7 @@ type antMessage struct {
 }
 
 // antContentBlock is a single content block inside an Anthropic message.
-// Used for text, tool_use, tool_result, and thinking blocks.
+// Used for text, tool_use, tool_result, thinking, and image blocks.
 type antContentBlock struct {
 	Type string `json:"type"`
 
@@ -118,6 +123,18 @@ type antContentBlock struct {
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Content   string `json:"content,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
+
+	// type=image
+	Source *antImageSource `json:"source,omitempty"`
+}
+
+// antImageSource is the source descriptor for an image content block.
+// Type "base64" is used now; "file" (with FileID) is the Files API upgrade path.
+type antImageSource struct {
+	Type      string `json:"type"`                 // "base64" | "file"
+	MediaType string `json:"media_type,omitempty"` // required for type=base64
+	Data      string `json:"data,omitempty"`       // base64-encoded bytes, for type=base64
+	FileID    string `json:"file_id,omitempty"`    // for type=file (future Files API)
 }
 
 // antTool is the Anthropic tool definition wire format.
@@ -231,13 +248,36 @@ func convertMessages(messages []Message) []antMessage {
 
 		default: // "user"
 			content := m.Content
-			if content == "" {
+			if content == "" && len(m.ImagePaths) == 0 {
 				content = "(empty)"
 			}
-			out = append(out, antMessage{
-				Role:    m.Role,
-				Content: []antContentBlock{{Type: "text", Text: content}},
-			})
+
+			if len(m.ImagePaths) > 0 {
+				// Multi-part message: image blocks first, then text.
+				var blocks []antContentBlock
+				for _, imgPath := range m.ImagePaths {
+					block, err := imageBlockFromFile(imgPath)
+					if err != nil {
+						// Single image failure is non-fatal — skip this image.
+						slog.Warn("anthropic: failed to encode image, skipping", "path", imgPath, "err", err)
+						continue
+					}
+					blocks = append(blocks, block)
+				}
+				if content != "" {
+					blocks = append(blocks, antContentBlock{Type: "text", Text: content})
+				}
+				if len(blocks) == 0 {
+					// All images failed and no text — send placeholder.
+					blocks = []antContentBlock{{Type: "text", Text: "(empty)"}}
+				}
+				out = append(out, antMessage{Role: "user", Content: blocks})
+			} else {
+				out = append(out, antMessage{
+					Role:    m.Role,
+					Content: []antContentBlock{{Type: "text", Text: content}},
+				})
+			}
 		}
 	}
 	return out
@@ -559,5 +599,31 @@ func (p *AnthropicProvider) readSSE(body io.Reader, streamFn StreamFunc) (Comple
 		StopReason: stopReason,
 		Usage:      usage,
 		Model:      ModelMeta{Model: p.model},
+	}, nil
+}
+
+// imageBlockFromFile reads a local image file and returns an Anthropic image
+// content block with base64-encoded data.
+// This is the current implementation; swap to Files API upload here in future.
+func imageBlockFromFile(path string) (antContentBlock, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return antContentBlock{}, fmt.Errorf("read image %q: %w", path, err)
+	}
+	mediaType := mime.TypeByExtension(filepath.Ext(path))
+	if mediaType == "" {
+		mediaType = "image/jpeg" // safe fallback
+	}
+	// Strip parameters (e.g. "image/jpeg; charset=...") — Anthropic wants bare type.
+	if idx := strings.Index(mediaType, ";"); idx != -1 {
+		mediaType = strings.TrimSpace(mediaType[:idx])
+	}
+	return antContentBlock{
+		Type: "image",
+		Source: &antImageSource{
+			Type:      "base64",
+			MediaType: mediaType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		},
 	}, nil
 }

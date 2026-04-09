@@ -1,13 +1,18 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,12 +38,7 @@ func TestWeixinHandleMessage_TextOnly(t *testing.T) {
 		FromUserID:   "alice@im.wechat",
 		MessageType:  1,
 		ContextToken: "ctx-abc",
-		ItemList: []struct {
-			Type     int `json:"type"`
-			TextItem struct {
-				Text string `json:"text"`
-			} `json:"text_item"`
-		}{
+		ItemList: []weixinMessageItem{
 			{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello world"}},
 		},
 	}
@@ -63,12 +63,7 @@ func TestWeixinHandleMessage_TextOnly(t *testing.T) {
 	botMsg := weixinInboundMsg{
 		FromUserID:  "bot@im.bot",
 		MessageType: 2,
-		ItemList: []struct {
-			Type     int `json:"type"`
-			TextItem struct {
-				Text string `json:"text"`
-			} `json:"text_item"`
-		}{
+		ItemList: []weixinMessageItem{
 			{Type: 1, TextItem: struct{ Text string `json:"text"` }{"I am bot"}},
 		},
 	}
@@ -332,12 +327,7 @@ func TestWeixinHandleMessage_TrimsTextContent(t *testing.T) {
 		FromUserID:   "user@im.wechat",
 		MessageType:  1,
 		ContextToken: "ctx",
-		ItemList: []struct {
-			Type     int `json:"type"`
-			TextItem struct {
-				Text string `json:"text"`
-			} `json:"text_item"`
-		}{
+		ItemList: []weixinMessageItem{
 			{Type: 1, TextItem: struct{ Text string `json:"text"` }{"  hello  "}},
 		},
 	}
@@ -398,12 +388,7 @@ func TestWeixinSessions_BoundedGrowth(t *testing.T) {
 			FromUserID:   fmt.Sprintf("user-%d", i),
 			MessageType:  1,
 			ContextToken: fmt.Sprintf("ctx-%d", i),
-			ItemList: []struct {
-				Type     int `json:"type"`
-				TextItem struct {
-					Text string `json:"text"`
-				} `json:"text_item"`
-			}{
+			ItemList: []weixinMessageItem{
 				{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello"}},
 			},
 		}
@@ -470,10 +455,9 @@ func TestWeixinTyping_SkipsWhenTicketEmpty(t *testing.T) {
 
 	msg := weixinInboundMsg{
 		FromUserID: "user@im.wechat", MessageType: 1, ContextToken: "ctx",
-		ItemList: []struct {
-			Type     int `json:"type"`
-			TextItem struct{ Text string `json:"text"` } `json:"text_item"`
-		}{{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello"}}},
+		ItemList: []weixinMessageItem{
+			{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello"}},
+		},
 	}
 	if err := ch.handleMessage(context.Background(), msg, dispatch); err != nil {
 		t.Fatalf("handleMessage error: %v", err)
@@ -511,10 +495,9 @@ func TestWeixinHandleMessage_SendsTypingOnDispatch(t *testing.T) {
 
 	msg := weixinInboundMsg{
 		FromUserID: "user@im.wechat", MessageType: 1, ContextToken: "ctx",
-		ItemList: []struct {
-			Type     int `json:"type"`
-			TextItem struct{ Text string `json:"text"` } `json:"text_item"`
-		}{{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello"}}},
+		ItemList: []weixinMessageItem{
+			{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello"}},
+		},
 	}
 	ch.handleMessage(context.Background(), msg, dispatch)
 
@@ -572,5 +555,134 @@ func TestWeixinSend_CancelsTypingAfterReply(t *testing.T) {
 
 	if len(statuses) != 1 || statuses[0] != 2 {
 		t.Errorf("expected typing cancel (status=2), got %v", statuses)
+	}
+}
+
+func TestDecryptAES128ECB(t *testing.T) {
+	key := make([]byte, 16)
+	plaintext := []byte("hello world!!!!!")
+
+	// Encrypt using Go's aes package to create the test vector.
+	block, _ := aes.NewCipher(key)
+	ciphertext := make([]byte, 16)
+	block.Encrypt(ciphertext, plaintext)
+	// Add PKCS7 padding block (full block of 0x10).
+	padBlock := bytes.Repeat([]byte{0x10}, 16)
+	ciphertext = append(ciphertext, padBlock...)
+	// Encrypt the pad block too.
+	block.Encrypt(ciphertext[16:], padBlock)
+
+	got, err := decryptAES128ECB(ciphertext, key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "hello world!!!!!" {
+		t.Fatalf("got %q, want %q", got, "hello world!!!!!")
+	}
+}
+
+func TestParseWeixinAESKey(t *testing.T) {
+	raw := make([]byte, 16)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+
+	// Case 1: base64(raw 16 bytes)
+	b64 := base64.StdEncoding.EncodeToString(raw)
+	got, err := parseWeixinAESKey(b64)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("case1 failed: err=%v got=%x", err, got)
+	}
+
+	// Case 2: hex string (32 chars)
+	hexStr := hex.EncodeToString(raw)
+	got, err = parseWeixinAESKey(hexStr)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("case2 failed: err=%v got=%x", err, got)
+	}
+
+	// Case 3: base64(hex string)
+	b64hex := base64.StdEncoding.EncodeToString([]byte(hexStr))
+	got, err = parseWeixinAESKey(b64hex)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("case3 failed: err=%v got=%x", err, got)
+	}
+}
+
+func TestStripMarkdown(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"# Hello\nworld", "Hello\nworld"},
+		{"**bold** text", "bold text"},
+		{"```\ncode\n```", "\ncode\n"},
+		{"`inline`", "inline"},
+		{"plain text", "plain text"},
+	}
+	for _, c := range cases {
+		got := stripMarkdown(c.in)
+		if got != c.want {
+			t.Errorf("stripMarkdown(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDownloadWeixinCDNImage_RoundTrip(t *testing.T) {
+	// 8-byte PNG magic as plaintext.
+	plaintext := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52}
+
+	// AES-128-ECB encrypt with PKCS7 padding.
+	key := make([]byte, 16)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PKCS7 pad to next 16-byte boundary.
+	padLen := 16 - (len(plaintext) % 16)
+	padded := append(plaintext, bytes.Repeat([]byte{byte(padLen)}, padLen)...)
+	ciphertext := make([]byte, len(padded))
+	for i := 0; i < len(padded); i += 16 {
+		block.Encrypt(ciphertext[i:i+16], padded[i:i+16])
+	}
+
+	// Serve encrypted bytes from mock CDN.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(ciphertext)
+	}))
+	defer srv.Close()
+
+	// Build a WeixinChannel pointing at the mock server.
+	ch := NewWeixinChannel("test", filepath.Join(t.TempDir(), "tok.json"), nil)
+	ch.baseURL = srv.URL
+
+	// Build image item with hex-encoded key and the mock server's encrypt_query_param.
+	item := &weixinImageItem{
+		AESKey: hex.EncodeToString(key),
+		Media: &weixinCDNMedia{
+			EncryptQueryParam: "fake-param",
+		},
+	}
+
+	path, err := ch.downloadWeixinCDNImage(context.Background(), item)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected non-empty path")
+	}
+	defer os.Remove(path)
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read temp file: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("content mismatch: got %x, want %x", got, plaintext)
+	}
+	// Verify extension is .png (magic bytes match PNG).
+	if !strings.HasSuffix(path, ".png") {
+		t.Errorf("expected .png extension, got %q", path)
 	}
 }

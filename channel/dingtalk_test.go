@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func TestDingTalkHandleCallback_NonTextIgnored(t *testing.T) {
 	}
 
 	msg := dingTalkMessage{
-		MsgType:        "image",
+		MsgType:        "audio",
 		ConversationID: "conv-002",
 		SessionWebhook: "https://example.com/webhook",
 	}
@@ -758,4 +759,63 @@ func TestDingTalkMarkdownTableFix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDingTalkHandleCallback_PictureMessage(t *testing.T) {
+	// Serve a fake 1-byte image.
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte{0xff})
+	}))
+	defer imgSrv.Close()
+
+	ch := NewDingTalkChannel("test", "key", "secret", nil)
+
+	var mu sync.Mutex
+	var dispatched []InboundMessage
+	dispatch := func(_ context.Context, msg InboundMessage) {
+		mu.Lock()
+		dispatched = append(dispatched, msg)
+		mu.Unlock()
+	}
+
+	msg := dingTalkMessage{
+		MsgID:          "pic-001",
+		MsgType:        "picture",
+		ConversationID: "conv-pic",
+		SenderNick:     "Alice",
+		SessionWebhook: "https://example.com/webhook",
+	}
+	msg.Picture.PictureURL = imgSrv.URL + "/img.jpg"
+	data, _ := json.Marshal(msg)
+	frame := streamFrame{
+		Type:    "CALLBACK",
+		Headers: map[string]string{"topic": topicRobot, "messageId": "msg-pic-001"},
+		Data:    string(data),
+	}
+	if err := ch.handleCallbackWithAck(context.Background(), func(streamAck) {}, frame, dispatch); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dispatched) != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", len(dispatched))
+	}
+	if len(dispatched[0].Attachments) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(dispatched[0].Attachments))
+	}
+	att := dispatched[0].Attachments[0]
+	if att.MimeType != "image/jpeg" {
+		t.Errorf("mime: got %q, want image/jpeg", att.MimeType)
+	}
+	if att.Path == "" {
+		t.Fatal("attachment path must not be empty")
+	}
+	if _, err := os.Stat(att.Path); err != nil {
+		t.Errorf("attachment file does not exist: %v", err)
+	}
+	// Clean up temp file.
+	os.Remove(att.Path)
 }

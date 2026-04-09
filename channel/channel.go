@@ -4,10 +4,21 @@ package channel
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/XHao/claw-go/ipc"
 )
+
+// Attachment represents a downloaded media file attached to an inbound message.
+// Path is a local temporary file; the caller (agent.Dispatch) is responsible
+// for deleting it after the message has been fully processed.
+type Attachment struct {
+	Path     string // absolute path to local temp file
+	MimeType string // e.g. "image/jpeg", "image/png"
+	AltText  string // fallback text if image cannot be sent, e.g. "[图片]"
+}
 
 // InboundMessage is a normalised message received from any channel.
 type InboundMessage struct {
@@ -21,6 +32,7 @@ type InboundMessage struct {
 	Cwd         string // working directory reported by the client
 	MessageID   string
 	Timestamp   time.Time
+	Attachments []Attachment // downloaded media files; caller must clean up after dispatch
 }
 
 // OutboundMessage is a message to send through a channel.
@@ -68,4 +80,20 @@ type Status struct {
 	Name    string `json:"name"`
 	Running bool   `json:"running"`
 	Error   string `json:"error,omitempty"`
+}
+
+// mimeFromPath returns the MIME type for a file based on its extension.
+// Falls back to "image/jpeg" for unknown extensions.
+func mimeFromPath(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "image/jpeg"
+	}
 }

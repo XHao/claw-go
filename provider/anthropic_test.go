@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -358,5 +360,80 @@ func TestReadSSE_toolUse(t *testing.T) {
 	}
 	if tc.Function.Arguments != `{"command":"ls"}` {
 		t.Fatalf("arguments: got %q", tc.Function.Arguments)
+	}
+}
+
+func TestImageBlockFromFile_PNG(t *testing.T) {
+	// Minimal valid 1x1 red PNG (67 bytes).
+	pngBytes := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+		0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, // IDAT chunk
+		0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+		0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
+		0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, // IEND chunk
+		0x44, 0xae, 0x42, 0x60, 0x82,
+	}
+	f, err := os.CreateTemp("", "test-*.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Write(pngBytes)
+	f.Close()
+
+	block, err := imageBlockFromFile(f.Name())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if block.Type != "image" {
+		t.Fatalf("type: got %q, want %q", block.Type, "image")
+	}
+	if block.Source == nil {
+		t.Fatal("source is nil")
+	}
+	if block.Source.Type != "base64" {
+		t.Fatalf("source.type: got %q, want %q", block.Source.Type, "base64")
+	}
+	if block.Source.MediaType != "image/png" {
+		t.Fatalf("source.media_type: got %q, want %q", block.Source.MediaType, "image/png")
+	}
+	expected := base64.StdEncoding.EncodeToString(pngBytes)
+	if block.Source.Data != expected {
+		t.Fatalf("source.data mismatch")
+	}
+}
+
+func TestConvertMessages_WithImagePaths(t *testing.T) {
+	pngBytes := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a} // PNG header stub
+	f, err := os.CreateTemp("", "test-*.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Write(pngBytes)
+	f.Close()
+
+	msgs := []Message{
+		{Role: "user", Content: "describe this", ImagePaths: []string{f.Name()}},
+	}
+	out := convertMessages(msgs)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(out))
+	}
+	blocks, ok := out[0].Content.([]antContentBlock)
+	if !ok {
+		t.Fatalf("content is not []antContentBlock")
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks (image+text), got %d", len(blocks))
+	}
+	if blocks[0].Type != "image" {
+		t.Fatalf("first block type: got %q, want image", blocks[0].Type)
+	}
+	if blocks[1].Type != "text" || blocks[1].Text != "describe this" {
+		t.Fatalf("second block: got type=%q text=%q", blocks[1].Type, blocks[1].Text)
 	}
 }
