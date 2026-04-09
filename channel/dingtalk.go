@@ -940,8 +940,61 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 		"images", len(attachments),
 	)
 
-	go dispatch(ctx, inbound)
+	// Start webhook keepalive to prevent the sessionWebhook from expiring
+	// during long AI processing tasks.
+	d.mu.RLock()
+	sess, hasSess := d.sessions[sessionKey]
+	d.mu.RUnlock()
+	if hasSess && sess.webhookURL != "" {
+		keepaliveCtx, cancelKeepalive := context.WithCancel(ctx)
+		d.startWebhookKeepalive(keepaliveCtx, sess.webhookURL)
+		go func() {
+			dispatch(ctx, inbound)
+			cancelKeepalive()
+		}()
+	} else {
+		go dispatch(ctx, inbound)
+	}
 	return nil
+}
+
+// startWebhookKeepalive sends a periodic typing indicator to the sessionWebhook
+// to prevent it from expiring (DingTalk webhooks expire after ~60 seconds).
+// The goroutine stops when ctx is cancelled.
+// Call this when starting to process a message; cancel the ctx when done.
+func (d *DingTalkChannel) startWebhookKeepalive(ctx context.Context, webhookURL string) {
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				token, err := d.getAccessToken(ctx)
+				if err != nil {
+					return
+				}
+				body := mustMarshal(map[string]any{
+					"msgtype": "text",
+					"text":    map[string]string{"content": "⏳"},
+					"at":      map[string]bool{"isAtAll": false},
+				})
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
+				if err != nil {
+					return
+				}
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("x-acs-dingtalk-access-token", token)
+				resp, err := d.httpClient.Do(req)
+				if err != nil {
+					return
+				}
+				resp.Body.Close()
+				d.log.Debug("dingtalk: webhook keepalive sent", "webhook", webhookURL[:min(len(webhookURL), 60)])
+			}
+		}
+	}()
 }
 
 // dingTalkMessage is the JSON payload inside a robot CALLBACK frame.

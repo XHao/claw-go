@@ -466,13 +466,20 @@ type weixinInboundMsg struct {
 	ItemList     []weixinMessageItem `json:"item_list"`
 }
 
+// weixinRefMessage is a quoted/referenced message in a WeChat item.
+type weixinRefMessage struct {
+	Title       string             `json:"title"`        // summary/title of the quoted message
+	MessageItem *weixinMessageItem `json:"message_item"` // the quoted message item (recursive)
+}
+
 // weixinMessageItem is a single item in the item_list of a WeChat message.
 type weixinMessageItem struct {
 	Type     int `json:"type"` // 1=text, 2=image, 4=voice, 6=file
 	TextItem struct {
 		Text string `json:"text"`
 	} `json:"text_item"`
-	ImageItem *weixinImageItem `json:"image_item"`
+	ImageItem *weixinImageItem  `json:"image_item"`
+	RefMsg    *weixinRefMessage `json:"ref_msg"` // quoted message, if present
 }
 
 // weixinImageItem holds CDN reference and AES key for a WeChat image.
@@ -664,6 +671,27 @@ func (w *WeixinChannel) getUpdates(ctx context.Context, client *http.Client, cur
 	return result.Msgs, result.GetUpdatesBuf, nil
 }
 
+// extractRefText extracts displayable text from a ref_msg for context.
+// Returns empty string if there is nothing useful to show.
+func extractRefText(ref *weixinRefMessage) string {
+	if ref == nil {
+		return ""
+	}
+	var parts []string
+	if ref.Title != "" {
+		parts = append(parts, ref.Title)
+	}
+	if ref.MessageItem != nil && ref.MessageItem.Type == 1 {
+		if t := strings.TrimSpace(ref.MessageItem.TextItem.Text); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "[引用: " + strings.Join(parts, " | ") + "]"
+}
+
 // stripMarkdown converts common markdown to plain text suitable for WeChat.
 // WeChat does not render markdown, so we strip formatting characters.
 func stripMarkdown(text string) string {
@@ -700,7 +728,12 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 		switch item.Type {
 		case 1: // text
 			if item.TextItem.Text != "" && text == "" {
-				text = strings.TrimSpace(item.TextItem.Text)
+				userText := strings.TrimSpace(item.TextItem.Text)
+				if refText := extractRefText(item.RefMsg); refText != "" {
+					text = refText + "\n" + userText
+				} else {
+					text = userText
+				}
 			}
 		case 2: // image
 			path, err := w.downloadWeixinCDNImage(ctx, item.ImageItem)

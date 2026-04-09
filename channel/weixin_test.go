@@ -625,6 +625,79 @@ func TestStripMarkdown(t *testing.T) {
 	}
 }
 
+func TestExtractRefText_WithTitleAndBody(t *testing.T) {
+	ref := &weixinRefMessage{
+		Title: "摘要",
+		MessageItem: &weixinMessageItem{
+			Type:     1,
+			TextItem: struct{ Text string `json:"text"` }{"原文内容"},
+		},
+	}
+	got := extractRefText(ref)
+	want := "[引用: 摘要 | 原文内容]"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractRefText_TitleOnly(t *testing.T) {
+	ref := &weixinRefMessage{Title: "只有标题"}
+	got := extractRefText(ref)
+	want := "[引用: 只有标题]"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractRefText_Nil(t *testing.T) {
+	if got := extractRefText(nil); got != "" {
+		t.Errorf("expected empty for nil ref, got %q", got)
+	}
+}
+
+func TestHandleMessage_WithRefMsg(t *testing.T) {
+	ch := NewWeixinChannel("test", filepath.Join(t.TempDir(), "tok.json"), nil)
+	ch.baseURL = "http://localhost" // not used in this test
+
+	var mu sync.Mutex
+	var dispatched []InboundMessage
+	dispatch := func(_ context.Context, msg InboundMessage) {
+		mu.Lock()
+		dispatched = append(dispatched, msg)
+		mu.Unlock()
+	}
+
+	msg := weixinInboundMsg{
+		FromUserID:  "user1",
+		MessageType: 1,
+		ItemList: []weixinMessageItem{
+			{
+				Type:     1,
+				TextItem: struct{ Text string `json:"text"` }{"这是回复"},
+				RefMsg: &weixinRefMessage{
+					Title: "被引用的消息",
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	if err := ch.handleMessage(ctx, msg, dispatch); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dispatched) != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", len(dispatched))
+	}
+	want := "[引用: 被引用的消息]\n这是回复"
+	if dispatched[0].Text != want {
+		t.Errorf("text: got %q, want %q", dispatched[0].Text, want)
+	}
+}
+
 func TestDownloadWeixinCDNImage_RoundTrip(t *testing.T) {
 	// 8-byte PNG magic as plaintext.
 	plaintext := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52}

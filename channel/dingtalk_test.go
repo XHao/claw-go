@@ -819,3 +819,41 @@ func TestDingTalkHandleCallback_PictureMessage(t *testing.T) {
 	// Clean up temp file.
 	os.Remove(att.Path)
 }
+
+func TestDingTalkWebhookKeepalive_StopsOnContextCancel(t *testing.T) {
+	var keepaliveCount int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keepaliveCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Mock token server.
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"accessToken": "test-token",
+			"expireIn":    7200,
+		})
+	}))
+	defer tokenSrv.Close()
+
+	ch := NewDingTalkChannel("test", "key", "secret", nil)
+	ch.tokenURL = tokenSrv.URL
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch.startWebhookKeepalive(ctx, srv.URL)
+
+	// Cancel quickly — no keepalive should have fired yet.
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	count := keepaliveCount
+	mu.Unlock()
+	if count != 0 {
+		t.Errorf("expected 0 keepalive calls after immediate cancel, got %d", count)
+	}
+}
