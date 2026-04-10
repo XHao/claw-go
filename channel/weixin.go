@@ -69,6 +69,12 @@ type weixinTypingEntry struct {
 	fetchedAt time.Time
 }
 
+// typingFlight represents an in-flight typing ticket fetch for one user.
+type typingFlight struct {
+	done   chan struct{}
+	ticket string
+}
+
 // WeixinChannel implements Channel using WeChat's iLink Bot API.
 type WeixinChannel struct {
 	id              string
@@ -86,10 +92,11 @@ type WeixinChannel struct {
 	mu       sync.RWMutex
 	sessions map[string]weixinSession // key = from_user_id
 
-	// typingMu guards typingTickets and typingActive.
-	typingMu      sync.Mutex
-	typingTickets map[string]*weixinTypingEntry // key = fromUserID, TTL 24h
-	typingActive  map[string]string             // key = fromUserID, value = ticket
+	// typingMu guards typingTickets, typingActive, and typingInFlight.
+	typingMu        sync.Mutex
+	typingTickets   map[string]*weixinTypingEntry // key = fromUserID, TTL 24h
+	typingActive    map[string]string             // key = fromUserID, value = ticket
+	typingInFlight  map[string]*typingFlight      // key = fromUserID, singleflight dedup
 }
 
 // NewWeixinChannel creates a WeixinChannel.
@@ -104,9 +111,10 @@ func NewWeixinChannel(id, tokenFile string, log *slog.Logger) *WeixinChannel {
 		log:             log,
 		httpClient:      &http.Client{Timeout: 15 * time.Second},
 		mediaHTTPClient: &http.Client{Timeout: 60 * time.Second}, // CDN image downloads can be large
-		sessions:        make(map[string]weixinSession),
-		typingTickets:   make(map[string]*weixinTypingEntry),
-		typingActive:    make(map[string]string),
+		sessions:       make(map[string]weixinSession),
+		typingTickets:  make(map[string]*weixinTypingEntry),
+		typingActive:   make(map[string]string),
+		typingInFlight: make(map[string]*typingFlight),
 	}
 }
 
@@ -355,51 +363,70 @@ const weixinTypingTicketTTL = 24 * time.Hour
 // getTypingTicket returns the cached typing_ticket for a user, fetching it
 // from /ilink/bot/getconfig if the cache is empty or expired.
 // Returns ("", nil) on any error — callers must treat empty ticket as "skip typing".
-// The typingMu lock is NOT held across the HTTP call to avoid blocking other
-// users while one user's ticket fetch is in-flight.
+// Uses singleflight deduplication so concurrent callers for the same user share
+// one HTTP request instead of each issuing their own.
 func (w *WeixinChannel) getTypingTicket(ctx context.Context, fromUserID, contextToken string) (string, error) {
 	w.typingMu.Lock()
-	entry := w.typingTickets[fromUserID]
-	if entry != nil && time.Since(entry.fetchedAt) < weixinTypingTicketTTL {
+	// Fast path: valid cached entry.
+	if entry := w.typingTickets[fromUserID]; entry != nil && time.Since(entry.fetchedAt) < weixinTypingTicketTTL {
 		ticket := entry.ticket
 		w.typingMu.Unlock()
 		return ticket, nil
 	}
+	// Singleflight: if a fetch is already in progress for this user, wait for it.
+	if flight, ok := w.typingInFlight[fromUserID]; ok {
+		w.typingMu.Unlock()
+		<-flight.done
+		return flight.ticket, nil
+	}
+	// Start a new fetch; register the in-flight entry so other goroutines wait.
+	flight := &typingFlight{done: make(chan struct{})}
+	w.typingInFlight[fromUserID] = flight
 	w.typingMu.Unlock()
 
 	// Fetch outside the lock so concurrent users are not serialized.
-	body := mustMarshal(map[string]any{
-		"ilink_user_id": fromUserID,
-		"context_token": contextToken,
-		"base_info":     map[string]string{"channel_version": "1.0.2"},
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/ilink/bot/getconfig", bytes.NewReader(body))
-	if err != nil {
-		return "", nil
-	}
-	w.setHeaders(req)
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return "", nil
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var ticket string
+	func() {
+		body := mustMarshal(map[string]any{
+			"ilink_user_id": fromUserID,
+			"context_token": contextToken,
+			"base_info":     map[string]string{"channel_version": "1.0.2"},
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/ilink/bot/getconfig", bytes.NewReader(body))
+		if err != nil {
+			return
+		}
+		w.setHeaders(req)
+		resp, err := w.httpClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		var result struct {
+			Ret          int    `json:"ret"`
+			TypingTicket string `json:"typing_ticket"`
+		}
+		if err := json.Unmarshal(respBody, &result); err != nil || result.Ret != 0 {
+			return
+		}
+		ticket = result.TypingTicket
+	}()
 
-	var result struct {
-		Ret          int    `json:"ret"`
-		TypingTicket string `json:"typing_ticket"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil || result.Ret != 0 {
-		return "", nil
-	}
-
+	// Store result and notify waiters.
 	w.typingMu.Lock()
-	w.typingTickets[fromUserID] = &weixinTypingEntry{
-		ticket:    result.TypingTicket,
-		fetchedAt: time.Now(),
+	if ticket != "" {
+		w.typingTickets[fromUserID] = &weixinTypingEntry{
+			ticket:    ticket,
+			fetchedAt: time.Now(),
+		}
 	}
+	flight.ticket = ticket
+	delete(w.typingInFlight, fromUserID)
+	close(flight.done)
 	w.typingMu.Unlock()
-	return result.TypingTicket, nil
+
+	return ticket, nil
 }
 
 // sendTyping sends a typing indicator to a user.
@@ -757,12 +784,15 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 	w.mu.Lock()
 	if len(w.sessions) >= maxSessions {
 		n := len(w.sessions) / 2
+		toDelete := make([]string, 0, n)
 		for k := range w.sessions {
-			delete(w.sessions, k)
-			n--
-			if n == 0 {
+			toDelete = append(toDelete, k)
+			if len(toDelete) == n {
 				break
 			}
+		}
+		for _, k := range toDelete {
+			delete(w.sessions, k)
 		}
 	}
 	w.sessions[msg.FromUserID] = weixinSession{
@@ -797,7 +827,14 @@ func (w *WeixinChannel) handleMessage(ctx context.Context, msg weixinInboundMsg,
 		w.sendTyping(ctx, msg.FromUserID, ticket, 1)
 	}
 
-	go dispatch(ctx, inbound)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				w.log.Error("weixin: dispatch panic recovered", "panic", r)
+			}
+		}()
+		dispatch(ctx, inbound)
+	}()
 	return nil
 }
 

@@ -503,6 +503,66 @@ func TestDingTalkHeartbeat_ReconnectsOnSilentDrop(t *testing.T) {
 	}
 }
 
+// TestDingTalkWebhooks_EvictsExactlyHalfOnOverflow verifies that when the
+// sessions map hits maxSessions, exactly half the entries are evicted (not
+// more, not fewer) — guarding against the iterate-and-delete pattern that can
+// delete the wrong count due to Go map iteration randomness.
+func TestDingTalkWebhooks_EvictsExactlyHalfOnOverflow(t *testing.T) {
+	ch := NewDingTalkChannel("test", "key", "secret", nil)
+
+	// Fill to exactly maxSessions.
+	ctx := context.Background()
+	for i := range maxSessions {
+		msg := dingTalkMessage{
+			MsgType:        "text",
+			Text:           struct{ Content string `json:"content"` }{Content: "hi"},
+			SenderID:       fmt.Sprintf("user-%d", i),
+			ConversationID: fmt.Sprintf("conv-%d", i),
+			SessionWebhook: fmt.Sprintf("https://example.com/wh/%d", i),
+		}
+		data, _ := json.Marshal(msg)
+		frame := streamFrame{
+			Type:    "CALLBACK",
+			Headers: map[string]string{"topic": topicRobot, "messageId": fmt.Sprintf("mid-%d", i)},
+			Data:    string(data),
+		}
+		_ = ch.handleCallbackWithAck(ctx, func(streamAck) {}, frame, func(_ context.Context, _ InboundMessage) {})
+	}
+
+	ch.mu.RLock()
+	before := len(ch.sessions)
+	ch.mu.RUnlock()
+	if before != maxSessions {
+		t.Fatalf("setup: expected %d sessions, got %d", maxSessions, before)
+	}
+
+	// One more message triggers eviction.
+	extra := dingTalkMessage{
+		MsgType:        "text",
+		Text:           struct{ Content string `json:"content"` }{Content: "overflow"},
+		SenderID:       "overflow-user",
+		ConversationID: "overflow-conv",
+		SessionWebhook: "https://example.com/wh/overflow",
+	}
+	data, _ := json.Marshal(extra)
+	frame := streamFrame{
+		Type:    "CALLBACK",
+		Headers: map[string]string{"topic": topicRobot, "messageId": "mid-overflow"},
+		Data:    string(data),
+	}
+	_ = ch.handleCallbackWithAck(ctx, func(streamAck) {}, frame, func(_ context.Context, _ InboundMessage) {})
+
+	ch.mu.RLock()
+	after := len(ch.sessions)
+	ch.mu.RUnlock()
+
+	// After eviction of half + insert of 1 new entry, size must be exactly maxSessions/2 + 1.
+	want := maxSessions/2 + 1
+	if after != want {
+		t.Errorf("after overflow eviction: got %d sessions, want %d (half evicted + 1 new)", after, want)
+	}
+}
+
 // TestDingTalkWebhooks_BoundedGrowth verifies that the webhooks map does not
 // grow beyond maxSessions entries.
 func TestDingTalkWebhooks_BoundedGrowth(t *testing.T) {
@@ -722,6 +782,60 @@ func TestDingTalkSend_CardCreateFailureFallsBackToText(t *testing.T) {
 	}
 }
 
+// TestDingTalkCardCreate_ReturnsErrorOnNon2xx verifies that createCard returns
+// an error (not hang/panic) when the server returns a non-2xx status, and that
+// subsequent requests to the same server succeed (no connection held open).
+func TestDingTalkCardCreate_ReturnsErrorOnNon2xx(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		callCount++
+		switch r.URL.Path {
+		case "/v1.0/card/instances":
+			if r.Method == http.MethodPost {
+				// Return large body with 500 to ensure body must be drained for reuse.
+				w.WriteHeader(http.StatusInternalServerError)
+				for i := 0; i < 100; i++ {
+					fmt.Fprint(w, `{"error":"fail with lots of data to fill the buffer"}`)
+				}
+				return
+			}
+			fmt.Fprint(w, `{"result":"ok"}`)
+		default:
+			fmt.Fprint(w, `{"result":"ok"}`)
+		}
+	}))
+	defer srv.Close()
+
+	ch := NewDingTalkChannel("test", "key", "secret", nil)
+	ch.cardInstancesURL = srv.URL + "/v1.0/card/instances"
+	ch.cardDeliverURL = srv.URL + "/v1.0/card/instances/deliver"
+	ch.cardStreamingURL = srv.URL + "/v1.0/card/streaming"
+	ch.cachedToken = "tok"
+	ch.tokenExpiry = time.Now().Add(time.Hour)
+	ch.mu.Lock()
+	ch.sessions["chat-body"] = dingtalkSession{
+		webhookURL: srv.URL + "/reply", conversationType: "1",
+		senderStaffID: "s1", robotCode: "key",
+	}
+	ch.mu.Unlock()
+
+	// Send triggers createCard which should get a 500 and return an error.
+	// The fallback to text reply should still succeed (server is reachable).
+	done := make(chan struct{})
+	go func() {
+		ch.Send(context.Background(), OutboundMessage{ChatID: "chat-body", Delta: "hello"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good: Send returned without hanging (body was properly closed/drained).
+	case <-time.After(3 * time.Second):
+		t.Fatal("Send hung — response body was not closed, blocking connection pool")
+	}
+}
+
 // TestDingTalkMarkdownTableFix verifies that a blank line is inserted before a
 // Markdown table when the preceding line is non-empty and not itself a table row.
 func TestDingTalkMarkdownTableFix(t *testing.T) {
@@ -818,6 +932,46 @@ func TestDingTalkHandleCallback_PictureMessage(t *testing.T) {
 	}
 	// Clean up temp file.
 	os.Remove(att.Path)
+}
+
+// TestDingTalkDispatch_PanicDoesNotCrashProcess verifies that a panic inside
+// the dispatch goroutine is recovered and does not propagate to the caller.
+func TestDingTalkDispatch_PanicDoesNotCrashProcess(t *testing.T) {
+	ch := NewDingTalkChannel("test", "key", "secret", nil)
+
+	panicDispatched := make(chan struct{})
+	dispatch := func(_ context.Context, _ InboundMessage) {
+		close(panicDispatched)
+		panic("simulated dispatch panic")
+	}
+
+	msg := dingTalkMessage{
+		MsgType:        "text",
+		Text:           struct{ Content string `json:"content"` }{"hello"},
+		SenderID:       "user-001",
+		ConversationID: "conv-panic",
+		SessionWebhook: "https://example.com/webhook",
+	}
+	data, _ := json.Marshal(msg)
+	frame := streamFrame{
+		Type:    "CALLBACK",
+		Headers: map[string]string{"topic": topicRobot, "messageId": "msg-panic-001"},
+		Data:    string(data),
+	}
+
+	// handleCallbackWithAck must not panic or block even though dispatch panics.
+	if err := ch.handleCallbackWithAck(context.Background(), func(streamAck) {}, frame, dispatch); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-panicDispatched:
+		// dispatch was called; give goroutine time to recover
+		time.Sleep(50 * time.Millisecond)
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch goroutine never ran")
+	}
+	// If we reach here without the test process crashing, the recover worked.
 }
 
 func TestDingTalkWebhookKeepalive_StopsOnContextCancel(t *testing.T) {

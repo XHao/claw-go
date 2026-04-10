@@ -377,7 +377,7 @@ func (d *DingTalkChannel) createCard(ctx context.Context, chatID string, sess di
 	if err != nil {
 		return "", fmt.Errorf("card create: %w", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("card create status %d", resp.StatusCode)
 	}
@@ -421,7 +421,7 @@ func (d *DingTalkChannel) createCard(ctx context.Context, chatID string, sess di
 	if err != nil {
 		return "", fmt.Errorf("card deliver: %w", err)
 	}
-	resp2.Body.Close()
+	defer resp2.Body.Close()
 	if resp2.StatusCode >= 300 {
 		return "", fmt.Errorf("card deliver status %d", resp2.StatusCode)
 	}
@@ -474,7 +474,7 @@ func (d *DingTalkChannel) streamCard(ctx context.Context, card *dingtalkCard, co
 		if err != nil {
 			return fmt.Errorf("card inputing: %w", err)
 		}
-		resp.Body.Close()
+		resp.Body.Close() // intentional non-defer: card.started must be set after this block exits
 		card.started = true
 	}
 
@@ -594,6 +594,12 @@ func (d *DingTalkChannel) runOnce(ctx context.Context, dispatch DispatchFunc) er
 	// Step 3: Read frames until error or ctx cancellation.
 	errCh := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				d.log.Error("dingtalk: frame reader panic recovered", "panic", r)
+				errCh <- fmt.Errorf("frame reader panic: %v", r)
+			}
+		}()
 		for {
 			var frame streamFrame
 			if err := websocket.JSON.Receive(ws, &frame); err != nil {
@@ -840,12 +846,15 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 		d.mu.Lock()
 		if len(d.sessions) >= maxSessions {
 			n := len(d.sessions) / 2
+			toDelete := make([]string, 0, n)
 			for k := range d.sessions {
-				delete(d.sessions, k)
-				n--
-				if n == 0 {
+				toDelete = append(toDelete, k)
+				if len(toDelete) == n {
 					break
 				}
+			}
+			for _, k := range toDelete {
+				delete(d.sessions, k)
 			}
 		}
 		robotCode := msg.RobotCode
@@ -949,11 +958,23 @@ func (d *DingTalkChannel) handleCallbackWithAck(ctx context.Context, sendAck fun
 		keepaliveCtx, cancelKeepalive := context.WithCancel(ctx)
 		d.startWebhookKeepalive(keepaliveCtx, sess.webhookURL)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					d.log.Error("dingtalk: dispatch panic recovered", "panic", r)
+				}
+				cancelKeepalive()
+			}()
 			dispatch(ctx, inbound)
-			cancelKeepalive()
 		}()
 	} else {
-		go dispatch(ctx, inbound)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					d.log.Error("dingtalk: dispatch panic recovered", "panic", r)
+				}
+			}()
+			dispatch(ctx, inbound)
+		}()
 	}
 	return nil
 }

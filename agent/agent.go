@@ -46,6 +46,7 @@ type normalizedToolMessage struct {
 type Agent struct {
 	provider          provider.Provider
 	sessions          *session.Store
+	channelsMu        sync.RWMutex
 	channels          map[string]channel.Channel
 	maxIterations     int
 	memory            *memory.Manager            // optional; nil = memory disabled
@@ -97,7 +98,9 @@ func (a *Agent) SetExperienceStore(s *knowledge.ExperienceStore) {
 
 // RegisterChannel adds a channel so the agent can dispatch replies through it.
 func (a *Agent) RegisterChannel(ch channel.Channel) {
+	a.channelsMu.Lock()
 	a.channels[ch.ID()] = ch
+	a.channelsMu.Unlock()
 }
 
 func prepareMessagesForLLM(history []provider.Message, tools []provider.ToolDef) []provider.Message {
@@ -220,7 +223,9 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 		return
 	}
 
+	a.channelsMu.RLock()
 	ch := a.channels[msg.ChannelType+":"+msg.ChannelName]
+	a.channelsMu.RUnlock()
 	if ch != nil {
 		ctx = provider.WithUsageObserver(ctx, func(ev provider.UsageEvent) {
 			_ = ch.Send(ctx, channel.OutboundMessage{
@@ -721,12 +726,16 @@ func (a *Agent) saveTurnMemory(
 // /reset or session delete.
 func (a *Agent) clearAutoInjected(sessionKey string) {
 	prefix := sessionKey + ":"
+	var keys []any
 	a.autoInjected.Range(func(k, _ any) bool {
 		if strings.HasPrefix(k.(string), prefix) {
-			a.autoInjected.Delete(k)
+			keys = append(keys, k)
 		}
 		return true
 	})
+	for _, k := range keys {
+		a.autoInjected.Delete(k)
+	}
 }
 
 // autoInjectExperiences checks whether any saved experience library is

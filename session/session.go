@@ -417,7 +417,11 @@ func NewStore(maxTurns int, systemPrompt, dir string) *Store {
 func (st *Store) Get(key string) *Session {
 	sess := &Session{Key: key, Name: key, store: st}
 	v, loaded := st.sessions.LoadOrStore(key, sess)
-	sess = v.(*Session)
+	sess, _ = v.(*Session)
+	if sess == nil {
+		// Should never happen: only *Session values are stored in this map.
+		sess = &Session{Key: key, Name: key, store: st}
+	}
 	if !loaded {
 		// Brand-new session: inject system prompt and persist.
 		sess.mu.Lock()
@@ -458,7 +462,10 @@ func (st *Store) Create(name string) (*Session, error) {
 func (st *Store) List() []Summary {
 	var out []Summary
 	st.sessions.Range(func(_, v any) bool {
-		sess := v.(*Session)
+		sess, ok := v.(*Session)
+		if !ok {
+			return true
+		}
 		out = append(out, Summary{Name: sess.Name, TurnCount: sess.TurnCount()})
 		return true
 	})
@@ -486,7 +493,10 @@ func (st *Store) ClearHistory(key string) {
 	if !ok {
 		return
 	}
-	sess := v.(*Session)
+	sess, ok := v.(*Session)
+	if !ok {
+		return
+	}
 	sess.mu.Lock()
 	if st.systemPrompt != "" {
 		sess.history = []provider.Message{{Role: "system", Content: st.systemPrompt}}

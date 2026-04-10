@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -450,8 +451,8 @@ func TestWeixinTyping_SkipsWhenTicketEmpty(t *testing.T) {
 	ch.botToken = "tok"
 	ch.baseURL = srv.URL
 
-	var dispatched int
-	dispatch := func(_ context.Context, _ InboundMessage) { dispatched++ }
+	var dispatched int32
+	dispatch := func(_ context.Context, _ InboundMessage) { atomic.AddInt32(&dispatched, 1) }
 
 	msg := weixinInboundMsg{
 		FromUserID: "user@im.wechat", MessageType: 1, ContextToken: "ctx",
@@ -463,8 +464,8 @@ func TestWeixinTyping_SkipsWhenTicketEmpty(t *testing.T) {
 		t.Fatalf("handleMessage error: %v", err)
 	}
 	time.Sleep(20 * time.Millisecond)
-	if dispatched != 1 {
-		t.Errorf("expected 1 dispatch, got %d", dispatched)
+	if atomic.LoadInt32(&dispatched) != 1 {
+		t.Errorf("expected 1 dispatch, got %d", atomic.LoadInt32(&dispatched))
 	}
 }
 
@@ -758,4 +759,148 @@ func TestDownloadWeixinCDNImage_RoundTrip(t *testing.T) {
 	if !strings.HasSuffix(path, ".png") {
 		t.Errorf("expected .png extension, got %q", path)
 	}
+}
+
+// TestDecryptAES128ECB_EmptyCiphertextReturnsError verifies that decryptAES128ECB
+// returns an error (not a panic) when given ciphertext that decrypts to an empty
+// plaintext or has invalid padding.
+func TestDecryptAES128ECB_EmptyCiphertextReturnsError(t *testing.T) {
+	// 16-byte key (AES-128)
+	key := make([]byte, 16)
+
+	// Build a valid AES-ECB block that decrypts to all-zero bytes.
+	// All-zero padding means padLen == 0, which must be rejected.
+	block, _ := aes.NewCipher(key)
+	plaintext := make([]byte, 16) // all zeros → padLen == 0
+	ciphertext := make([]byte, 16)
+	block.Encrypt(ciphertext, plaintext)
+
+	// Note: signature is decryptAES128ECB(ciphertext, key)
+	_, err := decryptAES128ECB(ciphertext, key)
+	if err == nil {
+		t.Fatal("expected error for zero-padding byte, got nil")
+	}
+}
+
+// TestDecryptAES128ECB_PadLenExceedsPlaintextReturnsError verifies that a
+// padLen larger than the plaintext length returns an error instead of panicking
+// with a negative slice index.
+func TestDecryptAES128ECB_PadLenExceedsPlaintextReturnsError(t *testing.T) {
+	key := make([]byte, 16)
+
+	// Build a 16-byte block where the last byte is 0xff (255), which is a
+	// padLen larger than the block size (16). The existing check padLen > bs
+	// should catch this. But we also test padLen == bs+1 isn't reachable
+	// through a single block.
+	block, _ := aes.NewCipher(key)
+	plaintext := make([]byte, 16)
+	plaintext[15] = 17 // padLen = 17 > bs(16), must be rejected
+	ciphertext := make([]byte, 16)
+	block.Encrypt(ciphertext, plaintext)
+
+	_, err := decryptAES128ECB(ciphertext, key)
+	if err == nil {
+		t.Fatal("expected error for padLen > blockSize, got nil")
+	}
+}
+
+// TestDecryptAES128ECB_ValidPaddingRoundtrip verifies normal decryption works.
+func TestDecryptAES128ECB_ValidPaddingRoundtrip(t *testing.T) {
+	key := []byte("0123456789abcdef") // 16-byte key
+
+	// Encrypt "hello" with PKCS7 padding manually.
+	block, _ := aes.NewCipher(key)
+	bs := block.BlockSize() // 16
+	msg := []byte("hello")
+	padLen := bs - len(msg)%bs
+	padded := append(msg, bytes.Repeat([]byte{byte(padLen)}, padLen)...)
+	ciphertext := make([]byte, len(padded))
+	for i := 0; i < len(padded); i += bs {
+		block.Encrypt(ciphertext[i:i+bs], padded[i:i+bs])
+	}
+
+	// Note: signature is decryptAES128ECB(ciphertext, key)
+	got, err := decryptAES128ECB(ciphertext, key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+}
+
+// TestGetTypingTicket_ConcurrentCallsForSameUserFetchOnce verifies that when
+// two goroutines concurrently call getTypingTicket for the same user with an
+// empty cache, the HTTP endpoint is called at most once (double-check locking).
+func TestGetTypingTicket_ConcurrentCallsForSameUserFetchOnce(t *testing.T) {
+	var fetchCount int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCount, 1)
+		// Simulate slow server to maximise concurrency window.
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ret":0,"typing_ticket":"ticket-abc"}`)
+	}))
+	defer srv.Close()
+
+	ch := NewWeixinChannel("test", "", nil)
+	ch.baseURL = srv.URL
+
+	const goroutines = 10
+	results := make([]string, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticket, _ := ch.getTypingTicket(context.Background(), "alice", "ctx-tok")
+			results[i] = ticket
+		}()
+	}
+	wg.Wait()
+
+	// All goroutines must have received the same ticket.
+	for i, r := range results {
+		if r != "ticket-abc" {
+			t.Errorf("goroutine %d: got ticket %q, want %q", i, r, "ticket-abc")
+		}
+	}
+
+	// The HTTP endpoint must have been called at most once (ideally exactly once).
+	if n := atomic.LoadInt32(&fetchCount); n > 1 {
+		t.Errorf("HTTP fetch called %d times for same user, want 1 (TOCTOU not fixed)", n)
+	}
+}
+
+// TestWeixinDispatch_PanicDoesNotCrashProcess verifies that a panic inside
+// the dispatch goroutine is recovered and does not propagate to the caller.
+func TestWeixinDispatch_PanicDoesNotCrashProcess(t *testing.T) {
+	ch := NewWeixinChannel("test", "", nil)
+
+	panicDispatched := make(chan struct{})
+	dispatch := func(_ context.Context, _ InboundMessage) {
+		close(panicDispatched)
+		panic("simulated weixin dispatch panic")
+	}
+
+	msg := weixinInboundMsg{
+		FromUserID:  "alice@im.wechat",
+		MessageType: 1,
+		ItemList: []weixinMessageItem{
+			{Type: 1, TextItem: struct{ Text string `json:"text"` }{"hello"}},
+		},
+	}
+
+	if err := ch.handleMessage(context.Background(), msg, dispatch); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-panicDispatched:
+		time.Sleep(50 * time.Millisecond)
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch goroutine never ran")
+	}
+	// If we reach here without the test process crashing, the recover worked.
 }
