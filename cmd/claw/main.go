@@ -44,7 +44,7 @@ func main() {
 
 	// Subcommands that consume os.Args[1] before flag parsing.
 	switch sub {
-	case "serve", "install", "uninstall":
+	case "serve", "install", "uninstall", "restart":
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 
@@ -57,6 +57,7 @@ Usage:
   claw serve       [flags]   Start the background daemon
   claw install     [flags]   Register daemon as a startup service
   claw uninstall             Remove startup service registration
+  claw restart               Restart the daemon service
   claw             [flags]   Connect to the daemon (interactive CLI)
 
 Flags:
@@ -70,6 +71,8 @@ Flags:
 		runInstall(*configPath)
 	case "uninstall":
 		runUninstall()
+	case "restart":
+		runRestart()
 	default:
 		cfg, err := config.AutoLoad(*configPath)
 		if err != nil {
@@ -131,6 +134,19 @@ func runInstall(configPath string) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runRestart restarts the daemon service.
+func runRestart() {
+	if !startup.IsInstalled() {
+		fmt.Println("No startup service found. Run 'claw install' first.")
+		return
+	}
+	if err := startup.Restart(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Daemon restarted.")
 }
 
 // runUninstall removes the startup service registration.
@@ -272,7 +288,24 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		autoRouteP.SetToolNames(names)
 	}
 
+	// Wire up reload: re-reads prompt dir + dynamic profile and updates sessions.
+	ag.SetReloadFunc(func() (string, error) {
+		sp := cfg.Provider.SystemPrompt
+		if assembled, err := config.LoadPromptDir(cfg.PromptDir); err != nil {
+			log.Warn("prompt dir load failed during reload", "err", err)
+		} else if assembled != "" {
+			sp = assembled
+		}
+		if dynProfile, err := memory.LoadDynamicProfile(dirs.DynamicProfileFile()); err != nil {
+			log.Warn("dynamic profile load failed during reload", "err", err)
+		} else if dynProfile != "" {
+			sp = sp + "\n\n" + dynProfile
+		}
+		return config.ExpandPrompt(sp), nil
+	})
+
 	sock := channel.NewSocketChannel("default", socketPath, sessions)
+	sock.SetReloader(ag)
 	ag.RegisterChannel(sock)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

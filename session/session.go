@@ -521,6 +521,32 @@ func (st *Store) InjectContext(key, content string) {
 	}, 0) // maxTurns=0 → never trim system messages
 }
 
+// SetSystemPrompt replaces the store-level system prompt and updates the first
+// system message in every already-loaded session.  New sessions created after
+// this call will also use the new prompt.
+func (st *Store) SetSystemPrompt(prompt string) {
+	st.settingsMu.Lock()
+	st.systemPrompt = prompt
+	st.settingsMu.Unlock()
+
+	st.sessions.Range(func(_, v any) bool {
+		sess, ok := v.(*Session)
+		if !ok {
+			return true
+		}
+		sess.mu.Lock()
+		if len(sess.history) > 0 && sess.history[0].Role == "system" {
+			sess.history[0].Content = prompt
+		} else if prompt != "" {
+			// Prepend a new system message if one doesn't exist yet.
+			sess.history = append([]provider.Message{{Role: "system", Content: prompt}}, sess.history...)
+		}
+		sess.mu.Unlock()
+		st.save(sess)
+		return true
+	})
+}
+
 // Keys returns all active session keys.
 func (st *Store) Keys() []string {
 	var keys []string

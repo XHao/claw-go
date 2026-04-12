@@ -52,6 +52,7 @@ type Agent struct {
 	memory            *memory.Manager            // optional; nil = memory disabled
 	toolRunner        *tool.LocalRunner          // optional; nil = tool calling disabled
 	expStore          *knowledge.ExperienceStore // optional; nil = auto-inject disabled
+	reloadFunc        func() (string, error)     // optional; reloads system prompt from disk
 	autoInjected      sync.Map // tracks "sessionKey:topic" → true
 	continueRequested sync.Map // tracks sessionKey → true when iteration limit hit
 	log               *slog.Logger
@@ -94,6 +95,28 @@ func (a *Agent) SetToolRunner(r *tool.LocalRunner) {
 // Calling with nil disables auto-injection.
 func (a *Agent) SetExperienceStore(s *knowledge.ExperienceStore) {
 	a.expStore = s
+}
+
+// SetReloadFunc sets a callback that rebuilds the system prompt from disk.
+// When called, Reload() invokes this function and updates all sessions with
+// the new system prompt. If nil, Reload() returns an error.
+func (a *Agent) SetReloadFunc(fn func() (string, error)) {
+	a.reloadFunc = fn
+}
+
+// Reload rebuilds the system prompt by calling reloadFunc, then replaces the
+// system message in every active session. Returns the new prompt on success.
+func (a *Agent) Reload() (string, error) {
+	if a.reloadFunc == nil {
+		return "", fmt.Errorf("reload not configured")
+	}
+	newPrompt, err := a.reloadFunc()
+	if err != nil {
+		return "", fmt.Errorf("reload: %w", err)
+	}
+	a.sessions.SetSystemPrompt(newPrompt)
+	a.log.Info("system prompt reloaded", "len", len(newPrompt))
+	return newPrompt, nil
 }
 
 // RegisterChannel adds a channel so the agent can dispatch replies through it.

@@ -27,6 +27,7 @@ var commands = []cmdEntry{
 	{"/ml", "进入多行输入模式（/send 发送，/abort 取消）", nil},
 	{"/tokens", "显示 token 消耗（report/turn/clear）", []string{"report", "turn", "clear"}},
 	{"/reset", "清空当前对话历史（主会话保留，子会话删除）", nil},
+	{"/reload", "重新加载 daemon 配置（prompt 文件、动态 profile）", nil},
 	{"/learn", "将记忆提炼为指定主题的经验库，如 /learn \"Linux\"", []string{"\"<主题>\""}},
 	{"/exp", "管理经验库", []string{"ls", "use", "show", "rm"}},
 	{"exit", "断开连接并退出", nil},

@@ -188,6 +188,16 @@ func Run(
 			if err != nil {
 				return err
 			}
+		case line == "/reload":
+			if err := enc.Encode(ipc.Msg{Cmd: "reload"}); err != nil {
+				return fmt.Errorf("write: %w", err)
+			}
+			sp := NewSpinner("重新加载配置…")
+			err := printNextReply(ctx, scanner, enc, sp, usageTracker, interruptCh)
+			sp.Stop()
+			if err != nil {
+				return err
+			}
 		case line == "/ml":
 			msg, ok, err := readMultilineInput(rl, prompt)
 			if err != nil {

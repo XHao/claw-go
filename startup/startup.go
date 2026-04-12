@@ -53,6 +53,28 @@ func Uninstall() error {
 	}
 }
 
+// Restart stops and restarts the running daemon service.
+// On macOS it uses `launchctl kickstart -k`; on Linux `systemctl --user restart`.
+func Restart() error {
+	switch runtime.GOOS {
+	case "darwin":
+		uid := fmt.Sprintf("gui/%d/%s", os.Getuid(), label)
+		out, err := exec.Command("launchctl", "kickstart", "-k", uid).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("launchctl kickstart: %w\n%s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	case "linux":
+		out, err := exec.Command("systemctl", "--user", "restart", "claw-go.service").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("systemctl restart: %w\n%s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	default:
+		return fmt.Errorf("restart is not supported on %s", runtime.GOOS)
+	}
+}
+
 // IsInstalled reports whether a startup entry already exists on disk.
 func IsInstalled() bool {
 	path, err := servicePath()

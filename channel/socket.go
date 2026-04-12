@@ -26,12 +26,18 @@ type connState struct {
 	encoder *json.Encoder
 }
 
+// Reloader is implemented by types that can reload their configuration on demand.
+type Reloader interface {
+	Reload() (string, error)
+}
+
 // SocketChannel listens on a Unix Domain Socket. Multiple clients may connect
 // simultaneously, but each named conversation accepts only one client at a time.
 type SocketChannel struct {
 	name       string
 	socketPath string
 	sessions   *session.Store
+	reloader   Reloader // optional; nil = reload not supported
 	running    atomic.Bool
 
 	mu          sync.Mutex
@@ -51,6 +57,9 @@ func NewSocketChannel(name, socketPath string, sessions *session.Store) *SocketC
 		activeConns: make(map[string]*connState),
 	}
 }
+
+// SetReloader attaches a Reloader so that the "reload" IPC command is supported.
+func (s *SocketChannel) SetReloader(r Reloader) { s.reloader = r }
 
 // ID returns the unique channel identifier.
 func (s *SocketChannel) ID() string { return "socket:" + s.name }
@@ -237,6 +246,21 @@ func (s *SocketChannel) handleConn(ctx context.Context, conn net.Conn, dispatch 
 					continue
 				}
 				startDispatch("/reset", "")
+				continue
+			case "reload":
+				if running {
+					_ = sendFrame(ipc.Msg{Error: "当前请求处理中，可发送 cancel 中断后再重新加载"})
+					continue
+				}
+				if s.reloader == nil {
+					_ = sendFrame(ipc.Msg{Error: "reload 未配置"})
+					continue
+				}
+				if _, err := s.reloader.Reload(); err != nil {
+					_ = sendFrame(ipc.Msg{Error: fmt.Sprintf("重新加载失败：%v", err)})
+				} else {
+					_ = sendFrame(ipc.Msg{Info: "配置已重新加载"})
+				}
 				continue
 			}
 
