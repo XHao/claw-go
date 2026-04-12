@@ -76,13 +76,23 @@ func MemoryDir() string { return filepath.Join(Data(), "data", "memory") }
 // Each file is a Markdown document named {topic}.md.
 func ExperiencesDir() string { return filepath.Join(Data(), "data", "experiences") }
 
+// PromptsDir returns the directory where user-defined prompt layer files live.
+// Files are loaded at daemon startup to assemble the system prompt.
+func PromptsDir() string { return filepath.Join(Data(), "prompts") }
+
+// DynamicProfileFile returns the path to the agent-maintained user profile.
+// Facts observed during conversations are appended here over time.
+func DynamicProfileFile() string {
+	return filepath.Join(Data(), "data", "user-profile-dynamic.md")
+}
+
 // WeixinTokenFile returns the default path for the WeChat bot_token persistence file.
 func WeixinTokenFile() string { return filepath.Join(Data(), "weixin-token.json") }
 
 // MkdirAll creates all necessary subdirectories under the data root.
 // Should be called once at daemon startup.
 func MkdirAll() error {
-	for _, d := range []string{Sessions(), Logs(), MemoryDir(), ExperiencesDir()} {
+	for _, d := range []string{Sessions(), Logs(), MemoryDir(), ExperiencesDir(), PromptsDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
 		}

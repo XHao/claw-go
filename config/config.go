@@ -67,6 +67,8 @@ type Config struct {
 	Weixin        WeixinConfig        `yaml:"weixin"`
 	Tools         ToolsConfig         `yaml:"tools"`
 	Search        SearchConfig        `yaml:"search"`
+	Memory        MemoryConfig        `yaml:"memory"`
+	PromptDir     string              `yaml:"prompt_dir"`
 	Theme         ThemeConfig         `yaml:"theme"`
 	Log           LogConfig           `yaml:"log"`
 }
@@ -158,6 +160,14 @@ type SearchConfig struct {
 	MaxResults int `yaml:"max_results"`
 	// TimeoutSeconds is the per-request HTTP timeout (default 15).
 	TimeoutSeconds int `yaml:"timeout_seconds"`
+}
+
+// MemoryConfig controls long-term memory and user-profile extraction.
+type MemoryConfig struct {
+	// ExtractUserFacts enables automatic extraction of user preferences and
+	// context from conversations into ~/.claw/data/user-profile-dynamic.md.
+	// Default: false (opt-in until stable).
+	ExtractUserFacts bool `yaml:"extract_user_facts"`
 }
 
 // CLIConfig holds settings for the interactive terminal client.
@@ -365,6 +375,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Log.MetricsFile == "" {
 		cfg.Log.MetricsFile = dirs.MetricsFile()
+	}
+	if cfg.PromptDir == "" {
+		cfg.PromptDir = dirs.PromptsDir()
 	}
 }
 
