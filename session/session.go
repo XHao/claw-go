@@ -114,6 +114,15 @@ func (s *Session) Append(msg provider.Message, maxTurns int) {
 	}
 }
 
+// AppendEphemeral adds a message to the in-memory history without persisting
+// it to disk and without triggering trim. Used for temporary context injections
+// (e.g. L2 episodic memory) that should not pollute the stored session.
+func (s *Session) AppendEphemeral(msg provider.Message) {
+	s.mu.Lock()
+	s.history = append(s.history, msg)
+	s.mu.Unlock()
+}
+
 func trimMessages(history []provider.Message, settings trimSettings) []provider.Message {
 	if settings.maxTurns <= 0 {
 		out := make([]provider.Message, len(history))
@@ -544,6 +553,18 @@ func (st *Store) SetSystemPrompt(prompt string) {
 		sess.mu.Unlock()
 		st.save(sess)
 		return true
+	})
+}
+
+// InjectContextEphemeral injects a system-role message into the session's
+// in-memory history only — it is not persisted to disk and is not trimmed.
+// Use this for per-turn context that should not accumulate across turns
+// (e.g. auto-injected experience libraries on every dispatch).
+func (st *Store) InjectContextEphemeral(key, content string) {
+	sess := st.Get(key)
+	sess.AppendEphemeral(provider.Message{
+		Role:    "system",
+		Content: "[Injected experience context]\n" + content,
 	})
 }
 

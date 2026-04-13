@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -53,7 +54,9 @@ type Agent struct {
 	toolRunner        *tool.LocalRunner          // optional; nil = tool calling disabled
 	expStore          *knowledge.ExperienceStore // optional; nil = auto-inject disabled
 	reloadFunc        func() (string, error)     // optional; reloads system prompt from disk
-	autoInjected      sync.Map // tracks "sessionKey:topic" → true
+	distiller         *knowledge.Distiller      // optional; nil = auto-distill disabled
+	procedureStore    *knowledge.ProcedureStore // optional; nil = procedure injection disabled
+	classifier        *knowledge.TaskClassifier // optional; nil = procedure injection disabled
 	continueRequested sync.Map // tracks sessionKey → true when iteration limit hit
 	log               *slog.Logger
 }
@@ -117,6 +120,22 @@ func (a *Agent) Reload() (string, error) {
 	a.sessions.SetSystemPrompt(newPrompt)
 	a.log.Info("system prompt reloaded", "len", len(newPrompt))
 	return newPrompt, nil
+}
+
+// SetDistiller attaches a Distiller so that each completed turn is evaluated
+// for auto-distillation. Calling with nil disables auto-distillation.
+func (a *Agent) SetDistiller(d *knowledge.Distiller) {
+	a.distiller = d
+}
+
+// SetProcedureStore attaches a ProcedureStore for L4 procedure memory injection.
+func (a *Agent) SetProcedureStore(s *knowledge.ProcedureStore) {
+	a.procedureStore = s
+}
+
+// SetTaskClassifier attaches a TaskClassifier for per-turn task type detection.
+func (a *Agent) SetTaskClassifier(c *knowledge.TaskClassifier) {
+	a.classifier = c
 }
 
 // RegisterChannel adds a channel so the agent can dispatch replies through it.
@@ -276,7 +295,6 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 			if a.memory != nil {
 				_ = a.memory.ClearSession(msg.SessionKey)
 			}
-			a.clearAutoInjected(msg.SessionKey)
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
@@ -289,7 +307,6 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 			if a.memory != nil {
 				_ = a.memory.DeleteSession(msg.SessionKey)
 			}
-			a.clearAutoInjected(msg.SessionKey)
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
@@ -358,6 +375,12 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 	// Capture turn index right after the user message is appended.
 	turnN := sess.TurnCount()
 
+	// L2: inject relevant episodic memory turns as temporary system context.
+	a.injectEpisodicMemory(msg)
+
+	// L4: classify task type and inject matching procedures as temporary context.
+	a.injectProcedures(ctx, msg)
+
 	// Auto-inject relevant experience libraries before the first LLM call.
 	a.autoInjectExperiences(ctx, msg, ch)
 
@@ -404,7 +427,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
 			log.Error("LLM completion failed", "err", err)
-			a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, i, true)
+			a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, text, "", turnActions, i, true)
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
@@ -481,7 +504,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 			log.Warn("LLM returned empty content", "stop_reason", result.StopReason, "iteration", i)
 		}
 		sess.Append(provider.Message{Role: "assistant", Content: result.Content}, a.sessions.MaxTurns())
-		a.saveTurnMemory(log, msg.SessionKey, turnN, text, result.Content, turnActions, i, false)
+		a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, text, result.Content, turnActions, i, false)
 		if ch == nil {
 			log.Error("channel not registered", "channel_id", msg.ChannelType+":"+msg.ChannelName)
 			return
@@ -497,7 +520,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 
 	// Safety: exhausted iterations without a final reply.
 	log.Warn("max tool iterations reached", "max", a.maxIterations)
-	a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, a.maxIterations, true)
+	a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, text, "", turnActions, a.maxIterations, true)
 	a.continueRequested.Store(msg.SessionKey, true)
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
@@ -541,7 +564,7 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
 			log.Error("LLM completion failed", "err", err)
-			a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
+			a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
 			if ch != nil {
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
@@ -613,7 +636,7 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 			log.Warn("LLM returned empty content", "stop_reason", result.StopReason, "iteration", i)
 		}
 		sess.Append(provider.Message{Role: "assistant", Content: result.Content}, a.sessions.MaxTurns())
-		a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", result.Content, turnActions, i, false)
+		a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, "/continue", result.Content, turnActions, i, false)
 		if ch == nil {
 			log.Error("channel not registered", "channel_id", msg.ChannelType+":"+msg.ChannelName)
 			return
@@ -629,7 +652,7 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 
 	// Exhausted iterations again.
 	log.Warn("max tool iterations reached again", "max", a.maxIterations)
-	a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, a.maxIterations, true)
+	a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, "/continue", "", turnActions, a.maxIterations, true)
 	a.continueRequested.Store(msg.SessionKey, true)
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
@@ -728,6 +751,7 @@ func (a *Agent) SessionKeys() []string {
 // Errors are logged as warnings and never propagate to callers.
 func (a *Agent) saveTurnMemory(
 	log *slog.Logger,
+	ctx context.Context,
 	sessionKey string,
 	turnN int,
 	userText, replyText string,
@@ -742,22 +766,158 @@ func (a *Agent) saveTurnMemory(
 	if err := a.memory.ForSession(sessionKey).SaveTurn(summary); err != nil {
 		log.Warn("memory save failed", "err", err)
 	}
+
+	// Async: evaluate whether this turn contains knowledge worth distilling.
+	if a.distiller != nil && !isError {
+		go func() {
+			result := a.distiller.EvalTurn(ctx, summary)
+			if !result.Valuable || result.Topic == "" || result.Summary == "" {
+				return
+			}
+			log.Info("auto-distill: valuable turn detected", "topic", result.Topic)
+			// If the summary signals a conflict ("更新：" prefix), trigger a full
+			// Map-Reduce distillation so the Reduce phase can apply conflict annotations
+			// ([已更新] / [已废弃]) with full context. Otherwise, append incrementally.
+			if strings.HasPrefix(result.Summary, "更新：") {
+				log.Info("auto-distill: conflict detected, triggering full distill", "topic", result.Topic)
+				if _, err := a.distiller.Distill(ctx, result.Topic, nil); err != nil {
+					log.Warn("auto-distill: full distill failed", "topic", result.Topic, "err", err)
+				}
+				return
+			}
+
+			existing, _ := a.distiller.Store().Load(result.Topic)
+			var newContent string
+			if existing == "" {
+				newContent = fmt.Sprintf("# %s\n\n%s\n", result.Topic, result.Summary)
+			} else {
+				separator := fmt.Sprintf("\n\n---\n*%s 自动蒸馏*\n\n", time.Now().Format("2006-01-02 15:04"))
+				newContent = existing + separator + result.Summary + "\n"
+			}
+			if err := a.distiller.Store().Save(result.Topic, newContent); err != nil {
+				log.Warn("auto-distill: save failed", "topic", result.Topic, "err", err)
+			}
+		}()
+	}
 }
 
-// clearAutoInjected removes all auto-injection records for the given session
-// so that experience libraries will be re-injected if still relevant after a
-// /reset or session delete.
-func (a *Agent) clearAutoInjected(sessionKey string) {
-	prefix := sessionKey + ":"
-	var keys []any
-	a.autoInjected.Range(func(k, _ any) bool {
-		if strings.HasPrefix(k.(string), prefix) {
-			keys = append(keys, k)
+// injectEpisodicMemory searches cross-session memory for turns relevant to the
+// current user message and injects a compact summary as a temporary system
+// message. The injected message is NOT persisted to session history.
+func (a *Agent) injectEpisodicMemory(msg channel.InboundMessage) {
+	if a.memory == nil || strings.TrimSpace(msg.Text) == "" {
+		return
+	}
+	keywords := knowledge.ExtractKeywords(msg.Text)
+	if len(keywords) == 0 {
+		return
+	}
+	turns, err := a.memory.SearchTurns(keywords, 3)
+	if err != nil || len(turns) == 0 {
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[相关历史记忆]\n")
+	for _, t := range turns {
+		age := humanizeMemoryAge(t.At)
+		sb.WriteString(fmt.Sprintf("- %s：%s", age, t.User))
+		if t.Reply != "" {
+			sb.WriteString(fmt.Sprintf(" → %s", truncText(t.Reply, 60)))
 		}
-		return true
+		sb.WriteString("\n")
+	}
+
+	sess := a.sessions.Get(msg.SessionKey)
+	sess.AppendEphemeral(provider.Message{
+		Role:    "system",
+		Content: sb.String(),
 	})
-	for _, k := range keys {
-		a.autoInjected.Delete(k)
+}
+
+// injectProcedures classifies the current user message and injects matching
+// procedure documents as temporary system context. Not persisted to session history.
+func (a *Agent) injectProcedures(ctx context.Context, msg channel.InboundMessage) {
+	if a.procedureStore == nil || a.classifier == nil {
+		return
+	}
+	if strings.TrimSpace(msg.Text) == "" {
+		return
+	}
+	tags, err := a.classifier.Classify(ctx, msg.Text)
+	if err != nil || len(tags) == 0 {
+		return
+	}
+	procs, err := a.procedureStore.FindByTags(tags)
+	if err != nil || len(procs) == 0 {
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString("[相关操作流程]\n")
+	for _, p := range procs {
+		fmt.Fprintf(&sb, "\n## %s\n%s\n", p.Name, p.Body)
+	}
+	sess := a.sessions.Get(msg.SessionKey)
+	sess.AppendEphemeral(provider.Message{
+		Role:    "system",
+		Content: sb.String(),
+	})
+	a.log.Info("injected procedures", "tags", tags, "count", len(procs))
+}
+
+// PersistProcedureLayer assembles all procedures into prompts/20-procedures.md
+// and reloads the system prompt so the change takes effect in all sessions.
+// Called asynchronously after a procedure is saved via save_memory.
+func (a *Agent) PersistProcedureLayer(promptsDir string) {
+	a.persistProcedureLayer(promptsDir)
+}
+
+// persistProcedureLayer is the internal implementation.
+func (a *Agent) persistProcedureLayer(promptsDir string) {
+	if a.procedureStore == nil {
+		return
+	}
+	content, err := a.procedureStore.AssemblePromptLayer()
+	if err != nil {
+		a.log.Warn("persist procedure layer: assemble failed", "err", err)
+		return
+	}
+	path := filepath.Join(promptsDir, "20-procedures.md")
+	if content == "" {
+		_ = os.Remove(path)
+	} else {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			a.log.Warn("persist procedure layer: write failed", "err", err, "path", path)
+			return
+		}
+	}
+	if _, err := a.Reload(); err != nil {
+		a.log.Warn("persist procedure layer: reload failed", "err", err)
+	} else {
+		a.log.Info("procedure layer persisted and reloaded", "path", path)
+	}
+}
+
+
+func truncText(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n-1]) + "…"
+}
+
+func humanizeMemoryAge(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%d分钟前", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%d小时前", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%d天前", int(d.Hours()/24))
+	default:
+		return t.Format("2006-01-02")
 	}
 }
 
@@ -774,10 +934,6 @@ func (a *Agent) autoInjectExperiences(ctx context.Context, msg channel.InboundMe
 	}
 	msgLower := strings.ToLower(msg.Text)
 	for _, m := range metas {
-		injectKey := msg.SessionKey + ":" + m.Topic
-		if _, already := a.autoInjected.Load(injectKey); already {
-			continue
-		}
 		if !topicMatchesText(m.Topic, msgLower) {
 			continue
 		}
@@ -785,8 +941,7 @@ func (a *Agent) autoInjectExperiences(ctx context.Context, msg channel.InboundMe
 		if err != nil || content == "" {
 			continue
 		}
-		a.sessions.InjectContext(msg.SessionKey, content)
-		a.autoInjected.Store(injectKey, true)
+		a.sessions.InjectContextEphemeral(msg.SessionKey, content)
 		a.log.Info("auto-injected experience", "topic", m.Topic, "session", msg.SessionKey)
 		if ch != nil {
 			_ = ch.Send(ctx, channel.OutboundMessage{

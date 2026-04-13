@@ -42,6 +42,8 @@ const (
 //	  HintSourceAgentInject       "agent/inject"
 //	  HintSourceAutorouteClassify "autoroute/classify"
 //	  HintSourceDistillReduce     "distill/reduce"
+//	  HintSourceDistillEval       "distill/eval"
+//	  HintSourceClassifyTask      "classify/task"
 //
 //	Dynamic (use builder functions):
 //	  HintSourceAgentLoop(i)        "agent/loop[i=<i>]"
@@ -54,6 +56,10 @@ const (
 	HintSourceAgentInject       HintSource = "agent/inject"
 	HintSourceAutorouteClassify HintSource = "autoroute/classify"
 	HintSourceDistillReduce     HintSource = "distill/reduce"
+	// HintSourceDistillEval tags the per-turn knowledge-value evaluation call.
+	HintSourceDistillEval HintSource = "distill/eval"
+	// HintSourceClassifyTask tags the per-turn task-type classification call.
+	HintSourceClassifyTask HintSource = "classify/task"
 )
 
 // HintSourceAgentLoop returns the source label for the i-th iteration of the

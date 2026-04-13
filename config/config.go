@@ -168,6 +168,23 @@ type MemoryConfig struct {
 	// context from conversations into ~/.claw/data/user-profile-dynamic.md.
 	// Default: false (opt-in until stable).
 	ExtractUserFacts bool `yaml:"extract_user_facts"`
+
+	// DreamCycleEnabled enables the background Dream Cycle that periodically
+	// scans recent memory and distills high-frequency topics.
+	// Default: false (opt-in).
+	DreamCycleEnabled bool `yaml:"dream_cycle_enabled"`
+
+	// DreamCycleIntervalHours sets how often (in hours) the Dream Cycle runs.
+	// Default: 24 (once per day).
+	DreamCycleIntervalHours int `yaml:"dream_cycle_interval_hours"`
+
+	// DreamCycleMinFreq is the minimum keyword frequency required to trigger
+	// distillation for a topic. Default: 3.
+	DreamCycleMinFreq int `yaml:"dream_cycle_min_freq"`
+
+	// DreamCycleLookbackDays sets how many days of memory to scan per cycle.
+	// Default: 7.
+	DreamCycleLookbackDays int `yaml:"dream_cycle_lookback_days"`
 }
 
 // CLIConfig holds settings for the interactive terminal client.
@@ -378,6 +395,16 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.PromptDir == "" {
 		cfg.PromptDir = dirs.PromptsDir()
+	}
+	// Memory Dream Cycle defaults.
+	if cfg.Memory.DreamCycleIntervalHours == 0 {
+		cfg.Memory.DreamCycleIntervalHours = 24
+	}
+	if cfg.Memory.DreamCycleMinFreq == 0 {
+		cfg.Memory.DreamCycleMinFreq = 3
+	}
+	if cfg.Memory.DreamCycleLookbackDays == 0 {
+		cfg.Memory.DreamCycleLookbackDays = 7
 	}
 }
 

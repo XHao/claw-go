@@ -194,3 +194,77 @@ func (m *Manager) AllSessions() ([]string, error) {
 	}
 	return sessions, nil
 }
+
+// SearchTurns returns up to maxResults TurnSummary records across all sessions
+// that contain at least one of the given keywords, sorted by descending composite
+// score (keyword hit count × recency decay factor). If maxResults <= 0, all
+// matching turns are returned. If keywords is empty, nil is returned.
+// Per-session load errors are silently skipped so a single corrupted session
+// does not abort the search.
+func (m *Manager) SearchTurns(keywords []string, maxResults int) ([]TurnSummary, error) {
+	sessions, err := m.AllSessions()
+	if err != nil {
+		return nil, err
+	}
+	var all []TurnSummary
+	for _, key := range sessions {
+		turns, err := m.ForSession(key).LoadRecent(0)
+		if err != nil {
+			continue
+		}
+		all = append(all, turns...)
+	}
+	if len(all) == 0 || len(keywords) == 0 {
+		return nil, nil
+	}
+
+	type scored struct {
+		turn  TurnSummary
+		score float64
+	}
+	var hits []scored
+	for _, t := range all {
+		kwScore := scoreTurnByKeywords(t, keywords)
+		if kwScore > 0 {
+			composite := float64(kwScore) * recencyFactor(t.At)
+			hits = append(hits, scored{t, composite})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+	if maxResults > 0 && len(hits) > maxResults {
+		hits = hits[:maxResults]
+	}
+	out := make([]TurnSummary, len(hits))
+	for i, h := range hits {
+		out[i] = h.turn
+	}
+	return out, nil
+}
+
+// recencyFactor returns a time-decay multiplier in (0, 1] based on how many
+// days ago t occurred. Uses the formula 1 / (1 + daysSince/30), so:
+//
+//	today     → 1.0
+//	30 days   → 0.5
+//	90 days   → 0.25
+func recencyFactor(t time.Time) float64 {
+	daysSince := time.Since(t).Hours() / 24
+	if daysSince < 0 {
+		daysSince = 0
+	}
+	return 1.0 / (1.0 + daysSince/30.0)
+}
+
+// scoreTurnByKeywords counts keyword occurrences in a TurnSummary's text fields.
+func scoreTurnByKeywords(t TurnSummary, keywords []string) int {
+	parts := []string{t.User, t.Reply}
+	for _, a := range t.Actions {
+		parts = append(parts, a.Tool, a.Summary)
+	}
+	haystack := strings.ToLower(strings.Join(parts, " "))
+	score := 0
+	for _, kw := range keywords {
+		score += strings.Count(haystack, strings.ToLower(kw))
+	}
+	return score
+}

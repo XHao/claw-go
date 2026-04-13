@@ -80,6 +80,10 @@ func ExperiencesDir() string { return filepath.Join(Data(), "data", "experiences
 // Files are loaded at daemon startup to assemble the system prompt.
 func PromptsDir() string { return filepath.Join(Data(), "prompts") }
 
+// ProceduresDir returns the directory for L4 procedure files.
+// Each file is a Markdown document with YAML frontmatter describing tags and priority.
+func ProceduresDir() string { return filepath.Join(Data(), "data", "procedures") }
+
 // DynamicProfileFile returns the path to the agent-maintained user profile.
 // Facts observed during conversations are appended here over time.
 func DynamicProfileFile() string {
@@ -92,7 +96,7 @@ func WeixinTokenFile() string { return filepath.Join(Data(), "weixin-token.json"
 // MkdirAll creates all necessary subdirectories under the data root.
 // Should be called once at daemon startup.
 func MkdirAll() error {
-	for _, d := range []string{Sessions(), Logs(), MemoryDir(), ExperiencesDir(), PromptsDir()} {
+	for _, d := range []string{Sessions(), Logs(), MemoryDir(), ExperiencesDir(), PromptsDir(), ProceduresDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
 		}

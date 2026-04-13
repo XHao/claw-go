@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"log/slog"
-	"strings"
 	"sync"
 	"testing"
 
@@ -28,52 +27,6 @@ func (s *stubProvider) Complete(_ context.Context, _ []provider.Message) (string
 }
 func (s *stubProvider) CompleteWithTools(_ context.Context, _ []provider.Message, _ []provider.ToolDef) (provider.CompleteResult, error) {
 	return provider.CompleteResult{Content: "ok"}, nil
-}
-
-// TestClearAutoInjected_DeletesAllMatchingKeys verifies that clearAutoInjected
-// removes all keys with the given session prefix, even when there are many
-// concurrent entries in the sync.Map. This guards against the Range-and-delete
-// pattern that may miss entries under concurrent load.
-func TestClearAutoInjected_DeletesAllMatchingKeys(t *testing.T) {
-	st := session.NewStore(10, "sys", "")
-	a := New(&stubProvider{}, st, slog.Default())
-
-	const sessionKey = "my-session"
-	const otherKey = "other-session"
-
-	// Store 20 entries for our session and 5 for another.
-	for i := 0; i < 20; i++ {
-		a.autoInjected.Store(sessionKey+":topic-"+string(rune('a'+i)), true)
-	}
-	for i := 0; i < 5; i++ {
-		a.autoInjected.Store(otherKey+":topic-"+string(rune('a'+i)), true)
-	}
-
-	a.clearAutoInjected(sessionKey)
-
-	// All keys for sessionKey must be gone.
-	remaining := 0
-	a.autoInjected.Range(func(k, _ any) bool {
-		if strings.HasPrefix(k.(string), sessionKey+":") {
-			remaining++
-		}
-		return true
-	})
-	if remaining != 0 {
-		t.Errorf("clearAutoInjected left %d keys for session %q, want 0", remaining, sessionKey)
-	}
-
-	// Keys for other session must be untouched.
-	otherRemaining := 0
-	a.autoInjected.Range(func(k, _ any) bool {
-		if strings.HasPrefix(k.(string), otherKey+":") {
-			otherRemaining++
-		}
-		return true
-	})
-	if otherRemaining != 5 {
-		t.Errorf("clearAutoInjected removed keys for other session, want 5 got %d", otherRemaining)
-	}
 }
 
 // TestRegisterChannel_ConcurrentWithDispatch verifies that RegisterChannel and

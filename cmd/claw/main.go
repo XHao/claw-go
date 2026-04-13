@@ -273,12 +273,21 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	ag.SetMemory(memMgr)
 
 	expStore := knowledge.NewExperienceStore(dirs.ExperiencesDir())
+	procStore := knowledge.NewProcedureStore(dirs.ProceduresDir())
 	if cfg.Tools.Enabled {
 		tool.RegisterDaemonTools(toolRunner, llm, memMgr, expStore, sessions)
 		tool.RegisterWebSearch(toolRunner, cfg.Search)
 		tool.RegisterFetchURL(toolRunner)
+		tool.RegisterRecallMemory(toolRunner, memMgr)
+		tool.RegisterSaveMemory(toolRunner, expStore, procStore, func() {
+			ag.PersistProcedureLayer(dirs.PromptsDir())
+		})
 	}
 	ag.SetExperienceStore(expStore)
+	distiller := knowledge.NewDistiller(llm, memMgr, expStore)
+	ag.SetDistiller(distiller)
+	ag.SetProcedureStore(procStore)
+	ag.SetTaskClassifier(knowledge.NewTaskClassifier(llm))
 	log.Info("tools ready", "registered", len(toolRunner.RegisteredDefs()))
 	if autoRouteP != nil {
 		names := make([]string, 0, len(toolRunner.RegisteredDefs()))
@@ -310,6 +319,24 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Start Dream Cycle if enabled: periodically scan memory and distill
+	// high-frequency topics in the background.
+	if cfg.Memory.DreamCycleEnabled {
+		dream := knowledge.NewDreamCycle(
+			distiller,
+			memMgr,
+			expStore,
+			cfg.Memory.DreamCycleMinFreq,
+			cfg.Memory.DreamCycleLookbackDays,
+		)
+		dream.Start(ctx, time.Duration(cfg.Memory.DreamCycleIntervalHours)*time.Hour)
+		log.Info("dream cycle started",
+			"interval_hours", cfg.Memory.DreamCycleIntervalHours,
+			"min_freq", cfg.Memory.DreamCycleMinFreq,
+			"lookback_days", cfg.Memory.DreamCycleLookbackDays,
+		)
+	}
 
 	dispatch := func(ctx context.Context, msg channel.InboundMessage) {
 		dctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
