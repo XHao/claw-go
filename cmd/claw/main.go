@@ -228,7 +228,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		systemPrompt = systemPrompt + "\n\n" + dynProfile
 		log.Info("dynamic user profile appended to system prompt")
 	}
-	systemPrompt = config.ExpandPrompt(systemPrompt)
+	systemPrompt = config.ExpandStaticVars(systemPrompt)
 
 	sessions := session.NewStore(cfg.MaxHistoryTurns, systemPrompt, dirs.Sessions())
 	if cfg.MaxHistoryTokens > 0 {
@@ -310,7 +310,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		} else if dynProfile != "" {
 			sp = sp + "\n\n" + dynProfile
 		}
-		return config.ExpandPrompt(sp), nil
+		return config.ExpandStaticVars(sp), nil
 	})
 
 	sock := channel.NewSocketChannel("default", socketPath, sessions)

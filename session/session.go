@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/XHao/claw-go/config"
 	"github.com/XHao/claw-go/provider"
 )
 
@@ -88,13 +89,21 @@ func (s *Session) History() []provider.Message {
 
 // HistoryForLLM returns a hint-aware, budget-trimmed view of the session
 // history for a provider call. It never mutates the stored history on disk.
+// Template variables (e.g. {date}, {cwd}) in system messages are expanded
+// at call time so they always reflect the current environment.
 func (s *Session) HistoryForLLM(hint provider.ModelHint) []provider.Message {
 	history := s.History()
 	settings := trimSettings{maxTurns: 0}
 	if s.store != nil {
 		settings = s.store.resolveTrimSettings(hint)
 	}
-	return trimMessages(history, settings)
+	messages := trimMessages(history, settings)
+	for i, m := range messages {
+		if m.Role == "system" {
+			messages[i].Content = config.ExpandTimeVars(m.Content)
+		}
+	}
+	return messages
 }
 
 // Append adds a message to the session history, trims it if needed, then
@@ -418,6 +427,22 @@ func NewStore(maxTurns int, systemPrompt, dir string) *Store {
 	}
 	if dir != "" {
 		st.loadAll()
+		// Update system message in all reloaded sessions to reflect the
+		// current prompt (which may differ from what was persisted on disk).
+		if systemPrompt != "" {
+			st.sessions.Range(func(_, v any) bool {
+				sess, ok := v.(*Session)
+				if !ok {
+					return true
+				}
+				sess.mu.Lock()
+				if len(sess.history) > 0 && sess.history[0].Role == "system" {
+					sess.history[0].Content = systemPrompt
+				}
+				sess.mu.Unlock()
+				return true
+			})
+		}
 	}
 	return st
 }

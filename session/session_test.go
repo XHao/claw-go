@@ -470,6 +470,61 @@ func TestHistoryForLLMUsesHintBudgetScale(t *testing.T) {
 	}
 }
 
+func TestHistoryForLLMExpandsDateInSystemPrompt(t *testing.T) {
+	st := session.NewStore(10, "Today is {date}. Hello.", "")
+	s := st.Get("expand-test")
+
+	llmHist := s.HistoryForLLM(provider.ModelHintTask)
+	if len(llmHist) == 0 || llmHist[0].Role != "system" {
+		t.Fatal("expected system message in HistoryForLLM result")
+	}
+	if strings.Contains(llmHist[0].Content, "{date}") {
+		t.Errorf("HistoryForLLM should expand {date}, but got: %q", llmHist[0].Content)
+	}
+
+	// History() must still return the raw template (not expanded)
+	rawHist := s.History()
+	if len(rawHist) == 0 || rawHist[0].Role != "system" {
+		t.Fatal("expected system message in History result")
+	}
+	if !strings.Contains(rawHist[0].Content, "{date}") {
+		t.Errorf("History() should keep raw template with {date}, but got: %q", rawHist[0].Content)
+	}
+}
+
+func TestHistoryForLLMExpandsDatetimeInSystemPrompt(t *testing.T) {
+	st := session.NewStore(10, "now={datetime}", "")
+	s := st.Get("expand-datetime")
+
+	llmHist := s.HistoryForLLM(provider.ModelHintTask)
+	if len(llmHist) == 0 || llmHist[0].Role != "system" {
+		t.Fatal("expected system message in HistoryForLLM result")
+	}
+	if strings.Contains(llmHist[0].Content, "{datetime}") {
+		t.Errorf("HistoryForLLM should expand {datetime}, but got: %q", llmHist[0].Content)
+	}
+}
+
+func TestHistoryForLLMDoesNotExpandNonTimeVars(t *testing.T) {
+	st := session.NewStore(10, "cwd={cwd} os={os} user={user}", "")
+	s := st.Get("no-expand-non-time")
+
+	llmHist := s.HistoryForLLM(provider.ModelHintTask)
+	if len(llmHist) == 0 || llmHist[0].Role != "system" {
+		t.Fatal("expected system message in HistoryForLLM result")
+	}
+	content := llmHist[0].Content
+	if !strings.Contains(content, "{cwd}") {
+		t.Errorf("HistoryForLLM should NOT expand {cwd}, but got: %q", content)
+	}
+	if !strings.Contains(content, "{os}") {
+		t.Errorf("HistoryForLLM should NOT expand {os}, but got: %q", content)
+	}
+	if !strings.Contains(content, "{user}") {
+		t.Errorf("HistoryForLLM should NOT expand {user}, but got: %q", content)
+	}
+}
+
 func TestTrimPrefersKeepingToolHeavyTurns(t *testing.T) {
 	st := session.NewStore(4, "sys", "")
 	st.SetTokenBudget(2000)

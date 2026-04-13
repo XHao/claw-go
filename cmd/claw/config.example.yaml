@@ -11,7 +11,7 @@ models:
     model: "gpt-4o-mini"
     system_prompt: |
       You are a helpful assistant running on {os} ({arch}).
-      User: {user}  Home: {home}  Cwd: {cwd}  Shell: {shell}  Date: {date}
+      User: {user}  Home: {home}  Shell: {shell}
       Be concise and prefer concrete steps.
     max_tokens: 4096
 
