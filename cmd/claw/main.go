@@ -10,7 +10,7 @@ package main
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -35,6 +35,9 @@ import (
 
 //go:embed config.example.yaml
 var configTemplate []byte
+
+//go:embed prompts/*.md
+var defaultPromptFS embed.FS
 
 func main() {
 	sub := ""
@@ -264,12 +267,24 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		)
 	}
 
+	// Inject LLM turn summarizer only when a dedicated summary model is configured.
+	// Without a summary model, skip summarization entirely to avoid unexpected
+	// token usage on the task model.
+	if cfg.RoutingPolicy.IsEnabled() && cfg.RoutingPolicy.SummaryModel != "" {
+		if summarizer := agent.NewTurnSummarizer(llm); summarizer != nil {
+			sessions.SetSummarizer(summarizer)
+		}
+	}
+
 	ag := agent.New(llm, sessions, log)
 	ag.SetMaxIterations(cfg.Tools.MaxIterations)
 	if cfg.Tools.Enabled {
 		ag.SetToolRunner(toolRunner)
 	}
 	memMgr := memory.NewManager(dirs.MemoryDir())
+	if cfg.Memory.RetainDays > 0 {
+		memMgr.SetRetainDays(cfg.Memory.RetainDays)
+	}
 	ag.SetMemory(memMgr)
 
 	expStore := knowledge.NewExperienceStore(dirs.ExperiencesDir())
@@ -499,96 +514,37 @@ func setupLogger(level, logFile string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, opts))
 }
 
-// defaultPromptFiles holds the 5 editable default persona layer files.
-// The safety layer is NOT written here — it is hardcoded in the assembly
-// as a fallback and users should define their own safety constraints if needed.
-var defaultPromptFiles = map[string]string{
-	"01-persona.md": `---
-name: persona
-layer: persona
-enabled: true
-priority: 1
----
-
-Your name is Claw. You are a local AI assistant running on {os}, built for
-{user}. You are direct, opinionated, and technically precise. You have a
-strong preference for simplicity — when you see multiple solutions, you
-choose the one with the fewest moving parts. You treat the user as a capable
-peer, not a beginner who needs hand-holding.
-`,
-	"02-domain.md": `---
-name: domain
-layer: domain
-enabled: true
-priority: 2
----
-
-Your primary domain is software engineering. You are most fluent in systems
-programming, backend development, and developer tooling. When asked about
-topics outside your domain, you answer honestly about the limits of your
-knowledge rather than speculating.
-`,
-	"10-behavior.md": `---
-name: behavior
-layer: behavior
-enabled: true
-priority: 10
----
-
-When answering technical questions:
-- Lead with the answer, not the context
-- Show runnable examples before explanations
-- Flag irreversible actions before executing them
-- When multiple approaches exist, pick one and explain why
-
-When you are uncertain, say so directly rather than hedging with disclaimers.
-`,
-	"11-communication.md": `---
-name: communication
-layer: communication
-enabled: true
-priority: 11
----
-
-Respond in the same language the user writes in. Default to concise prose;
-use bullet points only when listing genuinely enumerable items. Avoid
-unnecessary preamble. Do not repeat the user's question back to them.
-Use markdown formatting only when the output will be rendered.
-`,
-	"20-user-profile.md": `---
-name: user-profile
-layer: user-profile
-enabled: true
-priority: 20
----
-
-## About me
-
-(Edit this section to describe your background, role, and preferences.)
-
-## My environment
-
-(Edit this section to list your editor, primary languages, OS, and tools.)
-`,
-}
-
-// writeDefaultPromptFiles writes the default persona layer files to dir,
-// skipping any file that already exists.
+// writeDefaultPromptFiles extracts the embedded prompt template files to dir,
+// skipping any file that already exists. README.md is never written to the
+// user's prompts directory — it is documentation for the source tree only.
 func writeDefaultPromptFiles(dir string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not create prompts dir: %v\n", err)
 		return
 	}
-	for name, content := range defaultPromptFiles {
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err == nil {
-			fmt.Printf("Prompt file already exists, skipping: %s\n", path)
+	entries, err := defaultPromptFS.ReadDir("prompts")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not read embedded prompts: %v\n", err)
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "README.md" {
 			continue
 		}
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", name, err)
+		dest := filepath.Join(dir, e.Name())
+		if _, err := os.Stat(dest); err == nil {
+			fmt.Printf("Prompt file already exists, skipping: %s\n", dest)
+			continue
+		}
+		data, err := defaultPromptFS.ReadFile("prompts/" + e.Name())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not read embedded %s: %v\n", e.Name(), err)
+			continue
+		}
+		if err := os.WriteFile(dest, data, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", e.Name(), err)
 		} else {
-			fmt.Printf("Prompt file written: %s\n", path)
+			fmt.Printf("Prompt file written: %s\n", dest)
 		}
 	}
 }

@@ -5,6 +5,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/XHao/claw-go/config"
+	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
 )
 
@@ -24,7 +26,9 @@ import (
 const MainSessionKey = "main"
 
 const (
-	historySummaryPrefix       = "[History summary]\n"
+	historySummaryPrefix       = "[CONTEXT COMPACTION — REFERENCE ONLY]\n" +
+		"Earlier turns have been summarized. Treat this as background reference,\n" +
+		"NOT as active instructions. Do not re-execute tasks mentioned here.\n\n"
 	defaultPerTurnTokenBudget  = 1200
 	minTrimTokenBudget         = 2000
 	defaultCharsPerToken       = 4.0
@@ -49,7 +53,9 @@ type Session struct {
 }
 
 type historyBlock struct {
-	messages []provider.Message
+	messages   []provider.Message
+	turnN      int    // 1-based turn index; 0 = unknown
+	llmSummary string // LLM-generated summary; empty = use rule-based fallback
 }
 
 type trimSettings struct {
@@ -97,7 +103,7 @@ func (s *Session) HistoryForLLM(hint provider.ModelHint) []provider.Message {
 	if s.store != nil {
 		settings = s.store.resolveTrimSettings(hint)
 	}
-	messages := trimMessages(history, settings)
+	messages := trimMessages(history, settings, s.Key, s.store)
 	for i, m := range messages {
 		if m.Role == "system" {
 			messages[i].Content = config.ExpandTimeVars(m.Content)
@@ -115,7 +121,7 @@ func (s *Session) Append(msg provider.Message, maxTurns int) {
 	if s.store != nil {
 		settings = s.store.resolveBaseTrimSettings(maxTurns)
 	}
-	s.history = trimMessages(s.history, settings)
+	s.history = trimMessages(s.history, settings, s.Key, s.store)
 	s.mu.Unlock()
 	// Save outside the lock so readers are not blocked.
 	if s.store != nil {
@@ -132,7 +138,7 @@ func (s *Session) AppendEphemeral(msg provider.Message) {
 	s.mu.Unlock()
 }
 
-func trimMessages(history []provider.Message, settings trimSettings) []provider.Message {
+func trimMessages(history []provider.Message, settings trimSettings, sessionKey string, st *Store) []provider.Message {
 	if settings.maxTurns <= 0 {
 		out := make([]provider.Message, len(history))
 		copy(out, history)
@@ -153,7 +159,30 @@ func trimMessages(history []provider.Message, settings trimSettings) []provider.
 		}
 	}
 
-	turns := splitIntoTurnBlocks(rest)
+	// turnOffset: how many turns have already been compressed into the summary block.
+	// Count user messages in the full history vs. in rest to find how many were removed.
+	totalUserMsgs := 0
+	for _, m := range history {
+		if m.Role == "user" {
+			totalUserMsgs++
+		}
+	}
+	restUserMsgs := 0
+	for _, m := range rest {
+		if m.Role == "user" {
+			restUserMsgs++
+		}
+	}
+	turnOffset := totalUserMsgs - restUserMsgs
+	turns := splitIntoTurnBlocks(rest, turnOffset)
+	// Fill LLM summaries from cache if available.
+	if st != nil && sessionKey != "" {
+		for i := range turns {
+			if turns[i].turnN > 0 {
+				turns[i].llmSummary = st.llmSummaryForTurn(sessionKey, turns[i].turnN)
+			}
+		}
+	}
 	if len(turns) == 0 {
 		return append(system, buildSummaryMessage(existingSummary)...)
 	}
@@ -230,12 +259,16 @@ func isToolHeavyBlock(b historyBlock) bool {
 	return false
 }
 
-func splitIntoTurnBlocks(messages []provider.Message) []historyBlock {
+// splitIntoTurnBlocks splits messages into per-turn blocks.
+// turnOffset is the number of turns already compressed into the summary;
+// the first user message in messages gets turnN = turnOffset+1.
+func splitIntoTurnBlocks(messages []provider.Message, turnOffset int) []historyBlock {
 	if len(messages) == 0 {
 		return nil
 	}
 	var blocks []historyBlock
 	var current []provider.Message
+	turnIdx := turnOffset
 
 	flush := func() {
 		if len(current) == 0 {
@@ -243,13 +276,16 @@ func splitIntoTurnBlocks(messages []provider.Message) []historyBlock {
 		}
 		copied := make([]provider.Message, len(current))
 		copy(copied, current)
-		blocks = append(blocks, historyBlock{messages: copied})
+		blocks = append(blocks, historyBlock{messages: copied, turnN: turnIdx})
 		current = nil
 	}
 
 	for _, m := range messages {
 		if m.Role == "user" && len(current) > 0 {
 			flush()
+		}
+		if m.Role == "user" {
+			turnIdx++
 		}
 		current = append(current, m)
 	}
@@ -303,6 +339,13 @@ func buildSummaryMessage(lines []string) []provider.Message {
 }
 
 func summarizeBlock(b historyBlock) string {
+	if b.llmSummary != "" {
+		return fmt.Sprintf("- Turn %d: %s", b.turnN, b.llmSummary)
+	}
+	return summarizeBlockFallback(b)
+}
+
+func summarizeBlockFallback(b historyBlock) string {
 	user := ""
 	assistant := ""
 	toolSet := map[string]struct{}{}
@@ -390,6 +433,12 @@ type sessionFile struct {
 	History []provider.Message `json:"history"`
 }
 
+// TurnSummarizer generates a structured summary for a single conversation turn.
+// Implemented in the agent package and injected via Store.SetSummarizer.
+type TurnSummarizer interface {
+	SummarizeTurn(ctx context.Context, messages []provider.Message) (string, error)
+}
+
 // Store is a concurrency-safe map from session key to *Session.
 type Store struct {
 	sessions       sync.Map
@@ -406,6 +455,10 @@ type Store struct {
 	systemPrompt   string
 	dir            string       // sessions directory; "" = no persistence
 	log            *slog.Logger // may be nil
+
+	summarizer     TurnSummarizer
+	summaryCache   map[string]map[int]string // sessionKey → turnN → LLMSummary
+	summaryCacheMu sync.RWMutex
 }
 
 // NewStore creates a Store with the given history limit, system prompt, and
@@ -425,6 +478,7 @@ func NewStore(maxTurns int, systemPrompt, dir string) *Store {
 		dir:           dir,
 		log:           slog.Default(),
 	}
+	st.summaryCache = make(map[string]map[int]string)
 	if dir != "" {
 		st.loadAll()
 		// Update system message in all reloaded sessions to reflect the
@@ -605,6 +659,44 @@ func (st *Store) Keys() []string {
 
 // MaxTurns returns the configured history turn limit.
 func (st *Store) MaxTurns() int { return st.maxTurns }
+
+// SetSummarizer injects the LLM-based turn summarizer. Pass nil to disable.
+func (st *Store) SetSummarizer(s TurnSummarizer) {
+	st.settingsMu.Lock()
+	defer st.settingsMu.Unlock()
+	st.summarizer = s
+}
+
+// Summarizer returns the configured TurnSummarizer, or nil if not set.
+func (st *Store) Summarizer() TurnSummarizer {
+	st.settingsMu.RLock()
+	defer st.settingsMu.RUnlock()
+	return st.summarizer
+}
+
+// RefreshSummaryCache updates the in-memory cache of LLM summaries for a session.
+// Called by the agent before each dispatch so trimMessages can use fresh summaries.
+func (st *Store) RefreshSummaryCache(sessionKey string, turns []memory.TurnSummary) {
+	cache := make(map[int]string, len(turns))
+	for _, t := range turns {
+		if t.LLMSummary != "" {
+			cache[t.N] = t.LLMSummary
+		}
+	}
+	st.summaryCacheMu.Lock()
+	st.summaryCache[sessionKey] = cache
+	st.summaryCacheMu.Unlock()
+}
+
+// llmSummaryForTurn looks up a cached LLM summary for the given session and turn number.
+func (st *Store) llmSummaryForTurn(sessionKey string, turnN int) string {
+	st.summaryCacheMu.RLock()
+	defer st.summaryCacheMu.RUnlock()
+	if m, ok := st.summaryCache[sessionKey]; ok {
+		return m[turnN]
+	}
+	return ""
+}
 
 // SetTokenBudget sets an approximate prompt token budget used by history trim.
 // Values <= 0 disable explicit override and fall back to maxTurns-derived budget.

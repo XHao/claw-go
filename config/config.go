@@ -185,6 +185,12 @@ type MemoryConfig struct {
 	// DreamCycleLookbackDays sets how many days of memory to scan per cycle.
 	// Default: 7.
 	DreamCycleLookbackDays int `yaml:"dream_cycle_lookback_days"`
+
+	// RetainDays sets how many days of memory JSONL files to keep per session.
+	// Files older than this are deleted during the daily compaction triggered
+	// by the first SaveTurn of a new UTC day. 0 means keep forever.
+	// Default: 90.
+	RetainDays int `yaml:"retain_days"`
 }
 
 // CLIConfig holds settings for the interactive terminal client.

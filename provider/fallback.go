@@ -2,8 +2,6 @@ package provider
 
 import (
 	"context"
-	"errors"
-	"strings"
 )
 
 // FallbackProvider retries with fallback provider when the primary model is unavailable.
@@ -44,34 +42,6 @@ func (f *FallbackProvider) CompleteWithTools(ctx context.Context, messages []Mes
 }
 
 func shouldFallback(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "context canceled") || strings.Contains(msg, "deadline exceeded") {
-		return false
-	}
-	for _, key := range []string{
-		"model_not_found",
-		"model not found",
-		"does not exist",
-		"not available",
-		"unavailable",
-		"temporarily overloaded",
-		"status 404",
-		"status 429",
-		"status 500",
-		"status 502",
-		"status 503",
-		"status 504",
-	} {
-		if strings.Contains(msg, key) {
-			return true
-		}
-	}
-	var netErr interface{ Timeout() bool }
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-	return false
+	ce := Classify(err)
+	return ce != nil && ce.ShouldFallback
 }

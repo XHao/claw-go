@@ -16,14 +16,15 @@ import "time"
 
 // TurnSummary is the compact record written for one completed conversation turn.
 type TurnSummary struct {
-	N       int       `json:"n"`
-	At      time.Time `json:"at"`
-	User    string    `json:"user"`
-	Reply   string    `json:"reply"`
-	Actions []Action  `json:"actions,omitempty"`
-	Files   []string  `json:"files,omitempty"`
-	Iters   int       `json:"iters,omitempty"`
-	IsError bool      `json:"err,omitempty"`
+	N          int       `json:"n"`
+	At         time.Time `json:"at"`
+	User       string    `json:"user"`
+	Reply      string    `json:"reply"`
+	Actions    []Action  `json:"actions,omitempty"`
+	Files      []string  `json:"files,omitempty"`
+	Iters      int       `json:"iters,omitempty"`
+	IsError    bool      `json:"err,omitempty"`
+	LLMSummary string    `json:"llm_summary,omitempty"`
 }
 
 // Action describes a single tool invocation in a compact, human-readable form.

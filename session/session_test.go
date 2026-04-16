@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
 	"github.com/XHao/claw-go/session"
 )
@@ -234,7 +235,7 @@ func TestTrimPreservesToolTransactionAtomicity(t *testing.T) {
 
 	foundSummary := false
 	for _, m := range h {
-		if m.Role == "system" && strings.HasPrefix(m.Content, "[History summary]\n") {
+		if m.Role == "system" && strings.HasPrefix(m.Content, "[CONTEXT COMPACTION") {
 			foundSummary = true
 			break
 		}
@@ -269,7 +270,7 @@ func TestTrimByTokenBudgetDropsOldestTurnBlocks(t *testing.T) {
 
 	foundSummary := false
 	for _, m := range h {
-		if m.Role == "system" && strings.HasPrefix(m.Content, "[History summary]\n") {
+		if m.Role == "system" && strings.HasPrefix(m.Content, "[CONTEXT COMPACTION") {
 			foundSummary = true
 			break
 		}
@@ -571,5 +572,64 @@ func TestTrimPrefersKeepingToolHeavyTurns(t *testing.T) {
 	}
 	if !foundToolMessage {
 		t.Fatal("expected tool result to remain when tool-heavy turn is prioritized")
+	}
+}
+
+func TestBuildSummaryMessageNewPrefix(t *testing.T) {
+	st := session.NewStore(10, "sys", "")
+	s := st.Get("k")
+	for i := 0; i < 15; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		s.Append(provider.Message{Role: role, Content: fmt.Sprintf("msg%d", i)}, st.MaxTurns())
+	}
+	hist := s.HistoryForLLM(provider.ModelHintTask)
+	for _, m := range hist {
+		if m.Role == "system" && strings.Contains(m.Content, "[History summary]") {
+			t.Errorf("old prefix found; expected CONTEXT COMPACTION prefix")
+		}
+	}
+}
+
+func TestRefreshSummaryCacheAffectsTrimOutput(t *testing.T) {
+	// maxTurns=2: HistoryForLLM will compress turns beyond the last 2.
+	// We add 4 turns so turns 1 and 2 get compressed into the summary block.
+	// RefreshSummaryCache is called before HistoryForLLM so LLM summaries are
+	// available when trimMessages runs.
+	st := session.NewStore(2, "sys", "")
+	s := st.Get("sess1")
+
+	for i := 1; i <= 4; i++ {
+		// Use Append with maxTurns=100 so Append itself does NOT trim.
+		s.Append(provider.Message{Role: "user", Content: fmt.Sprintf("question %d", i)}, 100)
+		s.Append(provider.Message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)}, 100)
+	}
+
+	// Inject LLM summaries before HistoryForLLM compresses turns 1 and 2.
+	turns := []memory.TurnSummary{
+		{N: 1, LLMSummary: "LLM summary for turn one"},
+		{N: 2, LLMSummary: "LLM summary for turn two"},
+	}
+	st.RefreshSummaryCache("sess1", turns)
+
+	// HistoryForLLM uses maxTurns=2, so it compresses turns 1 and 2 into summary.
+	hist := s.HistoryForLLM(provider.ModelHintTask)
+
+	found := false
+	for _, m := range hist {
+		if m.Role == "system" && strings.Contains(m.Content, "CONTEXT COMPACTION") {
+			found = true
+			if !strings.Contains(m.Content, "LLM summary for turn") {
+				t.Errorf("expected LLM summary text in compaction block, got:\n%s", m.Content)
+			}
+			if strings.Contains(m.Content, "U:question 1") {
+				t.Errorf("found rule-based fallback for turn 1; LLM summary should take precedence:\n%s", m.Content)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected CONTEXT COMPACTION block in HistoryForLLM output")
 	}
 }

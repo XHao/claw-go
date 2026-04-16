@@ -375,6 +375,13 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 	// Capture turn index right after the user message is appended.
 	turnN := sess.TurnCount()
 
+	// Refresh LLM summary cache so trimMessages can use pre-generated summaries.
+	if a.memory != nil {
+		if turns, err := a.memory.ForSession(msg.SessionKey).LoadRecent(0); err == nil {
+			a.sessions.RefreshSummaryCache(msg.SessionKey, turns)
+		}
+	}
+
 	// L2: inject relevant episodic memory turns as temporary system context.
 	a.injectEpisodicMemory(msg)
 
@@ -426,12 +433,25 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 
 		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
-			log.Error("LLM completion failed", "err", err)
-			a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, text, "", turnActions, i, true)
+			ce := provider.Classify(err)
+			if ce.ShouldCompress {
+				if a.compressHistory(sess) {
+					continue
+				}
+				if a.llmCompressHistory(ctx, sess, msg.SessionKey) {
+					continue
+				}
+			}
+			log.Error("LLM completion failed", "reason", ce.Reason, "err", err)
+			a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, i, true)
 			if ch != nil {
+				userMsg := ce.UserMessage
+				if userMsg == "" {
+					userMsg = "抱歉，遇到了错误，请重试。"
+				}
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
-					Text:   "抱歉，遇到了错误，请重试。",
+					Text:   userMsg,
 				})
 			}
 			return
@@ -447,40 +467,8 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 				ToolCalls: result.ToolCalls,
 			}, a.sessions.MaxTurns())
 
-			var allResults []ipc.ToolResult
-
-			for _, tc := range result.ToolCalls {
-				log.Info("tool call requested", "tool", tc.Function.Name, "call_id", tc.ID)
-
-				var output string
-				var isErr bool
-
-				if a.toolRunner != nil {
-					toolProgress := func(m string) {
-						log.Info("tool progress", "tool", tc.Function.Name, "msg", m)
-						if ch != nil {
-							_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Delta: m + "\n"})
-						}
-					}
-					rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
-					output, isErr = a.toolRunner.Run(ctx, tc.Function.Name, tc.Function.Arguments, rctx, toolProgress)
-					if isErr {
-						log.Warn("tool error", "tool", tc.Function.Name)
-					} else {
-						log.Info("tool result", "tool", tc.Function.Name)
-					}
-				} else {
-					output = "工具不可用：守护进程未配置工具执行器"
-					isErr = true
-				}
-
-				allResults = append(allResults, ipc.ToolResult{
-					CallID:  tc.ID,
-					Name:    tc.Function.Name,
-					Output:  output,
-					IsError: isErr,
-				})
-			}
+			rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
+			allResults := runToolBatch(ctx, log, result.ToolCalls, a.toolRunner, rctx, ch, msg.ChatID)
 
 			// Append all tool results as "tool" role messages.
 			for _, res := range allResults {
@@ -504,7 +492,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 			log.Warn("LLM returned empty content", "stop_reason", result.StopReason, "iteration", i)
 		}
 		sess.Append(provider.Message{Role: "assistant", Content: result.Content}, a.sessions.MaxTurns())
-		a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, text, result.Content, turnActions, i, false)
+		a.saveTurnMemory(log, msg.SessionKey, turnN, text, result.Content, turnActions, i, false)
 		if ch == nil {
 			log.Error("channel not registered", "channel_id", msg.ChannelType+":"+msg.ChannelName)
 			return
@@ -520,7 +508,7 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 
 	// Safety: exhausted iterations without a final reply.
 	log.Warn("max tool iterations reached", "max", a.maxIterations)
-	a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, text, "", turnActions, a.maxIterations, true)
+	a.saveTurnMemory(log, msg.SessionKey, turnN, text, "", turnActions, a.maxIterations, true)
 	a.continueRequested.Store(msg.SessionKey, true)
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
@@ -563,12 +551,25 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 
 		result, err := a.provider.CompleteWithTools(loopCtx, messages, tools)
 		if err != nil {
-			log.Error("LLM completion failed", "err", err)
-			a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
+			ce := provider.Classify(err)
+			if ce.ShouldCompress {
+				if a.compressHistory(sess) {
+					continue
+				}
+				if a.llmCompressHistory(ctx, sess, msg.SessionKey) {
+					continue
+				}
+			}
+			log.Error("LLM completion failed", "reason", ce.Reason, "err", err)
+			a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, i, true)
 			if ch != nil {
+				userMsg := ce.UserMessage
+				if userMsg == "" {
+					userMsg = "抱歉，遇到了错误，请重试。"
+				}
 				_ = ch.Send(ctx, channel.OutboundMessage{
 					ChatID: msg.ChatID,
-					Text:   "抱歉，遇到了错误，请重试。",
+					Text:   userMsg,
 				})
 			}
 			return
@@ -582,40 +583,8 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 				ToolCalls: result.ToolCalls,
 			}, a.sessions.MaxTurns())
 
-			var allResults []ipc.ToolResult
-
-			for _, tc := range result.ToolCalls {
-				log.Info("tool call requested", "tool", tc.Function.Name, "call_id", tc.ID)
-
-				var output string
-				var isErr bool
-
-				if a.toolRunner != nil {
-					toolProgress := func(m string) {
-						log.Info("tool progress", "tool", tc.Function.Name, "msg", m)
-						if ch != nil {
-							_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Delta: m + "\n"})
-						}
-					}
-					rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
-					output, isErr = a.toolRunner.Run(ctx, tc.Function.Name, tc.Function.Arguments, rctx, toolProgress)
-					if isErr {
-						log.Warn("tool error", "tool", tc.Function.Name)
-					} else {
-						log.Info("tool result", "tool", tc.Function.Name)
-					}
-				} else {
-					output = "工具不可用：守护进程未配置工具执行器"
-					isErr = true
-				}
-
-				allResults = append(allResults, ipc.ToolResult{
-					CallID:  tc.ID,
-					Name:    tc.Function.Name,
-					Output:  output,
-					IsError: isErr,
-				})
-			}
+			rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
+			allResults := runToolBatch(ctx, log, result.ToolCalls, a.toolRunner, rctx, ch, msg.ChatID)
 
 			for _, res := range allResults {
 				content := normalizeToolResultContent(res)
@@ -636,7 +605,7 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 			log.Warn("LLM returned empty content", "stop_reason", result.StopReason, "iteration", i)
 		}
 		sess.Append(provider.Message{Role: "assistant", Content: result.Content}, a.sessions.MaxTurns())
-		a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, "/continue", result.Content, turnActions, i, false)
+		a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", result.Content, turnActions, i, false)
 		if ch == nil {
 			log.Error("channel not registered", "channel_id", msg.ChannelType+":"+msg.ChannelName)
 			return
@@ -652,7 +621,7 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 
 	// Exhausted iterations again.
 	log.Warn("max tool iterations reached again", "max", a.maxIterations)
-	a.saveTurnMemory(log, ctx, msg.SessionKey, turnN, "/continue", "", turnActions, a.maxIterations, true)
+	a.saveTurnMemory(log, msg.SessionKey, turnN, "/continue", "", turnActions, a.maxIterations, true)
 	a.continueRequested.Store(msg.SessionKey, true)
 	if ch != nil {
 		_ = ch.Send(ctx, channel.OutboundMessage{
@@ -751,7 +720,6 @@ func (a *Agent) SessionKeys() []string {
 // Errors are logged as warnings and never propagate to callers.
 func (a *Agent) saveTurnMemory(
 	log *slog.Logger,
-	ctx context.Context,
 	sessionKey string,
 	turnN int,
 	userText, replyText string,
@@ -767,38 +735,84 @@ func (a *Agent) saveTurnMemory(
 		log.Warn("memory save failed", "err", err)
 	}
 
-	// Async: evaluate whether this turn contains knowledge worth distilling.
-	if a.distiller != nil && !isError {
+	// Async: generate LLM turn summary and (optionally) distill knowledge.
+	// Use context.Background() so the goroutine outlives the per-request context,
+	// which is cancelled as soon as Dispatch returns.
+	if (a.sessions.Summarizer() != nil && !isError && a.memory != nil) || (a.distiller != nil && !isError) {
+		bgCtx := context.Background()
 		go func() {
-			result := a.distiller.EvalTurn(ctx, summary)
-			if !result.Valuable || result.Topic == "" || result.Summary == "" {
-				return
-			}
-			log.Info("auto-distill: valuable turn detected", "topic", result.Topic)
-			// If the summary signals a conflict ("更新：" prefix), trigger a full
-			// Map-Reduce distillation so the Reduce phase can apply conflict annotations
-			// ([已更新] / [已废弃]) with full context. Otherwise, append incrementally.
-			if strings.HasPrefix(result.Summary, "更新：") {
-				log.Info("auto-distill: conflict detected, triggering full distill", "topic", result.Topic)
-				if _, err := a.distiller.Distill(ctx, result.Topic, nil); err != nil {
-					log.Warn("auto-distill: full distill failed", "topic", result.Topic, "err", err)
+			// Generate LLM turn summary and persist as patch record.
+			if a.sessions.Summarizer() != nil && !isError && a.memory != nil {
+				sess := a.sessions.Get(sessionKey)
+				msgs := extractTurnMessages(sess, turnN)
+				if len(msgs) > 0 {
+					if llmSummary, err := a.sessions.Summarizer().SummarizeTurn(bgCtx, msgs); err == nil && llmSummary != "" {
+						summary.LLMSummary = llmSummary
+						if patchErr := a.memory.ForSession(sessionKey).UpdateSummary(summary); patchErr != nil {
+							log.Warn("memory patch summary failed", "err", patchErr)
+						}
+					} else if err != nil {
+						log.Warn("turn summarization failed, using rule-based fallback", "err", err)
+					}
 				}
-				return
 			}
 
-			existing, _ := a.distiller.Store().Load(result.Topic)
-			var newContent string
-			if existing == "" {
-				newContent = fmt.Sprintf("# %s\n\n%s\n", result.Topic, result.Summary)
-			} else {
-				separator := fmt.Sprintf("\n\n---\n*%s 自动蒸馏*\n\n", time.Now().Format("2006-01-02 15:04"))
-				newContent = existing + separator + result.Summary + "\n"
-			}
-			if err := a.distiller.Store().Save(result.Topic, newContent); err != nil {
-				log.Warn("auto-distill: save failed", "topic", result.Topic, "err", err)
+			// Evaluate whether this turn contains knowledge worth distilling.
+			if a.distiller != nil {
+				result := a.distiller.EvalTurn(bgCtx, summary)
+				if !result.Valuable || result.Topic == "" || result.Summary == "" {
+					return
+				}
+				log.Info("auto-distill: valuable turn detected", "topic", result.Topic)
+				// If the summary signals a conflict ("更新：" prefix), trigger a full
+				// Map-Reduce distillation so the Reduce phase can apply conflict annotations
+				// ([已更新] / [已废弃]) with full context. Otherwise, append incrementally.
+				if strings.HasPrefix(result.Summary, "更新：") {
+					log.Info("auto-distill: conflict detected, triggering full distill", "topic", result.Topic)
+					if _, err := a.distiller.Distill(bgCtx, result.Topic, nil); err != nil {
+						log.Warn("auto-distill: full distill failed", "topic", result.Topic, "err", err)
+					}
+					return
+				}
+
+				existing, _ := a.distiller.Store().Load(result.Topic)
+				var newContent string
+				if existing == "" {
+					newContent = fmt.Sprintf("# %s\n\n%s\n", result.Topic, result.Summary)
+				} else {
+					separator := fmt.Sprintf("\n\n---\n*%s 自动蒸馏*\n\n", time.Now().Format("2006-01-02 15:04"))
+					newContent = existing + separator + result.Summary + "\n"
+				}
+				if err := a.distiller.Store().Save(result.Topic, newContent); err != nil {
+					log.Warn("auto-distill: save failed", "topic", result.Topic, "err", err)
+				}
 			}
 		}()
 	}
+}
+
+// extractTurnMessages returns the messages belonging to turn number turnN
+// from sess. turnN is 1-based (matches TurnSummary.N).
+// Returns the user message and all subsequent non-user messages up to
+// (not including) the next user message.
+func extractTurnMessages(sess *session.Session, turnN int) []provider.Message {
+	history := sess.History()
+	userCount := 0
+	start := -1
+	for i, m := range history {
+		if m.Role == "user" {
+			userCount++
+			if userCount == turnN {
+				start = i
+			} else if userCount == turnN+1 {
+				return history[start:i]
+			}
+		}
+	}
+	if start >= 0 {
+		return history[start:]
+	}
+	return nil
 }
 
 // injectEpisodicMemory searches cross-session memory for turns relevant to the
@@ -854,15 +868,22 @@ func (a *Agent) injectProcedures(ctx context.Context, msg channel.InboundMessage
 	}
 	var sb strings.Builder
 	sb.WriteString("[相关操作流程]\n")
+	anyBlocked := false
 	for _, p := range procs {
-		fmt.Fprintf(&sb, "\n## %s\n%s\n", p.Name, p.Body)
+		safe, blocked := sanitizeInjection(p.Name+".md", p.Body)
+		if blocked {
+			a.log.Warn("procedure injection blocked: prompt injection detected",
+				"procedure", p.Name)
+			anyBlocked = true
+		}
+		fmt.Fprintf(&sb, "\n## %s\n%s\n", p.Name, safe)
 	}
 	sess := a.sessions.Get(msg.SessionKey)
 	sess.AppendEphemeral(provider.Message{
 		Role:    "system",
 		Content: sb.String(),
 	})
-	a.log.Info("injected procedures", "tags", tags, "count", len(procs))
+	a.log.Info("injected procedures", "tags", tags, "count", len(procs), "blocked", anyBlocked)
 }
 
 // PersistProcedureLayer assembles all procedures into prompts/20-procedures.md
@@ -941,8 +962,13 @@ func (a *Agent) autoInjectExperiences(ctx context.Context, msg channel.InboundMe
 		if err != nil || content == "" {
 			continue
 		}
-		a.sessions.InjectContextEphemeral(msg.SessionKey, content)
-		a.log.Info("auto-injected experience", "topic", m.Topic, "session", msg.SessionKey)
+		safe, blocked := sanitizeInjection(m.Topic+".md", content)
+		if blocked {
+			a.log.Warn("auto-inject blocked: prompt injection detected in experience file",
+				"topic", m.Topic, "session", msg.SessionKey)
+		}
+		a.sessions.InjectContextEphemeral(msg.SessionKey, safe)
+		a.log.Info("auto-injected experience", "topic", m.Topic, "session", msg.SessionKey, "blocked", blocked)
 		if ch != nil {
 			_ = ch.Send(ctx, channel.OutboundMessage{
 				ChatID: msg.ChatID,
@@ -991,4 +1017,56 @@ func attachmentPaths(attachments []channel.Attachment) []string {
 		}
 	}
 	return paths
+}
+
+// compressHistory reduces the session's token budget to 2/3 of its current
+// value so that subsequent HistoryForLLM calls produce a shorter message list.
+// Returns true if the budget reduction actually caused fewer messages to be
+// returned (i.e. compression happened). The reduction is permanent — restoring
+// the budget would cause the same overflow on the next call.
+func (a *Agent) compressHistory(sess *session.Session) bool {
+	before := len(sess.HistoryForLLM(provider.ModelHintTask))
+	current := a.sessions.MaxTurns() * 1200 // approximate current budget
+	a.sessions.SetTokenBudget(current * 2 / 3)
+	after := len(sess.HistoryForLLM(provider.ModelHintTask))
+	return after < before
+}
+
+// llmCompressHistory generates LLM summaries for the oldest unsummarised turns
+// and refreshes the summary cache so that the next HistoryForLLM call uses
+// them during compression. Returns true if at least one summary was generated.
+// No-op (returns false) if memory or summarizer is not configured.
+func (a *Agent) llmCompressHistory(ctx context.Context, sess *session.Session, sessionKey string) bool {
+	if a.memory == nil || a.sessions.Summarizer() == nil {
+		return false
+	}
+	turns, err := a.memory.ForSession(sessionKey).LoadRecent(0)
+	if err != nil {
+		return false
+	}
+	summarized := 0
+	for _, t := range turns {
+		if summarized >= 3 {
+			break
+		}
+		if t.LLMSummary != "" {
+			continue
+		}
+		msgs := extractTurnMessages(sess, t.N)
+		if len(msgs) == 0 {
+			continue
+		}
+		if summary, err := a.sessions.Summarizer().SummarizeTurn(ctx, msgs); err == nil && summary != "" {
+			t.LLMSummary = summary
+			_ = a.memory.ForSession(sessionKey).UpdateSummary(t)
+			summarized++
+		}
+	}
+	if summarized > 0 {
+		if fresh, err := a.memory.ForSession(sessionKey).LoadRecent(0); err == nil {
+			a.sessions.RefreshSummaryCache(sessionKey, fresh)
+		}
+		return true
+	}
+	return false
 }
