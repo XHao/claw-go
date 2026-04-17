@@ -1,7 +1,7 @@
 ---
 name: user-profile
 layer: user-profile
-enabled: true
+enabled: false
 priority: 20
 ---
 

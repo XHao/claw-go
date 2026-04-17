@@ -11,6 +11,46 @@ import (
 	"github.com/XHao/claw-go/provider"
 )
 
+func TestRegisteredDefsByName(t *testing.T) {
+	r := &LocalRunner{}
+	r.Register(provider.ToolDef{Name: "tool_a", Description: "a"}, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return "a", nil
+	})
+	r.Register(provider.ToolDef{Name: "tool_b", Description: "b"}, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return "b", nil
+	})
+
+	got := r.RegisteredDefsByName([]string{"tool_b", "tool_a"})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 defs, got %d", len(got))
+	}
+	// Order follows input list.
+	if got[0].Name != "tool_b" || got[1].Name != "tool_a" {
+		t.Errorf("unexpected order: %v", []string{got[0].Name, got[1].Name})
+	}
+}
+
+func TestRegisteredDefsByName_UnknownSkipped(t *testing.T) {
+	r := &LocalRunner{}
+	r.Register(provider.ToolDef{Name: "tool_x", Description: "x"}, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		return "x", nil
+	})
+
+	got := r.RegisteredDefsByName([]string{"tool_x", "nonexistent", "bash"})
+	// "nonexistent" skipped (not registered), "bash" skipped (builtin)
+	if len(got) != 1 || got[0].Name != "tool_x" {
+		t.Errorf("expected [tool_x], got %v", got)
+	}
+}
+
+func TestRegisteredDefsByName_Empty(t *testing.T) {
+	r := &LocalRunner{}
+	got := r.RegisteredDefsByName(nil)
+	if len(got) != 0 {
+		t.Errorf("expected empty, got %d", len(got))
+	}
+}
+
 func decodeInspectReport(t *testing.T, out string) map[string]any {
 	t.Helper()
 	var m map[string]any

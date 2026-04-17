@@ -72,31 +72,40 @@ func SocketPath() string {
 // Per-session short-term memory lives under {MemoryDir}/{sessionKey}/.
 func MemoryDir() string { return filepath.Join(Data(), "data", "memory") }
 
-// ExperiencesDir returns the directory for long-term per-topic experience files.
-// Each file is a Markdown document named {topic}.md.
-func ExperiencesDir() string { return filepath.Join(Data(), "data", "experiences") }
-
 // PromptsDir returns the directory where user-defined prompt layer files live.
 // Files are loaded at daemon startup to assemble the system prompt.
 func PromptsDir() string { return filepath.Join(Data(), "prompts") }
 
-// ProceduresDir returns the directory for L4 procedure files.
-// Each file is a Markdown document with YAML frontmatter describing tags and priority.
-func ProceduresDir() string { return filepath.Join(Data(), "data", "procedures") }
+// AgentExperiencesDir returns the experiences directory for a specific Agent.
+func AgentExperiencesDir(name string) string { return filepath.Join(AgentDir(name), "experiences") }
 
-// DynamicProfileFile returns the path to the agent-maintained user profile.
-// Facts observed during conversations are appended here over time.
-func DynamicProfileFile() string {
-	return filepath.Join(Data(), "data", "user-profile-dynamic.md")
-}
+// AgentProceduresDir returns the procedures directory for a specific Agent.
+func AgentProceduresDir(name string) string { return filepath.Join(AgentDir(name), "procedures") }
 
 // WeixinTokenFile returns the default path for the WeChat bot_token persistence file.
 func WeixinTokenFile() string { return filepath.Join(Data(), "weixin-token.json") }
 
+// AgentsDir returns the root directory for all Agent definitions.
+// Each Agent lives under {AgentsDir}/{name}/.
+func AgentsDir() string { return filepath.Join(Data(), "agents") }
+
+// AgentDir returns the directory for a specific Agent definition.
+func AgentDir(name string) string { return filepath.Join(AgentsDir(), name) }
+
+// AgentStateFile returns the path to the runtime agent state file.
+// This file tracks the current default agent name.
+func AgentStateFile() string { return filepath.Join(Data(), "agent-state.json") }
+
+// AgentMemoryDir returns the memory directory for a specific Agent.
+func AgentMemoryDir(name string) string { return filepath.Join(AgentDir(name), "memory") }
+
+// AgentSkillsDir returns the skills directory for a specific Agent.
+func AgentSkillsDir(name string) string { return filepath.Join(AgentDir(name), "skills") }
+
 // MkdirAll creates all necessary subdirectories under the data root.
 // Should be called once at daemon startup.
 func MkdirAll() error {
-	for _, d := range []string{Sessions(), Logs(), MemoryDir(), ExperiencesDir(), PromptsDir(), ProceduresDir()} {
+	for _, d := range []string{Sessions(), Logs(), MemoryDir(), PromptsDir(), AgentsDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
 		}

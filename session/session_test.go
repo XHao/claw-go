@@ -633,3 +633,31 @@ func TestRefreshSummaryCacheAffectsTrimOutput(t *testing.T) {
 		t.Error("expected CONTEXT COMPACTION block in HistoryForLLM output")
 	}
 }
+
+func TestSessionAgentID(t *testing.T) {
+	tmp := t.TempDir()
+	store := session.NewStore(10, "sys", tmp)
+	sess := store.Get("main")
+	if sess.AgentID() != "" {
+		t.Errorf("initial AgentID should be empty, got %q", sess.AgentID())
+	}
+	store.SetAgentID("main", "lawyer")
+	if sess.AgentID() != "lawyer" {
+		t.Errorf("AgentID after set = %q, want 'lawyer'", sess.AgentID())
+	}
+}
+
+func TestSessionAgentIDPersists(t *testing.T) {
+	tmp := t.TempDir()
+	store1 := session.NewStore(10, "sys", tmp)
+	store1.SetAgentID("main", "coder")
+	// Force a save by appending a message
+	store1.Get("main").Append(provider.Message{Role: "user", Content: "hi"}, 10)
+
+	// Reload store from disk.
+	store2 := session.NewStore(10, "sys", tmp)
+	sess2 := store2.Get("main")
+	if sess2.AgentID() != "coder" {
+		t.Errorf("AgentID after reload = %q, want 'coder'", sess2.AgentID())
+	}
+}

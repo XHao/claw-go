@@ -43,6 +43,10 @@ The more concrete the instruction, the harder it is for the model to drift.
 
 One concrete sentence does the work of a dozen abstract adjectives.
 
+**The verifiability test:** after writing a rule, ask yourself — can I look at
+the model's output and judge within 3 seconds whether this rule was followed?
+If not, the rule is too abstract and needs to be split into concrete behaviors.
+
 ### 3. Reasons outlast commands
 
 Give the model a *why*, not just a *what*. Bare commands degrade over long
@@ -74,10 +78,80 @@ from *who* → *relationship* → *how* → *what*:
 Earlier layers set the frame; later layers add specifics. This mirrors how
 humans process context: establish who you're talking to, then get into details.
 
+**Bonus: stable prefix = cache-friendly.** Identity and domain layers rarely
+change, so putting them first means the model's prompt cache can reuse the
+prefix across conversations. Claw's priority system achieves this naturally.
+
+### 5. Only write rules that change defaults
+
+Before adding a rule, ask: *if I removed this line, would the model behave
+differently?*
+
+| Rule                                | Without it?                     | Verdict    |
+|-------------------------------------|---------------------------------|------------|
+| "Be accurate"                       | Model already tries to be       | ❌ Delete  |
+| "Don't restate my question"         | Model restates every time       | ✅ Keep    |
+| "Use Python"                        | Model might pick any language   | ✅ Keep    |
+| "Be respectful"                     | Model won't be rude anyway      | ❌ Delete  |
+
+Every token in the prompt has a cost — not just money, but attention dilution.
+**100 rules at 60% compliance each are worse than 10 rules at 95%.** After
+writing all your rules, run the "deletion test" on each one: delete it, check
+if outputs get worse. If not, leave it out.
+
+### 6. Collect pet peeves, iterate relentlessly
+
+Maintain a **"Never do this"** list. Every time the model produces an output
+that makes you wince, add an entry.
+
+Why this is the highest-ROI section of your prompt: each pet peeve is a
+real behavior you personally verified the model exhibits, not a theoretical
+guard. Over time this list becomes your most valuable prompt asset.
+
+Practical tips:
+- Put it at the end of `10-behavior.md` (or as a standalone layer)
+- Review periodically — some pet peeves disappear after model upgrades
+- Each entry should be a specific, observable prohibition (principle 1 + 2)
+
+### 7. Mind the token budget
+
+Keep your **persona/behavior/user-profile text** within **500–800 tokens**.
+
+| Tokens  | Status                                                         |
+|---------|----------------------------------------------------------------|
+| < 300   | Too thin — constraints are insufficient, behavior is unstable  |
+| **500–800** | **Sweet spot** — enough rules, attention stays focused     |
+| > 1500  | Compliance starts to drop; rules interfere with each other     |
+| > 3000  | Model effectively ignores rules in the middle                  |
+
+This budget covers the text *you* write in the prompt files. It does not
+include tool schemas, few-shot examples, or framework-injected content —
+those are managed by Claw automatically and don't compete for the same
+attention window.
+
+When over budget, cut in this order:
+1. Rules that duplicate default behavior (principle 5)
+2. Near-synonyms that can be merged
+3. Over-explained reasons — one sentence is enough
+
+### Quick checklist
+
+Run through this before finalizing your prompt layers:
+
+- [ ] **Negation > affirmation**: are constraints written as prohibitions?
+- [ ] **Specific > abstract**: can you verify each rule in 3 seconds?
+- [ ] **Reasons attached**: do key rules carry a one-sentence *why*?
+- [ ] **Layered structure**: persona → behavior → user-profile, clear separation?
+- [ ] **Deletion test**: would removing each rule make outputs worse?
+- [ ] **No cross-layer duplication**: is every rule stated exactly once?
+- [ ] **Pet peeves list**: do you have an evolving "never do this" section?
+- [ ] **Token budget**: is your total text within 500–800 tokens?
+- [ ] **Sculpture test**: are you chipping away excess, or piling on material?
+
 ### Putting it together
 
 Here is a fragment from the default `01-persona.md` — notice how it applies
-all four principles:
+the principles above:
 
 ```markdown
 You are a senior software engineer who happens to be available 24/7. You have
@@ -107,6 +181,9 @@ phrases like "Great question!".
 - **Restating defaults.** LLMs already try to be "helpful" and "accurate".
   Don't waste tokens reinforcing default behavior — focus on where you want
   to *diverge* from it.
+- **Duplicating across layers.** If a rule appears in both `02-domain.md` and
+  `20-user-profile.md`, you're paying double the tokens and risking subtle
+  wording mismatches that confuse the model. Each rule lives in exactly one layer.
 
 ---
 

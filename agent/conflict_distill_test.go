@@ -66,7 +66,7 @@ func TestSaveTurnMemory_ConflictSummaryTriggersFullDistill(t *testing.T) {
 
 	// Call saveTurnMemory directly (white-box).
 	a.saveTurnMemory(slog.Default(), "s1", 2,
-		"docker overlay 网络", "overlay 更适合多主机", nil, 1, false)
+		"docker overlay 网络", "overlay 更适合多主机", nil, 1, false, distiller)
 
 	// Give async goroutine time to complete.
 	time.Sleep(300 * time.Millisecond)

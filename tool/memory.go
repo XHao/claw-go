@@ -130,8 +130,10 @@ var SaveMemoryDef = provider.ToolDef{
 }
 
 // RegisterSaveMemory registers the save_memory tool with runner under the "core" group.
-func RegisterSaveMemory(runner *LocalRunner, store *knowledge.ExperienceStore, procStore *knowledge.ProcedureStore, onProcedureSaved func()) {
+// getStores is called at tool invocation time to retrieve the current Agent's stores.
+func RegisterSaveMemory(runner *LocalRunner, getStores func() (*knowledge.ExperienceStore, *knowledge.ProcedureStore), onProcedureSaved func()) {
 	runner.RegisterGroup("core", SaveMemoryDef, func(ctx context.Context, argsJSON string, _ RunContext, _ func(string)) (string, error) {
+		store, procStore := getStores()
 		var p struct {
 			Topic   string `json:"topic"`
 			Content string `json:"content"`

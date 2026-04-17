@@ -150,6 +150,20 @@ func (r *LocalRunner) RegisteredDefs() []provider.ToolDef {
 	return r.RegisteredDefsByGroup()
 }
 
+// RegisteredDefsByName returns the ToolDef slice for registered (non-builtin)
+// tools whose names appear in the given list. Order follows the input list.
+// Unknown names are silently skipped.
+func (r *LocalRunner) RegisteredDefsByName(names []string) []provider.ToolDef {
+	r.ensureBuiltinHandlers()
+	out := make([]provider.ToolDef, 0, len(names))
+	for _, name := range names {
+		if e, ok := r.handlers[name]; ok && !e.builtin {
+			out = append(out, e.def)
+		}
+	}
+	return out
+}
+
 // RegisteredDefsByGroup returns the ToolDef slice for registered tools that
 // belong to any of the specified groups. If no groups are given, all registered
 // tools are returned.
@@ -1094,6 +1108,38 @@ func (r *LocalRunner) runWriteFile(argsJSON string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), args.Path), nil
+}
+
+// WithoutTools returns a shallow copy of the runner with the specified tool names
+// excluded. Used by Worker Agents to prevent recursive plan_tasks calls.
+func (r *LocalRunner) WithoutTools(names ...string) *LocalRunner {
+	exclude := make(map[string]bool, len(names))
+	for _, n := range names {
+		exclude[n] = true
+	}
+	// Build allowed list from builtins, excluding specified names.
+	all := AllDefs(nil)
+	var allowed []string
+	for _, d := range all {
+		if !exclude[d.Name] {
+			allowed = append(allowed, d.Name)
+		}
+	}
+	c := &LocalRunner{
+		BashTimeoutSeconds: r.BashTimeoutSeconds,
+		AllowedCommands:    r.AllowedCommands,
+		AllowedTools:       allowed,
+		MaxFileBytes:       r.MaxFileBytes,
+	}
+	// Copy registered (non-builtin) handlers, excluding specified names.
+	r.ensureBuiltinHandlers()
+	c.ensureBuiltinHandlers()
+	for name, entry := range r.handlers {
+		if !exclude[name] && !entry.builtin {
+			c.handlers[name] = entry
+		}
+	}
+	return c
 }
 
 func (r *LocalRunner) runListFiles(argsJSON string) (string, error) {

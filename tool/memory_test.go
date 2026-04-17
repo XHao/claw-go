@@ -75,11 +75,15 @@ func TestRecallMemory_NoHistoryReturnsEmptyTurns(t *testing.T) {
 	}
 }
 
+func makeStoreGetter(exp *knowledge.ExperienceStore, proc *knowledge.ProcedureStore) func() (*knowledge.ExperienceStore, *knowledge.ProcedureStore) {
+	return func() (*knowledge.ExperienceStore, *knowledge.ProcedureStore) { return exp, proc }
+}
+
 func TestSaveMemory_CreatesNewFile(t *testing.T) {
 	dir := t.TempDir()
 	expStore := knowledge.NewExperienceStore(dir)
 	runner := &tool.LocalRunner{}
-	tool.RegisterSaveMemory(runner, expStore, nil, nil)
+	tool.RegisterSaveMemory(runner, makeStoreGetter(expStore, nil), nil)
 
 	argsJSON := `{"topic":"golang","content":"goroutine 泄漏可用 pprof /debug/pprof/goroutine 排查","type":"knowledge"}`
 	out, isErr := runner.Run(context.Background(), "save_memory", argsJSON, tool.RunContext{}, nil)
@@ -100,7 +104,7 @@ func TestSaveMemory_AppendsToExistingFile(t *testing.T) {
 	expStore := knowledge.NewExperienceStore(dir)
 	_ = expStore.Save("golang", "# golang\n\n旧内容")
 	runner := &tool.LocalRunner{}
-	tool.RegisterSaveMemory(runner, expStore, nil, nil)
+	tool.RegisterSaveMemory(runner, makeStoreGetter(expStore, nil), nil)
 
 	argsJSON := `{"topic":"golang","content":"新内容：channel 方向类型提升安全性"}`
 	_, isErr := runner.Run(context.Background(), "save_memory", argsJSON, tool.RunContext{}, nil)
@@ -120,7 +124,7 @@ func TestSaveMemory_EmptyTopicReturnsError(t *testing.T) {
 	dir := t.TempDir()
 	expStore := knowledge.NewExperienceStore(dir)
 	runner := &tool.LocalRunner{}
-	tool.RegisterSaveMemory(runner, expStore, nil, nil)
+	tool.RegisterSaveMemory(runner, makeStoreGetter(expStore, nil), nil)
 
 	out, isErr := runner.Run(context.Background(), "save_memory", `{"topic":"","content":"something"}`, tool.RunContext{}, nil)
 	if !isErr {
@@ -132,7 +136,7 @@ func TestSaveMemory_EmptyContentReturnsError(t *testing.T) {
 	dir := t.TempDir()
 	expStore := knowledge.NewExperienceStore(dir)
 	runner := &tool.LocalRunner{}
-	tool.RegisterSaveMemory(runner, expStore, nil, nil)
+	tool.RegisterSaveMemory(runner, makeStoreGetter(expStore, nil), nil)
 
 	out, isErr := runner.Run(context.Background(), "save_memory", `{"topic":"golang","content":""}`, tool.RunContext{}, nil)
 	if !isErr {
@@ -146,7 +150,7 @@ func TestSaveMemory_ProcedureWritesToProcedureStore(t *testing.T) {
 	expStore := knowledge.NewExperienceStore(expDir)
 	procStore := knowledge.NewProcedureStore(procDir)
 	runner := &tool.LocalRunner{}
-	tool.RegisterSaveMemory(runner, expStore, procStore, nil)
+	tool.RegisterSaveMemory(runner, makeStoreGetter(expStore, procStore), nil)
 
 	argsJSON := `{"topic":"debug-golang","content":"遇到 panic 先跑 go test -race","type":"procedure"}`
 	out, isErr := runner.Run(context.Background(), "save_memory", argsJSON, tool.RunContext{}, nil)
@@ -180,7 +184,7 @@ func TestSaveMemory_ProcedureCallsCallback(t *testing.T) {
 	runner := &tool.LocalRunner{}
 
 	called := make(chan struct{}, 1)
-	tool.RegisterSaveMemory(runner, expStore, procStore, func() {
+	tool.RegisterSaveMemory(runner, makeStoreGetter(expStore, procStore), func() {
 		called <- struct{}{}
 	})
 

@@ -48,6 +48,7 @@ type Session struct {
 	Key     string
 	Name    string // human-readable name chosen by the user
 	history []provider.Message
+	agentID string // Persona Agent bound to this session
 	mu      sync.Mutex
 	store   *Store // back-reference for auto-save
 }
@@ -63,6 +64,13 @@ type trimSettings struct {
 	budget        int
 	keepRecent    int
 	charsPerToken float64
+}
+
+// AgentID returns the Persona Agent name bound to this session.
+func (s *Session) AgentID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.agentID
 }
 
 // TurnCount returns the number of completed dialogue turns (user+assistant pairs).
@@ -431,6 +439,7 @@ type sessionFile struct {
 	Key     string             `json:"key"`
 	Name    string             `json:"name"`
 	History []provider.Message `json:"history"`
+	AgentID string             `json:"agent_id,omitempty"`
 }
 
 // TurnSummarizer generates a structured summary for a single conversation turn.
@@ -655,6 +664,15 @@ func (st *Store) Keys() []string {
 		return true
 	})
 	return keys
+}
+
+// SetAgentID binds a Persona Agent name to a session and persists it.
+func (s *Store) SetAgentID(sessionKey, agentID string) {
+	sess := s.Get(sessionKey)
+	sess.mu.Lock()
+	sess.agentID = agentID
+	sess.mu.Unlock()
+	s.save(sess)
 }
 
 // MaxTurns returns the configured history turn limit.
@@ -926,6 +944,7 @@ func (st *Store) save(sess *Session) {
 		Key:     sess.Key,
 		Name:    sess.Name,
 		History: make([]provider.Message, len(sess.history)),
+		AgentID: sess.agentID,
 	}
 	copy(sf.History, sess.history)
 	sess.mu.Unlock()
@@ -978,6 +997,7 @@ func (st *Store) loadAll() {
 			Key:     sf.Key,
 			Name:    sf.Name,
 			history: sf.History,
+			agentID: sf.AgentID,
 			store:   st,
 		}
 		st.sessions.Store(sf.Key, sess)

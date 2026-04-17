@@ -42,6 +42,8 @@ type OutboundMessage struct {
 	Delta            string // streaming: incremental text chunk
 	ReplyToMessageID string
 	Usage            *ipc.LLMUsageEvent
+	AgentID          string // current agent id, sent to client for UI display
+	AgentName        string // human-readable agent name
 }
 
 // DispatchFunc is called by the channel for each inbound user message.

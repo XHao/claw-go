@@ -179,6 +179,28 @@ func (s *Store) LoadRecent(maxTurns int) ([]TurnSummary, error) {
 	return turns, nil
 }
 
+// LoadRecentForAgent returns turns for a specific agentID only.
+// If agentID is empty, behaves identically to LoadRecent.
+func (s *Store) LoadRecentForAgent(maxTurns int, agentID string) ([]TurnSummary, error) {
+	if agentID == "" {
+		return s.LoadRecent(maxTurns)
+	}
+	all, err := s.LoadRecent(0)
+	if err != nil {
+		return nil, err
+	}
+	var filtered []TurnSummary
+	for _, t := range all {
+		if t.AgentID == agentID {
+			filtered = append(filtered, t)
+		}
+	}
+	if maxTurns > 0 && len(filtered) > maxTurns {
+		filtered = filtered[len(filtered)-maxTurns:]
+	}
+	return filtered, nil
+}
+
 // CompactDay rewrites the JSONL file for the given day (format "2006-01-02")
 // by merging patch records into their originals, producing one record per N.
 // Uses atomic write (tmp → rename). No-op if the file does not exist.

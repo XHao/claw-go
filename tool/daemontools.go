@@ -12,6 +12,65 @@ import (
 	"github.com/XHao/claw-go/session"
 )
 
+// WorkerTaskDef describes a single sub-task for parallel execution.
+// This mirrors agent.WorkerTask but lives in the tool package to avoid circular imports.
+type WorkerTaskDef struct {
+	ID          string   `json:"id"`
+	Description string   `json:"description"`
+	ToolsHint   []string `json:"tools_hint,omitempty"`
+}
+
+// WorkerResultDef holds the output of a single Worker execution.
+// This mirrors agent.WorkerResult but lives in the tool package to avoid circular imports.
+type WorkerResultDef struct {
+	TaskID string
+	Output string
+	Error  error
+}
+
+// WorkerBatchRunner is a function that executes a batch of worker tasks concurrently.
+// It is implemented by agent.RunWorkerBatch (via an adapter in main.go) to avoid
+// the tool→agent circular import.
+type WorkerBatchRunner func(ctx context.Context, p provider.Provider, tasks []WorkerTaskDef, runner *LocalRunner, sp *string) []WorkerResultDef
+
+// RegisterPlanTasks registers the plan_tasks tool that triggers parallel Worker Agent execution.
+// p is the shared LLM provider used by worker agents.
+// runWorkers is the batch-execution function (typically an adapter around agent.RunWorkerBatch).
+func RegisterPlanTasks(runner *LocalRunner, p provider.Provider, systemPrompt *string, runWorkers WorkerBatchRunner) {
+	def := provider.ToolDef{
+		Name:        "plan_tasks",
+		Description: "Decompose a complex request into independent sub-tasks and execute them concurrently using isolated Worker Agents. Each worker runs its own reasoning loop. Use when tasks are independent and can be parallelized.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"tasks":{"type":"array","description":"List of independent sub-tasks to execute in parallel.","items":{"type":"object","properties":{"id":{"type":"string","description":"Unique task identifier."},"description":{"type":"string","description":"Full task description for the worker agent."},"tools_hint":{"type":"array","items":{"type":"string"},"description":"Optional list of tool names the worker may need."}},"required":["id","description"]}}},"required":["tasks"]}`),
+	}
+
+	runner.RegisterGroup("core", def, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
+		var args struct {
+			Tasks []WorkerTaskDef `json:"tasks"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return "", fmt.Errorf("plan_tasks: invalid args: %w", err)
+		}
+		if len(args.Tasks) == 0 {
+			return "", fmt.Errorf("plan_tasks: no tasks provided")
+		}
+
+		progress(fmt.Sprintf("开始并发执行 %d 个子任务...", len(args.Tasks)))
+		results := runWorkers(ctx, p, args.Tasks, runner, systemPrompt)
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("已完成 %d 个子任务：\n\n", len(results)))
+		for _, r := range results {
+			sb.WriteString(fmt.Sprintf("### 任务 %s\n", r.TaskID))
+			if r.Error != nil {
+				sb.WriteString(fmt.Sprintf("错误：%v\n\n", r.Error))
+			} else {
+				sb.WriteString(r.Output + "\n\n")
+			}
+		}
+		return sb.String(), nil
+	})
+}
+
 // RegisterDaemonTools registers all daemon-internal tools (knowledge, memory,
 // session operations) with runner. These tools capture daemon state via
 // closures and use rctx.SessionKey at call time.
@@ -19,7 +78,7 @@ func RegisterDaemonTools(
 	runner *LocalRunner,
 	llm provider.Provider,
 	mem *memory.Manager,
-	expStore *knowledge.ExperienceStore,
+	getExpStore func() *knowledge.ExperienceStore,
 	sessions *session.Store,
 ) {
 	// distill_knowledge -------------------------------------------------------
@@ -38,7 +97,7 @@ func RegisterDaemonTools(
 		if topic == "" {
 			return "", fmt.Errorf("distill_knowledge: topic is required")
 		}
-		d := knowledge.NewDistiller(llm, mem, expStore)
+		d := knowledge.NewDistiller(llm, mem, getExpStore())
 		content, err := d.Distill(ctx, topic, progress)
 		if err != nil {
 			return "", fmt.Errorf("distill_knowledge: %w", err)
@@ -57,7 +116,7 @@ func RegisterDaemonTools(
 		Description: "List all saved experience libraries with their sizes and last-update dates.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
 	}, func(ctx context.Context, argsJSON string, rctx RunContext, progress func(string)) (string, error) {
-		metas, err := expStore.List()
+		metas, err := getExpStore().List()
 		if err != nil {
 			return "", fmt.Errorf("list_experiences: %w", err)
 		}
@@ -89,7 +148,7 @@ func RegisterDaemonTools(
 		if topic == "" {
 			return "", fmt.Errorf("show_experience: topic is required")
 		}
-		content, err := expStore.Load(topic)
+		content, err := getExpStore().Load(topic)
 		if err != nil {
 			return "", fmt.Errorf("show_experience: %w", err)
 		}
@@ -115,7 +174,7 @@ func RegisterDaemonTools(
 		if topic == "" {
 			return "", fmt.Errorf("inject_experience: topic is required")
 		}
-		content, err := expStore.Load(topic)
+		content, err := getExpStore().Load(topic)
 		if err != nil {
 			return "", fmt.Errorf("inject_experience load: %w", err)
 		}

@@ -25,6 +25,7 @@ type TurnSummary struct {
 	Iters      int       `json:"iters,omitempty"`
 	IsError    bool      `json:"err,omitempty"`
 	LLMSummary string    `json:"llm_summary,omitempty"`
+	AgentID    string    `json:"agent_id,omitempty"`
 }
 
 // Action describes a single tool invocation in a compact, human-readable form.

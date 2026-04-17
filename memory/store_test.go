@@ -218,3 +218,53 @@ func TestPruneOldFilesViaRetainDays(t *testing.T) {
 		}
 	}
 }
+
+func TestSaveTurnWithAgentID(t *testing.T) {
+	tmp := t.TempDir()
+	mgr := NewManager(tmp)
+	store := mgr.ForSession("main")
+
+	turn := TurnSummary{
+		N:       1,
+		At:      time.Now(),
+		User:    "hello",
+		Reply:   "world",
+		AgentID: "lawyer",
+	}
+	if err := store.SaveTurn(turn); err != nil {
+		t.Fatalf("SaveTurn error: %v", err)
+	}
+
+	turns, err := store.LoadRecent(0)
+	if err != nil {
+		t.Fatalf("LoadRecent error: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("expected 1 turn, got %d", len(turns))
+	}
+	if turns[0].AgentID != "lawyer" {
+		t.Errorf("AgentID = %q, want 'lawyer'", turns[0].AgentID)
+	}
+}
+
+func TestLoadRecentFilterByAgent(t *testing.T) {
+	tmp := t.TempDir()
+	mgr := NewManager(tmp)
+	store := mgr.ForSession("main")
+
+	for i, agentID := range []string{"lawyer", "coder", "lawyer"} {
+		store.SaveTurn(TurnSummary{
+			N: i + 1, At: time.Now(), User: "q", AgentID: agentID,
+		})
+	}
+
+	turns, _ := store.LoadRecentForAgent(0, "lawyer")
+	if len(turns) != 2 {
+		t.Errorf("expected 2 lawyer turns, got %d", len(turns))
+	}
+	for _, t2 := range turns {
+		if t2.AgentID != "lawyer" {
+			t.Errorf("got AgentID %q, want 'lawyer'", t2.AgentID)
+		}
+	}
+}

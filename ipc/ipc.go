@@ -97,6 +97,9 @@ type Msg struct {
 	Usage    *LLMUsageEvent `json:"usage,omitempty"`
 	// recent history sent with select-ack
 	History []HistoryEntry `json:"history,omitempty"`
+	// agent management
+	AgentID   string `json:"agent_id,omitempty"`   // current bound agent id
+	AgentName string `json:"agent_name,omitempty"` // human-readable agent name for UI display
 }
 
 // SessionInfo describes a stored conversation visible to the client.
@@ -104,6 +107,7 @@ type SessionInfo struct {
 	Name      string `json:"name"`
 	TurnCount int    `json:"turn_count"`
 	Active    bool   `json:"active,omitempty"`
+	AgentID   string `json:"agent_id,omitempty"` // bound agent for this session
 }
 
 // HistoryEntry is a single message in the conversation history,

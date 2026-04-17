@@ -17,10 +17,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/XHao/claw-go/agent"
+	"github.com/XHao/claw-go/agentdef"
 	"github.com/XHao/claw-go/channel"
 	"github.com/XHao/claw-go/client"
 	"github.com/XHao/claw-go/config"
@@ -39,6 +41,9 @@ var configTemplate []byte
 //go:embed prompts/*.md
 var defaultPromptFS embed.FS
 
+//go:embed agents/**
+var agentTemplateFS embed.FS
+
 func main() {
 	sub := ""
 	if len(os.Args) > 1 {
@@ -47,7 +52,7 @@ func main() {
 
 	// Subcommands that consume os.Args[1] before flag parsing.
 	switch sub {
-	case "serve", "install", "uninstall", "restart":
+	case "serve", "install", "uninstall", "restart", "agent":
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 
@@ -76,6 +81,9 @@ Flags:
 		runUninstall()
 	case "restart":
 		runRestart()
+	case "agent":
+		runAgentCmd(os.Args[1:])
+		return
 	default:
 		cfg, err := config.AutoLoad(*configPath)
 		if err != nil {
@@ -96,6 +104,22 @@ Flags:
 
 // runInstall registers the daemon as a system startup service.
 func runInstall(configPath string) {
+	typeFlag := flag.String("type", "code", "comma-separated agent types to install (e.g. code,finance)")
+	flag.CommandLine.Parse(os.Args[1:])
+	rawTypes := strings.Split(*typeFlag, ",")
+	var types []string
+	seen := map[string]bool{}
+	for _, t := range rawTypes {
+		t = strings.TrimSpace(t)
+		if t != "" && !seen[t] {
+			seen[t] = true
+			types = append(types, t)
+		}
+	}
+	if len(types) == 0 {
+		types = []string{"code"}
+	}
+
 	bin, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: resolve binary path: %v\n", err)
@@ -108,6 +132,26 @@ func runInstall(configPath string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Data directory: %s\n", dirs.Data())
+
+	// Install requested agent templates.
+	installed := []string{}
+	for _, t := range types {
+		if err := agentdef.InstallTemplate(agentTemplateFS, t, dirs.AgentsDir()); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: unknown agent type %q, skipping\n", t)
+			continue
+		}
+		fmt.Printf("Agent template installed: %s → %s\n", t, dirs.AgentDir(t))
+		installed = append(installed, t)
+	}
+	if len(installed) == 0 {
+		fmt.Fprintf(os.Stderr, "error: no valid agent types installed\n")
+		os.Exit(1)
+	}
+	if err := agentdef.SaveState(dirs.AgentStateFile(), agentdef.AgentState{Default: installed[0]}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write agent-state.json: %v\n", err)
+	} else {
+		fmt.Printf("Default agent set to: %s\n", installed[0])
+	}
 
 	// 2. Copy the config template to the data directory if no config exists yet.
 	defaultCfg := dirs.ConfigFile()
@@ -162,6 +206,35 @@ func runUninstall() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// resolveDefaultAgent determines the default agent name using three-tier priority:
+//  1. agent-state.json exists and its Default agent directory exists → use it
+//  2. agent-state.json missing or Default dir missing → pick first sorted agent dir
+//  3. agents dir is empty → bootstrap "code" template and write state
+func resolveDefaultAgent(agentsDir, stateFile string) string {
+	state, _ := agentdef.LoadState(stateFile)
+
+	if state.Default != "" {
+		if _, err := os.Stat(filepath.Join(agentsDir, state.Default)); err == nil {
+			return state.Default
+		}
+	}
+
+	entries, err := os.ReadDir(agentsDir)
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				name := e.Name()
+				agentdef.SaveState(stateFile, agentdef.AgentState{Default: name})
+				return name
+			}
+		}
+	}
+
+	_ = agentdef.InstallTemplate(agentTemplateFS, "code", agentsDir)
+	agentdef.SaveState(stateFile, agentdef.AgentState{Default: "code"})
+	return "code"
 }
 
 // runServe starts the daemon: creates the Agent and listens on the Unix socket.
@@ -224,13 +297,6 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		systemPrompt = assembled
 		log.Info("system prompt loaded from prompt dir", "dir", cfg.PromptDir)
 	}
-	// Append dynamic user profile if present.
-	if dynProfile, err := memory.LoadDynamicProfile(dirs.DynamicProfileFile()); err != nil {
-		log.Warn("dynamic profile load failed", "err", err)
-	} else if dynProfile != "" {
-		systemPrompt = systemPrompt + "\n\n" + dynProfile
-		log.Info("dynamic user profile appended to system prompt")
-	}
 	systemPrompt = config.ExpandStaticVars(systemPrompt)
 
 	sessions := session.NewStore(cfg.MaxHistoryTurns, systemPrompt, dirs.Sessions())
@@ -281,27 +347,75 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	if cfg.Tools.Enabled {
 		ag.SetToolRunner(toolRunner)
 	}
+
+	// Load AgentDef Registry for multi-agent support.
+	agentReg, regErr := agentdef.LoadRegistry(dirs.AgentsDir())
+	if regErr != nil {
+		log.Warn("agent registry load failed, running in single-agent mode", "err", regErr)
+	} else {
+		ag.SetAgentRegistry(agentReg)
+		ag.SetAgentsDir(dirs.AgentsDir())
+		if agentReg.IsMultiAgent() {
+			log.Info("multi-agent mode enabled", "agents", agentReg.List())
+		}
+	}
+	defaultAgentID := resolveDefaultAgent(dirs.AgentsDir(), dirs.AgentStateFile())
+	ag.SetDefaultAgentID(defaultAgentID)
+
 	memMgr := memory.NewManager(dirs.MemoryDir())
 	if cfg.Memory.RetainDays > 0 {
 		memMgr.SetRetainDays(cfg.Memory.RetainDays)
 	}
 	ag.SetMemory(memMgr)
 
-	expStore := knowledge.NewExperienceStore(dirs.ExperiencesDir())
-	procStore := knowledge.NewProcedureStore(dirs.ProceduresDir())
+	// getAgentStores returns the ExperienceStore and ProcedureStore for the
+	// current default agent. Used as a getter closure so tool handlers always
+	// operate on the correct Agent's directories at call time.
+	getExpStore := func() *knowledge.ExperienceStore {
+		if agentReg != nil {
+			if def, ok := agentReg.Get(defaultAgentID); ok && def.Experiences != nil {
+				return def.Experiences
+			}
+		}
+		return knowledge.NewExperienceStore(dirs.AgentExperiencesDir(defaultAgentID))
+	}
+	getStores := func() (*knowledge.ExperienceStore, *knowledge.ProcedureStore) {
+		if agentReg != nil {
+			if def, ok := agentReg.Get(defaultAgentID); ok && def.Experiences != nil {
+				return def.Experiences, def.Procedures
+			}
+		}
+		return knowledge.NewExperienceStore(dirs.AgentExperiencesDir(defaultAgentID)),
+			knowledge.NewProcedureStore(dirs.AgentProceduresDir(defaultAgentID))
+	}
+
 	if cfg.Tools.Enabled {
-		tool.RegisterDaemonTools(toolRunner, llm, memMgr, expStore, sessions)
+		tool.RegisterDaemonTools(toolRunner, llm, memMgr, getExpStore, sessions)
 		tool.RegisterWebSearch(toolRunner, cfg.Search)
 		tool.RegisterFetchURL(toolRunner)
 		tool.RegisterRecallMemory(toolRunner, memMgr)
-		tool.RegisterSaveMemory(toolRunner, expStore, procStore, func() {
+		tool.RegisterSaveMemory(toolRunner, getStores, func() {
 			ag.PersistProcedureLayer(dirs.PromptsDir())
 		})
+		tool.RegisterPlanTasks(toolRunner, llm, nil, func(ctx context.Context, p provider.Provider, tasks []tool.WorkerTaskDef, runner *tool.LocalRunner, sp *string) []tool.WorkerResultDef {
+			agentTasks := make([]agent.WorkerTask, len(tasks))
+			for i, t := range tasks {
+				agentTasks[i] = agent.WorkerTask{ID: t.ID, Description: t.Description, ToolsHint: t.ToolsHint}
+			}
+			agentResults := agent.RunWorkerBatch(ctx, p, agentTasks, runner, sp)
+			out := make([]tool.WorkerResultDef, len(agentResults))
+			for i, r := range agentResults {
+				out[i] = tool.WorkerResultDef{TaskID: r.TaskID, Output: r.Output, Error: r.Error}
+			}
+			return out
+		})
 	}
-	ag.SetExperienceStore(expStore)
-	distiller := knowledge.NewDistiller(llm, memMgr, expStore)
-	ag.SetDistiller(distiller)
-	ag.SetProcedureStore(procStore)
+	// Set initial experience/procedure stores from the default agent.
+	// These are replaced per-request in Dispatch when the session's AgentID changes.
+	ag.SetExperienceStore(getExpStore())
+	defaultExp, defaultProc := getStores()
+	ag.SetDistiller(knowledge.NewDistiller(llm, memMgr, defaultExp))
+	ag.SetProcedureStore(defaultProc)
 	ag.SetTaskClassifier(knowledge.NewTaskClassifier(llm))
 	log.Info("tools ready", "registered", len(toolRunner.RegisteredDefs()))
 	if autoRouteP != nil {
@@ -320,11 +434,6 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		} else if assembled != "" {
 			sp = assembled
 		}
-		if dynProfile, err := memory.LoadDynamicProfile(dirs.DynamicProfileFile()); err != nil {
-			log.Warn("dynamic profile load failed during reload", "err", err)
-		} else if dynProfile != "" {
-			sp = sp + "\n\n" + dynProfile
-		}
 		return config.ExpandStaticVars(sp), nil
 	})
 
@@ -338,10 +447,11 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	// Start Dream Cycle if enabled: periodically scan memory and distill
 	// high-frequency topics in the background.
 	if cfg.Memory.DreamCycleEnabled {
+		dreamDistiller := knowledge.NewDistiller(llm, memMgr, getExpStore())
 		dream := knowledge.NewDreamCycle(
-			distiller,
+			dreamDistiller,
 			memMgr,
-			expStore,
+			getExpStore(),
 			cfg.Memory.DreamCycleMinFreq,
 			cfg.Memory.DreamCycleLookbackDays,
 		)
@@ -416,7 +526,7 @@ func runConnect(cfg *config.Config, socketPath string) {
 		cfg.Theme,
 		llm,
 		dirs.MemoryDir(),
-		dirs.ExperiencesDir(),
+		dirs.AgentExperiencesDir(resolveDefaultAgent(dirs.AgentsDir(), dirs.AgentStateFile())),
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -528,7 +638,7 @@ func writeDefaultPromptFiles(dir string) {
 		return
 	}
 	for _, e := range entries {
-		if e.IsDir() || e.Name() == "README.md" {
+		if e.IsDir() || e.Name() == "README.md" || e.Name() == "README.zh.md" {
 			continue
 		}
 		dest := filepath.Join(dir, e.Name())

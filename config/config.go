@@ -68,9 +68,9 @@ type Config struct {
 	Tools         ToolsConfig         `yaml:"tools"`
 	Search        SearchConfig        `yaml:"search"`
 	Memory        MemoryConfig        `yaml:"memory"`
-	PromptDir     string              `yaml:"prompt_dir"`
-	Theme         ThemeConfig         `yaml:"theme"`
-	Log           LogConfig           `yaml:"log"`
+	PromptDir string      `yaml:"prompt_dir"`
+	Theme     ThemeConfig `yaml:"theme"`
+	Log          LogConfig           `yaml:"log"`
 }
 
 // HistoryBudgetScaleConfig configures hint-specific multipliers applied when
@@ -162,13 +162,8 @@ type SearchConfig struct {
 	TimeoutSeconds int `yaml:"timeout_seconds"`
 }
 
-// MemoryConfig controls long-term memory and user-profile extraction.
+// MemoryConfig controls long-term memory and distillation settings.
 type MemoryConfig struct {
-	// ExtractUserFacts enables automatic extraction of user preferences and
-	// context from conversations into ~/.claw/data/user-profile-dynamic.md.
-	// Default: false (opt-in until stable).
-	ExtractUserFacts bool `yaml:"extract_user_facts"`
-
 	// DreamCycleEnabled enables the background Dream Cycle that periodically
 	// scans recent memory and distills high-frequency topics.
 	// Default: false (opt-in).

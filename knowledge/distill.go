@@ -35,6 +35,12 @@ func NewDistiller(llm provider.Provider, mem *memory.Manager, store *ExperienceS
 	return &Distiller{llm: llm, mem: mem, store: store}
 }
 
+// WithStore returns a shallow copy of the Distiller pointing at a different
+// ExperienceStore. Used to redirect distillation to the current Agent's directory.
+func (d *Distiller) WithStore(store *ExperienceStore) *Distiller {
+	return &Distiller{llm: d.llm, mem: d.mem, store: store}
+}
+
 // ProgressFunc is called with short status messages during Distill.
 type ProgressFunc func(msg string)
 
