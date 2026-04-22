@@ -13,8 +13,9 @@ func TestLoadPromptDir_Empty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "" {
-		t.Errorf("expected empty string, got %q", result)
+	// Embedded safety is always returned even for an empty dir.
+	if !strings.Contains(result, "Safety Rules") {
+		t.Errorf("expected embedded safety in result for empty dir, got %q", result)
 	}
 }
 
@@ -23,8 +24,9 @@ func TestLoadPromptDir_MissingDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error on missing dir: %v", err)
 	}
-	if result != "" {
-		t.Errorf("expected empty string for missing dir, got %q", result)
+	// Embedded safety is always returned even for a missing dir.
+	if !strings.Contains(result, "Safety Rules") {
+		t.Errorf("expected embedded safety in result for missing dir, got %q", result)
 	}
 }
 
@@ -149,10 +151,16 @@ func TestLoadPromptDir_EmptyFrontmatter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Empty body: no content should appear in result (only safety fallback if no safety layer).
-	// The body should be empty, so no persona content is injected.
-	if strings.Contains(result, "---") {
-		t.Errorf("raw frontmatter delimiters should not appear in result, got: %q", result)
+	// Embedded safety is always present.
+	if !strings.Contains(result, "Safety Rules") {
+		t.Errorf("expected embedded safety in result, got: %q", result)
+	}
+	// The file had an empty body, so no extra content beyond the safety rules.
+	// Frontmatter delimiters from the empty file should not appear.
+	// (The safety.md itself uses --- as a section divider, so we only check
+	// that no raw frontmatter opening "---\n---" from the empty file leaks through.)
+	if strings.Contains(result, "---\n---") {
+		t.Errorf("raw frontmatter delimiters from empty file should not appear in result, got: %q", result)
 	}
 }
 
@@ -197,7 +205,6 @@ func TestParsePromptFile_UnclosedFrontmatter(t *testing.T) {
 
 func TestLoadPromptDir_SafetyFallback(t *testing.T) {
 	dir := t.TempDir()
-	// A persona file with no safety layer — default safety should be prepended.
 	content := "---\nname: persona\nlayer: persona\nenabled: true\npriority: 1\n---\n\nHello."
 	if err := os.WriteFile(filepath.Join(dir, "01-persona.md"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -206,17 +213,18 @@ func TestLoadPromptDir_SafetyFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(result, "irreversible damage") {
-		t.Errorf("expected safety prompt to be prepended, got: %q", result)
+	// Embedded safety is always prepended regardless of files in dir.
+	if !strings.Contains(result, "Safety Rules") {
+		t.Errorf("expected embedded safety prompt to be prepended, got: %q", result)
 	}
 	if !strings.Contains(result, "Hello.") {
 		t.Errorf("expected persona body in result, got: %q", result)
 	}
 }
 
-func TestLoadPromptDir_CustomSafetyOverrides(t *testing.T) {
+func TestLoadPromptDir_SafetyFileIsIgnored(t *testing.T) {
 	dir := t.TempDir()
-	// A file with layer: safety — default should NOT be prepended.
+	// A file with layer: safety — must be silently ignored; embedded safety always wins.
 	content := "---\nname: safety\nlayer: safety\nenabled: true\npriority: 0\n---\n\nCustom safety rules."
 	if err := os.WriteFile(filepath.Join(dir, "00-safety.md"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -225,10 +233,12 @@ func TestLoadPromptDir_CustomSafetyOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(result, "irreversible damage") {
-		t.Errorf("default safety should not appear when custom safety file exists, got: %q", result)
+	// Filesystem safety layer must be ignored.
+	if strings.Contains(result, "Custom safety rules.") {
+		t.Errorf("filesystem safety layer must be ignored, got: %q", result)
 	}
-	if !strings.Contains(result, "Custom safety rules.") {
-		t.Errorf("expected custom safety in result, got: %q", result)
+	// Embedded safety must always be present.
+	if !strings.Contains(result, "Safety Rules") {
+		t.Errorf("embedded safety must always be present, got: %q", result)
 	}
 }

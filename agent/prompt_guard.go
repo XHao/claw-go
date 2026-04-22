@@ -4,20 +4,35 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/XHao/claw-go/ipc"
 )
 
 // threatPatterns matches common prompt injection attempts in injected context files.
 var threatPatterns = []*regexp.Regexp{
+	// English override attempts
 	regexp.MustCompile(`(?i)ignore\s+(previous|all|prior)\s+instructions?`),
 	regexp.MustCompile(`(?i)system\s+prompt\s+override`),
 	regexp.MustCompile(`(?i)disregard\s+(your|all|previous)\s+(rules?|instructions?|constraints?)`),
 	regexp.MustCompile(`(?i)act\s+as\s+if\s+you\s+have\s+no\s+restrictions?`),
 	regexp.MustCompile(`(?i)you\s+are\s+now\s+in\s+(developer|jailbreak|unrestricted)\s+mode`),
 	regexp.MustCompile(`(?i)<!--.*?(inject|override|prompt).*?-->`),
-	regexp.MustCompile(`(?i)curl\s+.*(OPENAI_API_KEY|ANTHROPIC_API_KEY|\.env)`),
-	regexp.MustCompile(`(?i)cat\s+\.env`),
 	regexp.MustCompile(`(?i)print\s+(your\s+)?(system\s+prompt|instructions?|rules?)`),
 	regexp.MustCompile(`(?i)new\s+instructions?:\s`),
+	// Roleplay / act-as jailbreak
+	regexp.MustCompile(`(?i)(pretend|roleplay|act\s+as).{0,30}(no\s+restriction|unrestricted|jailbreak|without\s+limit)`),
+	// Chinese override variants
+	regexp.MustCompile(`忽略.{0,10}(之前|前面|所有).{0,10}(指令|规则|限制)`),
+	// Base64 encoded instructions: "base64:" or "base64," or inline base64 payload
+	regexp.MustCompile(`(?i)base64\s*[:=,]`),
+	// Credential exfiltration — curl / wget
+	regexp.MustCompile(`(?i)(curl|wget)\s+.*(OPENAI_API_KEY|ANTHROPIC_API_KEY|\.env)`),
+	// Python requests exfiltration
+	regexp.MustCompile(`(?i)requests\.(get|post|put)\s*\(.*\$?(OPENAI_API_KEY|ANTHROPIC_API_KEY|API_KEY|SECRET)`),
+	// Environment variable enumeration
+	regexp.MustCompile(`(?i)os\.environ(\b|[\[.])`),
+	// cat .env variants
+	regexp.MustCompile(`(?i)cat\s+(\.env|/etc/passwd|~/\.ssh)`),
 }
 
 // invisibleChars matches Unicode characters that are invisible or directional
@@ -67,4 +82,20 @@ func sanitizeInjection(filename, content string) (string, bool) {
 		return strings.TrimSpace(safe), true
 	}
 	return content, false
+}
+
+// sanitizeToolResult scans the raw output of a tool result for prompt injection.
+// Error results (IsError==true) are skipped — they are system-generated and
+// cannot carry external injection. If injection is detected, the output is
+// replaced with a blocked placeholder and IsError is set to true.
+func sanitizeToolResult(res ipc.ToolResult) ipc.ToolResult {
+	if res.IsError {
+		return res
+	}
+	safe, blocked := sanitizeInjection(res.Name, res.Output)
+	if blocked {
+		res.Output = safe
+		res.IsError = true
+	}
+	return res
 }

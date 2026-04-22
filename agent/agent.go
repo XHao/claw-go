@@ -533,18 +533,9 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 			allResults := runToolBatch(ctx, log, result.ToolCalls, a.toolRunner, rctx, ch, msg.ChatID)
 
 			// Append all tool results as "tool" role messages.
-			for _, res := range allResults {
-				content := normalizeToolResultContent(res)
-				log.Info("tool result", "tool", res.Name, "call_id", res.CallID, "is_error", res.IsError)
-				sess.Append(provider.Message{
-					Role:       "tool",
-					Content:    content,
-					ToolCallID: res.CallID,
-					Name:       res.Name,
-				}, a.sessions.MaxTurns())
-			}
+			sanitizedResults := appendSanitizedToolResults(log, sess, allResults, a.sessions.MaxTurns())
 			// Record tool actions for the memory summary.
-			turnActions = append(turnActions, memory.ExtractActions(result.ToolCalls, allResults)...)
+			turnActions = append(turnActions, memory.ExtractActions(result.ToolCalls, sanitizedResults)...)
 			// Continue loop: call LLM again with the tool results.
 			continue
 		}
@@ -649,17 +640,8 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 			rctx := tool.RunContext{Cwd: msg.Cwd, SessionKey: msg.SessionKey}
 			allResults := runToolBatch(ctx, log, result.ToolCalls, a.toolRunner, rctx, ch, msg.ChatID)
 
-			for _, res := range allResults {
-				content := normalizeToolResultContent(res)
-				log.Info("tool result", "tool", res.Name, "call_id", res.CallID, "is_error", res.IsError)
-				sess.Append(provider.Message{
-					Role:       "tool",
-					Content:    content,
-					ToolCallID: res.CallID,
-					Name:       res.Name,
-				}, a.sessions.MaxTurns())
-			}
-			turnActions = append(turnActions, memory.ExtractActions(result.ToolCalls, allResults)...)
+			sanitizedResults := appendSanitizedToolResults(log, sess, allResults, a.sessions.MaxTurns())
+			turnActions = append(turnActions, memory.ExtractActions(result.ToolCalls, sanitizedResults)...)
 			continue
 		}
 
@@ -692,6 +674,36 @@ func (a *Agent) runToolLoop(ctx context.Context, log *slog.Logger, msg channel.I
 			Text:   fmt.Sprintf("已完成 %d 轮工具调用，任务可能尚未结束。回复 /continue 继续执行下一轮。", a.maxIterations),
 		})
 	}
+}
+
+// appendSanitizedToolResults sanitizes each tool result for prompt injection,
+// appends the results to the session, and returns a sanitized copy of the
+// results slice for use in memory extraction.
+func appendSanitizedToolResults(
+	log *slog.Logger,
+	sess *session.Session,
+	allResults []ipc.ToolResult,
+	maxTurns int,
+) []ipc.ToolResult {
+	sanitized := make([]ipc.ToolResult, len(allResults))
+	for i, res := range allResults {
+		wasError := res.IsError
+		res = sanitizeToolResult(res)
+		if res.IsError && !wasError {
+			log.Warn("tool result blocked: prompt injection detected",
+				"tool", res.Name, "call_id", res.CallID)
+		}
+		sanitized[i] = res
+		content := normalizeToolResultContent(res)
+		log.Info("tool result", "tool", res.Name, "call_id", res.CallID, "is_error", res.IsError)
+		sess.Append(provider.Message{
+			Role:       "tool",
+			Content:    content,
+			ToolCallID: res.CallID,
+			Name:       res.Name,
+		}, maxTurns)
+	}
+	return sanitized
 }
 
 func normalizeToolResultContent(res ipc.ToolResult) string {
