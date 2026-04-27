@@ -1,8 +1,6 @@
 ---
 name: behavior
-layer: behavior
 enabled: true
-priority: 10
 ---
 
 ## Answering questions

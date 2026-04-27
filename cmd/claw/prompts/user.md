@@ -1,8 +1,6 @@
 ---
-name: user-profile
-layer: user-profile
-enabled: false
-priority: 20
+name: user
+enabled: true
 ---
 
 ## About me

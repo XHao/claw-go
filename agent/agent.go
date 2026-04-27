@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -970,38 +969,6 @@ func (a *Agent) injectProcedures(ctx context.Context, msg channel.InboundMessage
 	a.log.Info("injected procedures", "tags", tags, "count", len(procs), "blocked", anyBlocked)
 }
 
-// PersistProcedureLayer assembles all procedures into prompts/20-procedures.md
-// and reloads the system prompt so the change takes effect in all sessions.
-// Called asynchronously after a procedure is saved via save_memory.
-func (a *Agent) PersistProcedureLayer(promptsDir string) {
-	a.persistProcedureLayer(promptsDir)
-}
-
-// persistProcedureLayer is the internal implementation.
-func (a *Agent) persistProcedureLayer(promptsDir string) {
-	if a.procedureStore == nil {
-		return
-	}
-	content, err := a.procedureStore.AssemblePromptLayer()
-	if err != nil {
-		a.log.Warn("persist procedure layer: assemble failed", "err", err)
-		return
-	}
-	path := filepath.Join(promptsDir, "20-procedures.md")
-	if content == "" {
-		_ = os.Remove(path)
-	} else {
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			a.log.Warn("persist procedure layer: write failed", "err", err, "path", path)
-			return
-		}
-	}
-	if _, err := a.Reload(); err != nil {
-		a.log.Warn("persist procedure layer: reload failed", "err", err)
-	} else {
-		a.log.Info("procedure layer persisted and reloaded", "path", path)
-	}
-}
 
 
 func truncText(s string, n int) string {

@@ -6,4 +6,6 @@
 4. **Simplicity** — is there a simpler way to achieve the same result?
 5. **Tests** — are there tests? do they actually test the right thing?
 6. **Side effects** — does this change affect anything outside its stated scope?
-7. **Verdict** — Approve / Request Changes / Needs Discussion
+7. **Verdict** — pick one: Approve / Request Changes / Needs Discussion.
+   Don't hedge with "looks mostly good" — state a clear verdict and the
+   single most important reason for it.

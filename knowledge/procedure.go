@@ -222,21 +222,3 @@ func (s *ProcedureStore) FindByTags(tags []string) ([]ProcedureFile, error) {
 	}
 	return out, nil
 }
-
-// AssemblePromptLayer renders all procedures into a promptdir-compatible Markdown string.
-// Returns ("", nil) if the store is empty.
-func (s *ProcedureStore) AssemblePromptLayer() (string, error) {
-	procs, err := s.List()
-	if err != nil {
-		return "", err
-	}
-	if len(procs) == 0 {
-		return "", nil
-	}
-	var sb strings.Builder
-	sb.WriteString("---\nname: procedures\nlayer: procedures\nenabled: true\npriority: 20\n---\n")
-	for _, p := range procs {
-		sb.WriteString(fmt.Sprintf("\n## %s\n\n%s\n", p.Name, p.Body))
-	}
-	return sb.String(), nil
-}

@@ -11,9 +11,11 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +29,7 @@ import (
 	"github.com/XHao/claw-go/client"
 	"github.com/XHao/claw-go/config"
 	"github.com/XHao/claw-go/dirs"
+	"github.com/XHao/claw-go/ipc"
 	"github.com/XHao/claw-go/knowledge"
 	"github.com/XHao/claw-go/memory"
 	"github.com/XHao/claw-go/provider"
@@ -52,7 +55,7 @@ func main() {
 
 	// Subcommands that consume os.Args[1] before flag parsing.
 	switch sub {
-	case "serve", "install", "uninstall", "restart", "agent":
+	case "serve", "install", "uninstall", "restart", "reload", "agent":
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 
@@ -66,6 +69,7 @@ Usage:
   claw install     [flags]   Register daemon as a startup service
   claw uninstall             Remove startup service registration
   claw restart               Restart the daemon service
+  claw reload                Reload prompt files without restarting
   claw             [flags]   Connect to the daemon (interactive CLI)
 
 Flags:
@@ -81,6 +85,17 @@ Flags:
 		runUninstall()
 	case "restart":
 		runRestart()
+	case "reload":
+		cfg, err := config.AutoLoad(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		socketPath := cfg.SocketPath
+		if socketPath == "" {
+			socketPath = dirs.SocketPath()
+		}
+		runReload(socketPath)
 	case "agent":
 		runAgentCmd(os.Args[1:])
 		return
@@ -180,6 +195,36 @@ func runInstall(configPath string) {
 	if err := startup.Install(bin, resolvedPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// runReload sends a reload command to the running daemon and prints the result.
+func runReload(socketPath string) {
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot connect to daemon: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	if err := enc.Encode(ipc.Msg{Cmd: "reload"}); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	scanner := ipc.NewScanner(conn)
+	if scanner.Scan() {
+		var msg ipc.Msg
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
+			if msg.Error != "" {
+				fmt.Fprintf(os.Stderr, "error: %s\n", msg.Error)
+				os.Exit(1)
+			}
+			if msg.Info != "" {
+				fmt.Println(msg.Info)
+			}
+		}
 	}
 }
 
@@ -394,9 +439,7 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		tool.RegisterWebSearch(toolRunner, cfg.Search)
 		tool.RegisterFetchURL(toolRunner)
 		tool.RegisterRecallMemory(toolRunner, memMgr)
-		tool.RegisterSaveMemory(toolRunner, getStores, func() {
-			ag.PersistProcedureLayer(dirs.PromptsDir())
-		})
+		tool.RegisterSaveMemory(toolRunner, getStores, nil)
 		tool.RegisterPlanTasks(toolRunner, llm, nil, func(ctx context.Context, p provider.Provider, tasks []tool.WorkerTaskDef, runner *tool.LocalRunner, sp *string) []tool.WorkerResultDef {
 			agentTasks := make([]agent.WorkerTask, len(tasks))
 			for i, t := range tasks {
