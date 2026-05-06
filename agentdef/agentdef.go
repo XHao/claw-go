@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/XHao/claw-go/config"
 	"github.com/XHao/claw-go/knowledge"
 )
 
@@ -68,7 +69,7 @@ func loadAgentDef(agentsDir, name string) (*AgentDef, error) {
 
 	// Load persona.md (optional).
 	if data, err := os.ReadFile(filepath.Join(dir, "persona.md")); err == nil {
-		def.Persona = string(data)
+		def.Persona = config.ExpandStaticVars(string(data))
 	}
 
 	// Load tools.yaml (optional).

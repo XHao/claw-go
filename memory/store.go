@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -321,12 +322,20 @@ func (s *Store) TodayPath() string {
 // directory (~/.claw/data/memory by default).
 type Manager struct {
 	baseDir    string
-	retainDays int // propagated to each Store; 0 = keep forever
+	retainDays int      // propagated to each Store; 0 = keep forever
+	embedder   *Embedder // nil = semantic search disabled, falls back to keyword
 }
 
 // NewManager returns a Manager that will root all session stores under baseDir.
 func NewManager(baseDir string) *Manager {
 	return &Manager{baseDir: baseDir}
+}
+
+// SetEmbedder attaches an Embedder for semantic search. When set, SearchTurns
+// uses cosine similarity against query embeddings; on any embedding error it
+// falls back to keyword matching so the feature degrades gracefully.
+func (m *Manager) SetEmbedder(e *Embedder) {
+	m.embedder = e
 }
 
 // SetRetainDays configures how many days of JSONL files to keep per session.
@@ -396,11 +405,10 @@ func (m *Manager) AllSessions() ([]string, error) {
 }
 
 // SearchTurns returns up to maxResults TurnSummary records across all sessions
-// that contain at least one of the given keywords, sorted by descending composite
-// score (keyword hit count × recency decay factor). If maxResults <= 0, all
-// matching turns are returned. If keywords is empty, nil is returned.
-// Per-session load errors are silently skipped so a single corrupted session
-// does not abort the search.
+// sorted by relevance to the query. When an Embedder is configured it uses
+// semantic cosine similarity (score × recency decay); otherwise it falls back
+// to keyword hit count × recency decay. Per-session load errors are silently
+// skipped. If query/keywords is empty, nil is returned.
 func (m *Manager) SearchTurns(keywords []string, maxResults int) ([]TurnSummary, error) {
 	sessions, err := m.AllSessions()
 	if err != nil {
@@ -418,16 +426,38 @@ func (m *Manager) SearchTurns(keywords []string, maxResults int) ([]TurnSummary,
 		return nil, nil
 	}
 
+	// Attempt semantic search when an embedder is available.
+	if m.embedder != nil {
+		query := strings.Join(keywords, " ")
+		ctx, cancel := context.WithTimeout(context.Background(), defaultEmbedTimeout)
+		defer cancel()
+		queryVec, embedErr := m.embedder.Embed(ctx, query)
+		if embedErr == nil {
+			return m.semanticSearch(all, queryVec, maxResults), nil
+		}
+		// Embedding failed — fall through to keyword search.
+	}
+
+	return m.keywordSearch(all, keywords, maxResults), nil
+}
+
+// semanticSearch ranks turns by cosine similarity × recency decay.
+func (m *Manager) semanticSearch(all []TurnSummary, queryVec []float32, maxResults int) []TurnSummary {
 	type scored struct {
 		turn  TurnSummary
 		score float64
 	}
 	var hits []scored
 	for _, t := range all {
-		kwScore := scoreTurnByKeywords(t, keywords)
-		if kwScore > 0 {
-			composite := float64(kwScore) * recencyFactor(t.At)
-			hits = append(hits, scored{t, composite})
+		ctx, cancel := context.WithTimeout(context.Background(), defaultEmbedTimeout)
+		vec, err := m.embedder.Embed(ctx, turnText(t))
+		cancel()
+		if err != nil {
+			continue
+		}
+		sim := float64(CosineSim(queryVec, vec))
+		if sim > 0.5 { // minimum similarity threshold
+			hits = append(hits, scored{t, sim * recencyFactor(t.At)})
 		}
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
@@ -438,7 +468,31 @@ func (m *Manager) SearchTurns(keywords []string, maxResults int) ([]TurnSummary,
 	for i, h := range hits {
 		out[i] = h.turn
 	}
-	return out, nil
+	return out
+}
+
+// keywordSearch ranks turns by keyword hit count × recency decay.
+func (m *Manager) keywordSearch(all []TurnSummary, keywords []string, maxResults int) []TurnSummary {
+	type scored struct {
+		turn  TurnSummary
+		score float64
+	}
+	var hits []scored
+	for _, t := range all {
+		kwScore := scoreTurnByKeywords(t, keywords)
+		if kwScore > 0 {
+			hits = append(hits, scored{t, float64(kwScore) * recencyFactor(t.At)})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+	if maxResults > 0 && len(hits) > maxResults {
+		hits = hits[:maxResults]
+	}
+	out := make([]TurnSummary, len(hits))
+	for i, h := range hits {
+		out[i] = h.turn
+	}
+	return out
 }
 
 // recencyFactor returns a time-decay multiplier in (0, 1] based on how many

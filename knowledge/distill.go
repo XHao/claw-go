@@ -199,14 +199,20 @@ func (d *Distiller) reduce(ctx context.Context, topic string, mapResults []strin
 	return d.llm.Complete(ctx, msgs)
 }
 
-const evalSystemPrompt = `你是一个知识价值评估助手。判断给定的对话摘要是否包含值得长期记忆的新知识或经验。
+const evalSystemPrompt = `你是一个知识价值评估助手。判断给定的对话摘要是否包含值得长期记忆的新知识或经验，同时识别情绪信号。
 
 规则：
-- 如果包含可复用的技术知识、解决方案或用户偏好，输出 JSON：{"valuable":true,"topic":"<简短主题>","summary":"<一句话摘要>"}
+- 如果包含可复用的技术知识、解决方案或用户偏好，输出 JSON：{"valuable":true,"topic":"<简短主题>","summary":"<一句话摘要>","emotion":"<情绪信号>"}
 - 如果是闲聊、简单问答、或无可复用价值，只输出：{"valuable":false}
 - topic 应简短（1-3个词），如 "docker"、"golang并发"、"用户偏好"
 - 如果本轮内容与已有知识存在明显矛盾（新方案替代了旧方案），在 summary 中以 "更新：" 开头说明，例如：
   "更新：overlay 模式替代 bridge 模式用于多主机 docker 网络"
+- emotion 字段识别用户在本轮对话中的情绪信号：
+  - "correction"：用户明确纠正了 AI 的错误（"不对"、"你搞错了"、"应该是..."）
+  - "frustration"：用户表达不满或重复追问同一问题
+  - "satisfaction"：用户明确表达满意或确认（"对"、"完美"、"就是这个"）
+  - "none"：无明显情绪信号
+- 如果 valuable 为 false，可省略 emotion 字段
 - 不要输出任何其他文字`
 
 // EvalTurnResult is the structured output from EvalTurn.
@@ -214,6 +220,9 @@ type EvalTurnResult struct {
 	Valuable bool   `json:"valuable"`
 	Topic    string `json:"topic,omitempty"`
 	Summary  string `json:"summary,omitempty"`
+	// Emotion captures affective signals from the user turn.
+	// Values: "correction" | "frustration" | "satisfaction" | "none"
+	Emotion string `json:"emotion,omitempty"`
 }
 
 // EvalTurn asks a cheap LLM whether the given TurnSummary contains knowledge

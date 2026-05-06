@@ -411,6 +411,12 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	if cfg.Memory.RetainDays > 0 {
 		memMgr.SetRetainDays(cfg.Memory.RetainDays)
 	}
+	if cfg.Memory.EmbedURL != "" && cfg.Memory.EmbedModel != "" {
+		memMgr.SetEmbedder(memory.NewEmbedder(cfg.Memory.EmbedURL, cfg.Memory.EmbedModel))
+		log.Info("semantic memory search enabled",
+			"url", cfg.Memory.EmbedURL,
+			"model", cfg.Memory.EmbedModel)
+	}
 	ag.SetMemory(memMgr)
 
 	// getAgentStores returns the ExperienceStore and ProcedureStore for the

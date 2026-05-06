@@ -186,6 +186,17 @@ type MemoryConfig struct {
 	// by the first SaveTurn of a new UTC day. 0 means keep forever.
 	// Default: 90.
 	RetainDays int `yaml:"retain_days"`
+
+	// EmbedURL is the base URL of a local Ollama-compatible embedding server
+	// (e.g. "http://localhost:11435"). When set together with EmbedModel,
+	// SearchTurns uses semantic cosine similarity instead of keyword matching,
+	// with automatic fallback to keywords on any embedding error.
+	// Default: "" (semantic search disabled).
+	EmbedURL string `yaml:"embed_url"`
+
+	// EmbedModel is the model name to use for embeddings (e.g.
+	// "jina-embeddings-v2-base-code:latest"). Only used when EmbedURL is set.
+	EmbedModel string `yaml:"embed_model"`
 }
 
 // CLIConfig holds settings for the interactive terminal client.

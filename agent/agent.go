@@ -846,12 +846,17 @@ func (a *Agent) saveTurnMemory(
 				if !result.Valuable || result.Topic == "" || result.Summary == "" {
 					return
 				}
-				log.Info("auto-distill: valuable turn detected", "topic", result.Topic)
-				// If the summary signals a conflict ("更新：" prefix), trigger a full
-				// Map-Reduce distillation so the Reduce phase can apply conflict annotations
-				// ([已更新] / [已废弃]) with full context. Otherwise, append incrementally.
-				if strings.HasPrefix(result.Summary, "更新：") {
-					log.Info("auto-distill: conflict detected, triggering full distill", "topic", result.Topic)
+				log.Info("auto-distill: valuable turn detected",
+					"topic", result.Topic, "emotion", result.Emotion)
+				// Correction and frustration signals mean existing knowledge may be
+				// wrong — always trigger full Map-Reduce distillation. This mirrors
+				// how negative emotional valence strengthens memory consolidation in
+				// the CLS model: the brain prioritises consolidating events that
+				// signal a prediction error.
+				if result.Emotion == "correction" || result.Emotion == "frustration" ||
+					strings.HasPrefix(result.Summary, "更新：") {
+					log.Info("auto-distill: high-priority consolidation triggered",
+						"topic", result.Topic, "reason", result.Emotion)
 					if _, err := distiller.Distill(bgCtx, result.Topic, nil); err != nil {
 						log.Warn("auto-distill: full distill failed", "topic", result.Topic, "err", err)
 					}
