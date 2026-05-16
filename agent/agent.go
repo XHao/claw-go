@@ -51,7 +51,7 @@ type Agent struct {
 	channelsMu        sync.RWMutex
 	channels          map[string]channel.Channel
 	maxIterations     int
-	memory            *memory.Manager            // optional; nil = memory disabled
+	memory            memory.MemoryManager       // optional; nil = memory disabled
 	toolRunner        *tool.LocalRunner          // optional; nil = tool calling disabled
 	expStore          *knowledge.ExperienceStore // optional; nil = auto-inject disabled
 	reloadFunc        func() (string, error)     // optional; reloads system prompt from disk
@@ -84,10 +84,10 @@ func (a *Agent) SetMaxIterations(n int) {
 	}
 }
 
-// SetMemory attaches a memory.Manager so that each completed turn is
+// SetMemory attaches a MemoryManager so that each completed turn is
 // summarised and persisted to ~/.claw/data/memory/{sessionKey}/short/.
 // Calling with nil disables memory persistence.
-func (a *Agent) SetMemory(m *memory.Manager) {
+func (a *Agent) SetMemory(m memory.MemoryManager) {
 	a.memory = m
 }
 

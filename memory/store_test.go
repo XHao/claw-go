@@ -146,7 +146,8 @@ func TestUpdateSummary(t *testing.T) {
 
 func TestCompactDay(t *testing.T) {
 	dir := t.TempDir()
-	s := NewManager(dir).ForSession("sess")
+	// Type-assert to *Store: this test exercises the JSONL-specific CompactDay.
+	s := NewManager(dir).ForSession("sess").(*Store)
 
 	day := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
@@ -178,7 +179,8 @@ func TestPruneOldFilesViaRetainDays(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(dir)
 	mgr.SetRetainDays(90)
-	s := mgr.ForSession("sess")
+	// Type-assert to *Store: this test exercises the JSONL-specific ListDays.
+	s := mgr.ForSession("sess").(*Store)
 
 	now := time.Date(2024, 6, 10, 0, 0, 0, 0, time.UTC)
 

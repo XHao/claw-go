@@ -20,7 +20,7 @@ import (
 // memories are consolidated into semantic knowledge during "offline" periods.
 type DreamCycle struct {
 	distiller    *Distiller
-	mem          *memory.Manager
+	mem          memory.MemoryManager
 	store        *ExperienceStore
 	log          *slog.Logger
 	minFreq      int // minimum keyword frequency to trigger distillation
@@ -34,7 +34,7 @@ type DreamCycle struct {
 //   - store:        the ExperienceStore to check last-updated times and save results
 //   - minFreq:      minimum keyword frequency threshold (e.g. 3)
 //   - lookbackDays: how many days of history to scan (e.g. 7)
-func NewDreamCycle(distiller *Distiller, mem *memory.Manager, store *ExperienceStore, minFreq, lookbackDays int) *DreamCycle {
+func NewDreamCycle(distiller *Distiller, mem memory.MemoryManager, store *ExperienceStore, minFreq, lookbackDays int) *DreamCycle {
 	if minFreq <= 0 {
 		minFreq = 3
 	}

@@ -142,37 +142,10 @@ func (s *Store) LoadRecent(maxTurns int) ([]TurnSummary, error) {
 		if err != nil {
 			continue
 		}
-		for _, rawLine := range strings.Split(string(data), "\n") {
-			rawLine = strings.TrimSpace(rawLine)
-			if rawLine == "" {
-				continue
-			}
-			var t TurnSummary
-			if json.Unmarshal([]byte(rawLine), &t) != nil {
-				continue
-			}
-			if existing, ok := byN[t.N]; ok {
-				if t.LLMSummary != "" {
-					existing.LLMSummary = t.LLMSummary
-				}
-				if t.User != "" {
-					existing.User = t.User
-				}
-				if t.Reply != "" {
-					existing.Reply = t.Reply
-				}
-			} else {
-				cp := t
-				byN[t.N] = &cp
-				order = append(order, t.N)
-			}
-		}
+		applyJSONLLines(byN, &order, data)
 	}
 
-	turns := make([]TurnSummary, 0, len(order))
-	for _, n := range order {
-		turns = append(turns, *byN[n])
-	}
+	turns := collectTurns(byN, order)
 
 	if maxTurns > 0 && len(turns) > maxTurns {
 		turns = turns[len(turns)-maxTurns:]
@@ -224,25 +197,7 @@ func (s *Store) compactDayLocked(day string) error {
 
 	byN := make(map[int]*TurnSummary)
 	var order []int
-	for _, rawLine := range strings.Split(string(data), "\n") {
-		rawLine = strings.TrimSpace(rawLine)
-		if rawLine == "" {
-			continue
-		}
-		var t TurnSummary
-		if json.Unmarshal([]byte(rawLine), &t) != nil {
-			continue
-		}
-		if existing, ok := byN[t.N]; ok {
-			if t.LLMSummary != "" {
-				existing.LLMSummary = t.LLMSummary
-			}
-		} else {
-			cp := t
-			byN[t.N] = &cp
-			order = append(order, t.N)
-		}
-	}
+	applyJSONLLines(byN, &order, data)
 
 	var buf []byte
 	for _, n := range order {
@@ -320,10 +275,11 @@ func (s *Store) TodayPath() string {
 
 // Manager creates and caches per-session memory Stores under a shared base
 // directory (~/.claw/data/memory by default).
+// Manager implements the MemoryManager interface.
 type Manager struct {
 	baseDir    string
-	retainDays int      // propagated to each Store; 0 = keep forever
-	embedder   *Embedder // nil = semantic search disabled, falls back to keyword
+	retainDays int     // propagated to each Store; 0 = keep forever
+	embedder   Embedder // nil = semantic search disabled, falls back to keyword
 }
 
 // NewManager returns a Manager that will root all session stores under baseDir.
@@ -334,7 +290,8 @@ func NewManager(baseDir string) *Manager {
 // SetEmbedder attaches an Embedder for semantic search. When set, SearchTurns
 // uses cosine similarity against query embeddings; on any embedding error it
 // falls back to keyword matching so the feature degrades gracefully.
-func (m *Manager) SetEmbedder(e *Embedder) {
+// Any type that implements the Embedder interface is accepted (e.g. OllamaEmbedder).
+func (m *Manager) SetEmbedder(e Embedder) {
 	m.embedder = e
 }
 
@@ -359,10 +316,10 @@ func (m *Manager) safeName(sessionKey string) string {
 	}, sessionKey)
 }
 
-// ForSession returns the Store for sessionKey.
+// ForSession returns the SessionStore for sessionKey.
 // Memory files live directly under {MemoryDir}/{sessionKey}/ as daily JSONL files.
-// The returned Store is lightweight (no I/O performed here).
-func (m *Manager) ForSession(sessionKey string) *Store {
+// The returned store is lightweight (no I/O performed here).
+func (m *Manager) ForSession(sessionKey string) SessionStore {
 	return newStore(filepath.Join(m.baseDir, m.safeName(sessionKey)), m.retainDays)
 }
 
@@ -442,57 +399,32 @@ func (m *Manager) SearchTurns(keywords []string, maxResults int) ([]TurnSummary,
 }
 
 // semanticSearch ranks turns by cosine similarity × recency decay.
+// Turns with cosine similarity ≤ 0.5 are excluded.
 func (m *Manager) semanticSearch(all []TurnSummary, queryVec []float32, maxResults int) []TurnSummary {
-	type scored struct {
-		turn  TurnSummary
-		score float64
-	}
-	var hits []scored
-	for _, t := range all {
+	return rankAndSlice(all, func(t TurnSummary) float64 {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultEmbedTimeout)
 		vec, err := m.embedder.Embed(ctx, turnText(t))
 		cancel()
 		if err != nil {
-			continue
+			return 0
 		}
 		sim := float64(CosineSim(queryVec, vec))
-		if sim > 0.5 { // minimum similarity threshold
-			hits = append(hits, scored{t, sim * recencyFactor(t.At)})
+		if sim <= 0.5 { // minimum similarity threshold
+			return 0
 		}
-	}
-	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-	if maxResults > 0 && len(hits) > maxResults {
-		hits = hits[:maxResults]
-	}
-	out := make([]TurnSummary, len(hits))
-	for i, h := range hits {
-		out[i] = h.turn
-	}
-	return out
+		return sim * recencyFactor(t.At)
+	}, 0, maxResults)
 }
 
 // keywordSearch ranks turns by keyword hit count × recency decay.
 func (m *Manager) keywordSearch(all []TurnSummary, keywords []string, maxResults int) []TurnSummary {
-	type scored struct {
-		turn  TurnSummary
-		score float64
-	}
-	var hits []scored
-	for _, t := range all {
-		kwScore := scoreTurnByKeywords(t, keywords)
-		if kwScore > 0 {
-			hits = append(hits, scored{t, float64(kwScore) * recencyFactor(t.At)})
+	return rankAndSlice(all, func(t TurnSummary) float64 {
+		kw := scoreTurnByKeywords(t, keywords)
+		if kw <= 0 {
+			return 0
 		}
-	}
-	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-	if maxResults > 0 && len(hits) > maxResults {
-		hits = hits[:maxResults]
-	}
-	out := make([]TurnSummary, len(hits))
-	for i, h := range hits {
-		out[i] = h.turn
-	}
-	return out
+		return float64(kw) * recencyFactor(t.At)
+	}, 0, maxResults)
 }
 
 // recencyFactor returns a time-decay multiplier in (0, 1] based on how many
@@ -521,4 +453,74 @@ func scoreTurnByKeywords(t TurnSummary, keywords []string) int {
 		score += strings.Count(haystack, strings.ToLower(kw))
 	}
 	return score
+}
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+// applyJSONLLines parses newline-delimited JSONL data and merges records into
+// byN by turn index N.  Patch records (same N, later in the byte slice) update
+// LLMSummary, User, and Reply when those fields are non-empty.  New Ns are
+// appended to order in first-seen order.
+func applyJSONLLines(byN map[int]*TurnSummary, order *[]int, data []byte) {
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		rawLine = strings.TrimSpace(rawLine)
+		if rawLine == "" {
+			continue
+		}
+		var t TurnSummary
+		if json.Unmarshal([]byte(rawLine), &t) != nil {
+			continue
+		}
+		if existing, ok := byN[t.N]; ok {
+			if t.LLMSummary != "" {
+				existing.LLMSummary = t.LLMSummary
+			}
+			if t.User != "" {
+				existing.User = t.User
+			}
+			if t.Reply != "" {
+				existing.Reply = t.Reply
+			}
+		} else {
+			cp := t
+			byN[t.N] = &cp
+			*order = append(*order, t.N)
+		}
+	}
+}
+
+// collectTurns assembles TurnSummary values from the byN map in the original
+// insertion order recorded in order.
+func collectTurns(byN map[int]*TurnSummary, order []int) []TurnSummary {
+	out := make([]TurnSummary, 0, len(order))
+	for _, n := range order {
+		out = append(out, *byN[n])
+	}
+	return out
+}
+
+// rankAndSlice scores each TurnSummary using scoreFn, discards those whose
+// score is ≤ threshold, sorts the remainder descending by score, and returns
+// at most maxResults entries.  maxResults ≤ 0 means no limit.
+func rankAndSlice(all []TurnSummary, scoreFn func(TurnSummary) float64, threshold float64, maxResults int) []TurnSummary {
+	type scored struct {
+		turn  TurnSummary
+		score float64
+	}
+	hits := make([]scored, 0, len(all))
+	for _, t := range all {
+		s := scoreFn(t)
+		if s > threshold {
+			hits = append(hits, scored{t, s})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+	if maxResults > 0 && len(hits) > maxResults {
+		hits = hits[:maxResults]
+	}
+	out := make([]TurnSummary, len(hits))
+	for i, h := range hits {
+		out[i] = h.turn
+	}
+	return out
 }

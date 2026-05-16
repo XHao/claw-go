@@ -29,7 +29,7 @@ var RecallMemoryDef = provider.ToolDef{
 }
 
 // RegisterRecallMemory registers the recall_memory tool with runner under the "core" group.
-func RegisterRecallMemory(runner *LocalRunner, mgr *memory.Manager) {
+func RegisterRecallMemory(runner *LocalRunner, mgr memory.MemoryManager) {
 	runner.RegisterGroup("core", RecallMemoryDef, func(ctx context.Context, argsJSON string, _ RunContext, _ func(string)) (string, error) {
 		var p struct {
 			Query string `json:"query"`

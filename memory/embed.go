@@ -12,17 +12,19 @@ import (
 
 const defaultEmbedTimeout = 5 * time.Second
 
-// Embedder calls a local Ollama-compatible embedding endpoint.
-type Embedder struct {
+// OllamaEmbedder calls a local Ollama-compatible embedding endpoint.
+// It implements the Embedder interface.
+type OllamaEmbedder struct {
 	baseURL string
 	model   string
 	client  *http.Client
 }
 
-// NewEmbedder returns an Embedder pointing at baseURL (e.g. "http://localhost:11435")
-// using the given model name.
-func NewEmbedder(baseURL, model string) *Embedder {
-	return &Embedder{
+// NewEmbedder returns an OllamaEmbedder pointing at baseURL
+// (e.g. "http://localhost:11435") using the given model name.
+// The returned value satisfies the Embedder interface.
+func NewEmbedder(baseURL, model string) *OllamaEmbedder {
+	return &OllamaEmbedder{
 		baseURL: baseURL,
 		model:   model,
 		client:  &http.Client{Timeout: defaultEmbedTimeout},
@@ -31,7 +33,7 @@ func NewEmbedder(baseURL, model string) *Embedder {
 
 // Embed returns the embedding vector for text. Returns an error if the
 // endpoint is unreachable or returns a non-200 status.
-func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
+func (e *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	body, _ := json.Marshal(map[string]string{
 		"model":  e.model,
 		"prompt": text,

@@ -25,13 +25,13 @@ const (
 // a clean, de-duplicated Markdown document.
 type Distiller struct {
 	llm   provider.Provider
-	mem   *memory.Manager
+	mem   memory.MemoryManager
 	store *ExperienceStore
 }
 
 // NewDistiller creates a Distiller that uses llm for LLM calls, mem to scan
 // conversation memory, and store to persist experience files.
-func NewDistiller(llm provider.Provider, mem *memory.Manager, store *ExperienceStore) *Distiller {
+func NewDistiller(llm provider.Provider, mem memory.MemoryManager, store *ExperienceStore) *Distiller {
 	return &Distiller{llm: llm, mem: mem, store: store}
 }
 
