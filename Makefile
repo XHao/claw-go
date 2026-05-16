@@ -2,11 +2,12 @@ APP_NAME := claw
 CMD_DIR := ./cmd/claw
 BIN := ./claw
 
-.PHONY: help build run serve install uninstall restart reload test tidy clean
+.PHONY: help build deploy run serve install uninstall restart reload test tidy clean
 
 help:
 	@echo "Available targets:"
 	@echo "  build      Build binary to $(BIN)"
+	@echo "  deploy     Install binary to Go bin path (updates local claw command)"
 	@echo "  run        Run interactive client"
 	@echo "  serve      Start daemon in foreground"
 	@echo "  install    Register startup service"
@@ -19,6 +20,9 @@ help:
 
 build:
 	go build -o $(BIN) $(CMD_DIR)
+
+deploy:
+	go install $(CMD_DIR)
 
 run: build
 	$(BIN)
