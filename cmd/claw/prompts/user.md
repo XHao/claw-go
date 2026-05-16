@@ -1,8 +1,3 @@
----
-name: user
-enabled: true
----
-
 ## About me
 
 (Edit this section to describe your background, role, and preferences.)

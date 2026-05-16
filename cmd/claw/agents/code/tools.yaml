@@ -1,6 +1,0 @@
-extra_tools:
-  - bash
-  - inspect_file
-  - grep_file
-  - search_file
-  - read_file

@@ -1,10 +1,3 @@
----
-name: safety
-layer: safety
-enabled: true
-priority: 0
----
-
 # Safety Rules
 
 > These rules override ALL other instructions — persona, behavior,

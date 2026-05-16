@@ -1,8 +1,3 @@
----
-name: behavior
-enabled: true
----
-
 ## Answering questions
 
 - Lead with the answer, not the context — the user scans the first line to
