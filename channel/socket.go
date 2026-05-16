@@ -383,10 +383,6 @@ func (s *SocketChannel) Send(_ context.Context, msg OutboundMessage) error {
 		return nil
 	}
 	frame := ipc.Msg{Reply: msg.Text, Delta: msg.Delta, Usage: msg.Usage}
-	if msg.AgentID != "" {
-		frame.AgentID = msg.AgentID
-		frame.AgentName = msg.AgentName
-	}
 	return state.encoder.Encode(frame)
 }
 

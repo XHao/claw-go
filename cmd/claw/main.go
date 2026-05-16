@@ -19,12 +19,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/XHao/claw-go/agent"
-	"github.com/XHao/claw-go/agentdef"
 	"github.com/XHao/claw-go/channel"
 	"github.com/XHao/claw-go/client"
 	"github.com/XHao/claw-go/config"
@@ -44,9 +42,6 @@ var configTemplate []byte
 //go:embed prompts/*.md
 var defaultPromptFS embed.FS
 
-//go:embed agents/**
-var agentTemplateFS embed.FS
-
 func main() {
 	sub := ""
 	if len(os.Args) > 1 {
@@ -55,7 +50,7 @@ func main() {
 
 	// Subcommands that consume os.Args[1] before flag parsing.
 	switch sub {
-	case "serve", "install", "uninstall", "restart", "reload", "agent":
+	case "serve", "install", "uninstall", "restart", "reload":
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 
@@ -96,9 +91,6 @@ Flags:
 			socketPath = dirs.SocketPath()
 		}
 		runReload(socketPath)
-	case "agent":
-		runAgentCmd(os.Args[1:])
-		return
 	default:
 		cfg, err := config.AutoLoad(*configPath)
 		if err != nil {
@@ -119,21 +111,7 @@ Flags:
 
 // runInstall registers the daemon as a system startup service.
 func runInstall(configPath string) {
-	typeFlag := flag.String("type", "code", "comma-separated agent types to install (e.g. code,finance)")
 	flag.CommandLine.Parse(os.Args[1:])
-	rawTypes := strings.Split(*typeFlag, ",")
-	var types []string
-	seen := map[string]bool{}
-	for _, t := range rawTypes {
-		t = strings.TrimSpace(t)
-		if t != "" && !seen[t] {
-			seen[t] = true
-			types = append(types, t)
-		}
-	}
-	if len(types) == 0 {
-		types = []string{"code"}
-	}
 
 	bin, err := os.Executable()
 	if err != nil {
@@ -147,26 +125,6 @@ func runInstall(configPath string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Data directory: %s\n", dirs.Data())
-
-	// Install requested agent templates.
-	installed := []string{}
-	for _, t := range types {
-		if err := agentdef.InstallTemplate(agentTemplateFS, t, dirs.AgentsDir()); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: unknown agent type %q, skipping\n", t)
-			continue
-		}
-		fmt.Printf("Agent template installed: %s → %s\n", t, dirs.AgentDir(t))
-		installed = append(installed, t)
-	}
-	if len(installed) == 0 {
-		fmt.Fprintf(os.Stderr, "error: no valid agent types installed\n")
-		os.Exit(1)
-	}
-	if err := agentdef.SaveState(dirs.AgentStateFile(), agentdef.AgentState{Default: installed[0]}); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write agent-state.json: %v\n", err)
-	} else {
-		fmt.Printf("Default agent set to: %s\n", installed[0])
-	}
 
 	// 2. Copy the config template to the data directory if no config exists yet.
 	defaultCfg := dirs.ConfigFile()
@@ -251,35 +209,6 @@ func runUninstall() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-// resolveDefaultAgent determines the default agent name using three-tier priority:
-//  1. agent-state.json exists and its Default agent directory exists → use it
-//  2. agent-state.json missing or Default dir missing → pick first sorted agent dir
-//  3. agents dir is empty → bootstrap "code" template and write state
-func resolveDefaultAgent(agentsDir, stateFile string) string {
-	state, _ := agentdef.LoadState(stateFile)
-
-	if state.Default != "" {
-		if _, err := os.Stat(filepath.Join(agentsDir, state.Default)); err == nil {
-			return state.Default
-		}
-	}
-
-	entries, err := os.ReadDir(agentsDir)
-	if err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				name := e.Name()
-				agentdef.SaveState(stateFile, agentdef.AgentState{Default: name})
-				return name
-			}
-		}
-	}
-
-	_ = agentdef.InstallTemplate(agentTemplateFS, "code", agentsDir)
-	agentdef.SaveState(stateFile, agentdef.AgentState{Default: "code"})
-	return "code"
 }
 
 // runServe starts the daemon: creates the Agent and listens on the Unix socket.
@@ -393,20 +322,6 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 		ag.SetToolRunner(toolRunner)
 	}
 
-	// Load AgentDef Registry for multi-agent support.
-	agentReg, regErr := agentdef.LoadRegistry(dirs.AgentsDir())
-	if regErr != nil {
-		log.Warn("agent registry load failed, running in single-agent mode", "err", regErr)
-	} else {
-		ag.SetAgentRegistry(agentReg)
-		ag.SetAgentsDir(dirs.AgentsDir())
-		if agentReg.IsMultiAgent() {
-			log.Info("multi-agent mode enabled", "agents", agentReg.List())
-		}
-	}
-	defaultAgentID := resolveDefaultAgent(dirs.AgentsDir(), dirs.AgentStateFile())
-	ag.SetDefaultAgentID(defaultAgentID)
-
 	memMgr := memory.NewManager(dirs.MemoryDir())
 	if cfg.Memory.RetainDays > 0 {
 		memMgr.SetRetainDays(cfg.Memory.RetainDays)
@@ -419,25 +334,12 @@ func runServe(cfg *config.Config, socketPath, logLevel string) {
 	}
 	ag.SetMemory(memMgr)
 
-	// getAgentStores returns the ExperienceStore and ProcedureStore for the
-	// current default agent. Used as a getter closure so tool handlers always
-	// operate on the correct Agent's directories at call time.
 	getExpStore := func() *knowledge.ExperienceStore {
-		if agentReg != nil {
-			if def, ok := agentReg.Get(defaultAgentID); ok && def.Experiences != nil {
-				return def.Experiences
-			}
-		}
-		return knowledge.NewExperienceStore(dirs.AgentExperiencesDir(defaultAgentID))
+		return knowledge.NewExperienceStore(dirs.ExperiencesDir())
 	}
 	getStores := func() (*knowledge.ExperienceStore, *knowledge.ProcedureStore) {
-		if agentReg != nil {
-			if def, ok := agentReg.Get(defaultAgentID); ok && def.Experiences != nil {
-				return def.Experiences, def.Procedures
-			}
-		}
-		return knowledge.NewExperienceStore(dirs.AgentExperiencesDir(defaultAgentID)),
-			knowledge.NewProcedureStore(dirs.AgentProceduresDir(defaultAgentID))
+		return knowledge.NewExperienceStore(dirs.ExperiencesDir()),
+			knowledge.NewProcedureStore(dirs.ProceduresDir())
 	}
 
 	if cfg.Tools.Enabled {
@@ -575,7 +477,7 @@ func runConnect(cfg *config.Config, socketPath string) {
 		cfg.Theme,
 		llm,
 		dirs.MemoryDir(),
-		dirs.AgentExperiencesDir(resolveDefaultAgent(dirs.AgentsDir(), dirs.AgentStateFile())),
+		dirs.ExperiencesDir(),
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

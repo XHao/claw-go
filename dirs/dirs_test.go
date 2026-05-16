@@ -4,44 +4,54 @@ package dirs_test
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/XHao/claw-go/dirs"
 )
 
-func TestAgentsDir(t *testing.T) {
-	t.Setenv("OPENCLAW_STATE_DIR", t.TempDir())
-	got := dirs.AgentsDir()
-	if !strings.HasSuffix(got, filepath.Join("agents")) {
-		t.Errorf("AgentsDir() = %q, want suffix 'agents'", got)
-	}
-}
-
-func TestAgentDir(t *testing.T) {
-	t.Setenv("OPENCLAW_STATE_DIR", t.TempDir())
-	got := dirs.AgentDir("lawyer")
-	if !strings.HasSuffix(got, filepath.Join("agents", "lawyer")) {
-		t.Errorf("AgentDir('lawyer') = %q, want suffix 'agents/lawyer'", got)
-	}
-}
-
-func TestAgentMemoryDir(t *testing.T) {
-	t.Setenv("OPENCLAW_STATE_DIR", t.TempDir())
-	got := dirs.AgentMemoryDir("coder")
-	want := filepath.Join(dirs.AgentDir("coder"), "memory")
+func TestExperiencesDir(t *testing.T) {
+	tmpdir := t.TempDir()
+	t.Setenv("OPENCLAW_STATE_DIR", tmpdir)
+	got := dirs.ExperiencesDir()
+	want := filepath.Join(tmpdir, "experiences")
 	if got != want {
-		t.Errorf("AgentMemoryDir('coder') = %q, want %q", got, want)
+		t.Errorf("ExperiencesDir() = %q, want %q", got, want)
 	}
 }
 
-func TestMkdirAllCreatesAgentsDir(t *testing.T) {
+func TestProceduresDir(t *testing.T) {
+	tmpdir := t.TempDir()
+	t.Setenv("OPENCLAW_STATE_DIR", tmpdir)
+	got := dirs.ProceduresDir()
+	want := filepath.Join(tmpdir, "procedures")
+	if got != want {
+		t.Errorf("ProceduresDir() = %q, want %q", got, want)
+	}
+}
+
+func TestMkdirAll(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("OPENCLAW_STATE_DIR", tmp)
 	if err := dirs.MkdirAll(); err != nil {
 		t.Fatalf("MkdirAll() error: %v", err)
 	}
-	if _, err := os.Stat(dirs.AgentsDir()); err != nil {
-		t.Errorf("AgentsDir not created: %v", err)
+	// Verify that expected directories are created
+	if _, err := os.Stat(dirs.Sessions()); err != nil {
+		t.Errorf("Sessions directory not created: %v", err)
+	}
+	if _, err := os.Stat(dirs.Logs()); err != nil {
+		t.Errorf("Logs directory not created: %v", err)
+	}
+	if _, err := os.Stat(dirs.MemoryDir()); err != nil {
+		t.Errorf("MemoryDir not created: %v", err)
+	}
+	if _, err := os.Stat(dirs.PromptsDir()); err != nil {
+		t.Errorf("PromptsDir not created: %v", err)
+	}
+	if _, err := os.Stat(dirs.ExperiencesDir()); err != nil {
+		t.Errorf("ExperiencesDir not created: %v", err)
+	}
+	if _, err := os.Stat(dirs.ProceduresDir()); err != nil {
+		t.Errorf("ProceduresDir not created: %v", err)
 	}
 }

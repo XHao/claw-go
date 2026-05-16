@@ -11,9 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/XHao/claw-go/agentdef"
 	"github.com/XHao/claw-go/channel"
-	"github.com/XHao/claw-go/dirs"
 	"github.com/XHao/claw-go/ipc"
 	"github.com/XHao/claw-go/knowledge"
 	"github.com/XHao/claw-go/memory"
@@ -60,9 +58,6 @@ type Agent struct {
 	classifier        *knowledge.TaskClassifier // optional; nil = procedure injection disabled
 	continueRequested sync.Map // tracks sessionKey → true when iteration limit hit
 	log               *slog.Logger
-	agentRegistry     *agentdef.Registry // optional; nil = single-agent mode
-	agentsDir         string             // path to ~/.claw/agents/
-	defaultAgentID    string             // from config.DefaultAgent
 }
 
 // New creates an Agent.
@@ -141,17 +136,6 @@ func (a *Agent) SetProcedureStore(s *knowledge.ProcedureStore) {
 func (a *Agent) SetTaskClassifier(c *knowledge.TaskClassifier) {
 	a.classifier = c
 }
-
-// SetAgentRegistry attaches an AgentDef Registry for multi-agent support.
-func (a *Agent) SetAgentRegistry(r *agentdef.Registry) {
-	a.agentRegistry = r
-}
-
-// SetAgentsDir sets the path to the agents directory.
-func (a *Agent) SetAgentsDir(dir string) { a.agentsDir = dir }
-
-// SetDefaultAgentID sets the default agent id from config.
-func (a *Agent) SetDefaultAgentID(id string) { a.defaultAgentID = id }
 
 // RegisterChannel adds a channel so the agent can dispatch replies through it.
 func (a *Agent) RegisterChannel(ch channel.Channel) {
@@ -332,12 +316,6 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 		return
 	}
 
-	// /agent list|use|new|info — Persona Agent management.
-	if strings.HasPrefix(text, "/agent") {
-		a.handleAgentCmd(ctx, msg, ch, text)
-		return
-	}
-
 	// /think <message> — ask the deep-reasoning Tier-3 model for this turn only.
 	// Strip the prefix and attach ModelHintThinking to ctx so RouterProvider
 	// selects the Tier-3 model for every LLM call in this dispatch.
@@ -385,39 +363,12 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 
 	sess := a.sessions.Get(msg.SessionKey)
 
-	// Resolve per-dispatch knowledge stores: start from Agent defaults,
-	// then override with the Persona Agent's stores if one is bound.
+	// Resolve per-dispatch knowledge stores from Agent defaults.
 	// We use local variables to avoid writing to shared Agent fields,
 	// which would cause data races under concurrent session dispatch.
 	localExpStore := a.expStore
 	localProcStore := a.procedureStore
 	localDistiller := a.distiller
-
-	var activeAgentDef *agentdef.AgentDef
-	if a.agentRegistry != nil {
-		agentID := sess.AgentID()
-		if agentID == "" {
-			agentID = a.defaultAgentID
-		}
-		if def, ok := a.agentRegistry.Get(agentID); ok {
-			activeAgentDef = def
-			if def.Persona != "" {
-				sess.AppendEphemeral(provider.Message{
-					Role:    "system",
-					Content: def.Persona,
-				})
-			}
-			if def.Experiences != nil {
-				localExpStore = def.Experiences
-			}
-			if def.Procedures != nil {
-				localProcStore = def.Procedures
-			}
-			if def.Experiences != nil && a.distiller != nil {
-				localDistiller = a.distiller.WithStore(def.Experiences)
-			}
-		}
-	}
 
 	userText := text
 	if userText == "" && len(msg.Attachments) > 0 {
@@ -471,10 +422,6 @@ func (a *Agent) Dispatch(ctx context.Context, msg channel.InboundMessage) {
 			tools = append(tools, a.toolRunner.RegisteredDefsByGroup("core")...)
 			if wantKnowledge {
 				tools = append(tools, a.toolRunner.RegisteredDefsByGroup("knowledge")...)
-			}
-			// Append Persona-specific extra tools declared in tools.yaml.
-			if activeAgentDef != nil && len(activeAgentDef.ExtraTools) > 0 {
-				tools = append(tools, a.toolRunner.RegisteredDefsByName(activeAgentDef.ExtraTools)...)
 			}
 		}
 
@@ -806,14 +753,6 @@ func (a *Agent) saveTurnMemory(
 		return
 	}
 	summary := memory.BuildSummary(turnN, userText, replyText, actions, iters, isError)
-	// Tag the turn with the current session's agent.
-	if a.agentRegistry != nil {
-		agentID := a.sessions.Get(sessionKey).AgentID()
-		if agentID == "" {
-			agentID = a.defaultAgentID
-		}
-		summary.AgentID = agentID
-	}
 	if err := a.memory.ForSession(sessionKey).SaveTurn(summary); err != nil {
 		log.Warn("memory save failed", "err", err)
 	}
@@ -1050,76 +989,6 @@ func topicMatchesText(topic, lowerText string) bool {
 		}
 	}
 	return true
-}
-
-// handleAgentCmd processes /agent list|use <name>|new <name>|info commands.
-func (a *Agent) handleAgentCmd(ctx context.Context, msg channel.InboundMessage, ch channel.Channel, text string) {
-	send := func(s string) {
-		if ch != nil {
-			_ = ch.Send(ctx, channel.OutboundMessage{ChatID: msg.ChatID, Text: s})
-		}
-	}
-	if a.agentRegistry == nil || !a.agentRegistry.IsMultiAgent() {
-		send("多 Agent 模式未启用。在 ~/.claw/agents/ 下创建多个 Agent 目录后重启。")
-		return
-	}
-	parts := strings.Fields(text)
-	if len(parts) < 2 {
-		send("用法：/agent list | /agent use <name> | /agent new <name> | /agent info")
-		return
-	}
-	switch parts[1] {
-	case "list":
-		names := a.agentRegistry.List()
-		var sb strings.Builder
-		sb.WriteString("可用 Agent：\n")
-		for _, n := range names {
-			sb.WriteString("  • " + n + "\n")
-		}
-		send(sb.String())
-	case "use":
-		if len(parts) < 3 {
-			send("用法：/agent use <name>")
-			return
-		}
-		name := parts[2]
-		if _, ok := a.agentRegistry.Get(name); !ok {
-			send("Agent 不存在：" + name + "。使用 /agent list 查看可用列表。")
-			return
-		}
-		a.sessions.SetAgentID(msg.SessionKey, name)
-		if ch != nil {
-			_ = ch.Send(ctx, channel.OutboundMessage{
-				ChatID:    msg.ChatID,
-				AgentID:   name,
-				AgentName: name,
-			})
-		}
-		send("已切换到 Agent: " + name + "\n当前会话记忆已隔离")
-	case "new":
-		if len(parts) < 3 {
-			send("用法：/agent new <name>")
-			return
-		}
-		name := parts[2]
-		if err := a.agentRegistry.Create(a.agentsDir, name); err != nil {
-			send("创建 Agent 失败：" + err.Error())
-			return
-		}
-		send("Agent 已创建：" + name + "\n配置目录：" + dirs.AgentDir(name))
-	case "info":
-		sess := a.sessions.Get(msg.SessionKey)
-		agentID := sess.AgentID()
-		if agentID == "" {
-			agentID = a.defaultAgentID
-		}
-		if agentID == "" {
-			agentID = "default"
-		}
-		send("当前 Agent: " + agentID + "\n配置目录: " + dirs.AgentDir(agentID))
-	default:
-		send("未知子命令：" + parts[1] + "。用法：/agent list | use | new | info")
-	}
 }
 
 // cleanupAttachments removes all temporary files created for inbound media attachments.

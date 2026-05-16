@@ -23,10 +23,6 @@ type SessionStore interface {
 	// LoadRecent returns up to maxTurns turns, ordered oldest-first.
 	// maxTurns ≤ 0 returns all stored turns.
 	LoadRecent(maxTurns int) ([]TurnSummary, error)
-
-	// LoadRecentForAgent is like LoadRecent but filtered by agentID.
-	// An empty agentID behaves identically to LoadRecent.
-	LoadRecentForAgent(maxTurns int, agentID string) ([]TurnSummary, error)
 }
 
 // MemoryManager is the cross-session memory coordination interface.

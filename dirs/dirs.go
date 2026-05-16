@@ -76,36 +76,19 @@ func MemoryDir() string { return filepath.Join(Data(), "data", "memory") }
 // Files are loaded at daemon startup to assemble the system prompt.
 func PromptsDir() string { return filepath.Join(Data(), "prompts") }
 
-// AgentExperiencesDir returns the experiences directory for a specific Agent.
-func AgentExperiencesDir(name string) string { return filepath.Join(AgentDir(name), "experiences") }
+// ExperiencesDir returns the directory for the agent's experience store.
+func ExperiencesDir() string { return filepath.Join(Data(), "experiences") }
 
-// AgentProceduresDir returns the procedures directory for a specific Agent.
-func AgentProceduresDir(name string) string { return filepath.Join(AgentDir(name), "procedures") }
+// ProceduresDir returns the directory for the agent's procedure store.
+func ProceduresDir() string { return filepath.Join(Data(), "procedures") }
 
 // WeixinTokenFile returns the default path for the WeChat bot_token persistence file.
 func WeixinTokenFile() string { return filepath.Join(Data(), "weixin-token.json") }
 
-// AgentsDir returns the root directory for all Agent definitions.
-// Each Agent lives under {AgentsDir}/{name}/.
-func AgentsDir() string { return filepath.Join(Data(), "agents") }
-
-// AgentDir returns the directory for a specific Agent definition.
-func AgentDir(name string) string { return filepath.Join(AgentsDir(), name) }
-
-// AgentStateFile returns the path to the runtime agent state file.
-// This file tracks the current default agent name.
-func AgentStateFile() string { return filepath.Join(Data(), "agent-state.json") }
-
-// AgentMemoryDir returns the memory directory for a specific Agent.
-func AgentMemoryDir(name string) string { return filepath.Join(AgentDir(name), "memory") }
-
-// AgentSkillsDir returns the skills directory for a specific Agent.
-func AgentSkillsDir(name string) string { return filepath.Join(AgentDir(name), "skills") }
-
 // MkdirAll creates all necessary subdirectories under the data root.
 // Should be called once at daemon startup.
 func MkdirAll() error {
-	for _, d := range []string{Sessions(), Logs(), MemoryDir(), PromptsDir(), AgentsDir()} {
+	for _, d := range []string{Sessions(), Logs(), MemoryDir(), PromptsDir(), ExperiencesDir(), ProceduresDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
 		}
