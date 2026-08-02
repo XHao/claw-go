@@ -11,12 +11,12 @@ import (
 var embeddedSafetyPrompt string
 
 // LoadPromptDir assembles the system prompt from the prompts directory.
-// Fixed load order: embedded safety → behavior.md → user.md.
+// Fixed load order: embedded safety → persona.md → behavior.md → user.md.
 // Missing files are silently skipped.
 func LoadPromptDir(dir string) (string, error) {
 	parts := []string{embeddedSafetyBody()}
 
-	for _, name := range []string{"behavior.md", "user.md"} {
+	for _, name := range []string{"persona.md", "behavior.md", "user.md"} {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			if os.IsNotExist(err) {

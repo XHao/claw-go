@@ -42,6 +42,9 @@ var configTemplate []byte
 //go:embed prompts/*.md
 var defaultPromptFS embed.FS
 
+//go:embed procedures/*.md
+var defaultProcedureFS embed.FS
+
 func main() {
 	sub := ""
 	if len(os.Args) > 1 {
@@ -143,6 +146,10 @@ func runInstall(configPath string) {
 	writeDefaultPromptFiles(dirs.PromptsDir())
 	fmt.Printf("Prompt files written to: %s\n", dirs.PromptsDir())
 	fmt.Println("  → Edit them to customize Claw's persona, domain, and behavior.")
+
+	// Write built-in procedure skill files to the procedures directory.
+	writeDefaultProcedureFiles(dirs.ProceduresDir())
+	fmt.Printf("Procedure skills written to: %s\n", dirs.ProceduresDir())
 
 	// 3. Resolve the effective config path for the startup service entry.
 	resolvedPath := config.ResolveConfigPath(configPath)
@@ -606,6 +613,40 @@ func writeDefaultPromptFiles(dir string) {
 			fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", e.Name(), err)
 		} else {
 			fmt.Printf("Prompt file written: %s\n", dest)
+		}
+	}
+}
+
+// writeDefaultProcedureFiles extracts the embedded procedure skill files to dir,
+// skipping any file that already exists so user edits are preserved.
+func writeDefaultProcedureFiles(dir string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create procedures dir: %v\n", err)
+		return
+	}
+	entries, err := defaultProcedureFS.ReadDir("procedures")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not read embedded procedures: %v\n", err)
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		dest := filepath.Join(dir, e.Name())
+		if _, err := os.Stat(dest); err == nil {
+			fmt.Printf("Procedure file already exists, skipping: %s\n", dest)
+			continue
+		}
+		data, err := defaultProcedureFS.ReadFile("procedures/" + e.Name())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not read embedded %s: %v\n", e.Name(), err)
+			continue
+		}
+		if err := os.WriteFile(dest, data, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", e.Name(), err)
+		} else {
+			fmt.Printf("Procedure skill written: %s\n", dest)
 		}
 	}
 }
