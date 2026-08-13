@@ -3,9 +3,6 @@ package channel
 
 import (
 	"context"
-	"encoding/json"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/XHao/claw-go/ipc"
@@ -57,22 +54,6 @@ type Channel interface {
 	Status() Status
 }
 
-// maxSessions is the maximum number of entries kept in per-channel session/webhook
-// maps. When the limit is reached, the oldest half is evicted to bound memory use.
-const maxSessions = 10_000
-
-// mustMarshal encodes v to JSON and panics if encoding fails.
-// Use only for values whose types guarantee successful marshalling (structs,
-// maps with string keys, slices). Never pass channels, functions, or complex
-// interface values.
-func mustMarshal(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic("channel: mustMarshal: " + err.Error())
-	}
-	return b
-}
-
 // Status represents the runtime health of a channel.
 type Status struct {
 	ID      string `json:"id"`
@@ -82,18 +63,3 @@ type Status struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// mimeFromPath returns the MIME type for a file based on its extension.
-// Falls back to "image/jpeg" for unknown extensions.
-func mimeFromPath(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
-	default:
-		return "image/jpeg"
-	}
-}

@@ -1,6 +1,6 @@
 # claw-go
 
-本地命令行 AI 助手，采用**守护进程 + CLI 客户端**架构，支持持久会话、多通道接入、工具调用、知识提炼和多模型分层路由。
+本地命令行 AI 助手，采用**守护进程 + CLI 客户端**架构，支持持久会话、工具调用、知识提炼和多模型分层路由。
 
 ---
 
@@ -8,8 +8,8 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                      Channels                       │
-│   CLI (Unix socket)  │  DingTalk  │  WeChat iLink   │
+│                      Channel                        │
+│                   CLI (Unix socket)                 │
 └──────────────┬──────────────────────────────────────┘
                │ IPC (JSON over Unix socket)
 ┌──────────────▼──────────────────────────────────────┐
@@ -175,25 +175,6 @@ claw                # 连接守护进程，进入交互界面
 
 ### CLI（默认）
 通过 Unix socket 连接守护进程，支持流式输出、Markdown 渲染、多会话切换。
-
-### DingTalk（钉钉）
-使用 Stream API（WebSocket 长连接），无需公网 HTTP 服务器。
-
-```yaml
-dingtalk:
-  enabled: true
-  client_id: "dingxxxxxxxx"    # AppKey
-  client_secret: "xxxxxxxx"    # AppSecret
-```
-
-### WeChat iLink
-使用 HTTP 长轮询，首次启动时在终端打印二维码，扫码后 token 自动保存复用。
-
-```yaml
-weixin:
-  enabled: true
-  token_file: "~/.claw/weixin-token.json"   # 可选，默认路径
-```
 
 ---
 

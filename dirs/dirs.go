@@ -82,9 +82,6 @@ func ExperiencesDir() string { return filepath.Join(Data(), "experiences") }
 // ProceduresDir returns the directory for the agent's procedure store.
 func ProceduresDir() string { return filepath.Join(Data(), "procedures") }
 
-// WeixinTokenFile returns the default path for the WeChat bot_token persistence file.
-func WeixinTokenFile() string { return filepath.Join(Data(), "weixin-token.json") }
-
 // MkdirAll creates all necessary subdirectories under the data root.
 // Should be called once at daemon startup.
 func MkdirAll() error {
